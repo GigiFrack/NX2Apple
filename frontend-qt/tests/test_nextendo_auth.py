@@ -283,6 +283,33 @@ class RegisteredClientTests(unittest.TestCase):
         finally:
             tokens.close()
 
+    def test_invalid_client_says_what_kind_of_app_to_register(self):
+        import http.server
+
+        class Refuse(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):                                     # noqa: N802 - stdlib API
+                body = b'{"error":"invalid_client"}'
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):                   # noqa: A002 - stdlib API
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), Refuse)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cfg = na.Config('https://x/a', f'http://127.0.0.1:{port}/token', 'nxc_1')
+            with self.assertRaises(na.AuthError) as cm:
+                na.exchange_code(cfg, 'CODE', 'v', cfg.redirect_uri)
+            self.assertIn('public application', str(cm.exception))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
     def test_a_public_client_sends_no_secret(self):
         tokens = TokenServer()
         try:

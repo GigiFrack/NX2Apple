@@ -236,6 +236,13 @@ def exchange_code(cfg: Config, code: str, verifier: str, redirect_uri: str) -> d
             body = r.read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode('utf-8', 'replace')[:300]
+        if 'invalid_client' in detail:
+            # The app was registered as confidential (`oauth.go:386-392`: a non-empty SecretHash
+            # makes the secret mandatory), while a desktop app should be the public/PKCE kind.
+            raise AuthError(
+                'Nextendo wants a client secret for this app: either put the secret the portal '
+                'showed once into nextendo-app.json, or register the app as "public application '
+                '(desktop / mobile, PKCE)" so there is none') from e
         raise AuthError(f'Nextendo refused the token exchange (HTTP {e.code}): {detail}') from e
     except OSError as e:
         raise AuthError(f'could not reach Nextendo to exchange the code: {e}') from e
