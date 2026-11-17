@@ -42,3 +42,6 @@ DM_TOUCH_LAYOUT	player	The player's per-layout touch-control arrangement, encode
 DM_TOUCH_SIZE	player	iOS touch-control size: small, medium (default) or large. Controls move toward medium when the requested size does not fit
 DM_TOUCH_STICK	player	iOS left touch-stick position: corner (default), higher or inward
 DM_UI_HOLD	test	When set, keeps the controller mapping test window open for 60 seconds after its UI screenshot for manual inspection
+DM_NEXTENDO	switch	`1` turns the Nextendo Network seams on: the hostname map, and (with the rest of the work) real sockets, TLS and the network account. Unset or `0` keeps every cut branch exactly as it is
+DM_NEXTENDO_HOSTS	path	`<ip> <hostname>` one per line, `*.suffix` cases included: the names the game resolves to the Nextendo servers. `#` starts a comment. Only read with `DM_NEXTENDO=1`
+DM_NEXTENDO_HOSTS_FILE	path	`=<path>` reads the map from a file instead of `DM_NEXTENDO_HOSTS` (the launcher's per-game copy)

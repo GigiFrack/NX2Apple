@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 17 Nov 2026 20:45:09 +0000
+Subject: [PATCH] host: the Nextendo hostname map (DM_NEXTENDO)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The seam nextendo-docs/ARCHITECTURE.md calls "the emulator's DNS layer": the names a game
+asks for (g2b309e01-….srv.nintendo.net, *.ndas.srv.nintendo.net, nncs1-lp1.n.n.srv.nintendo.net)
+answer with the addresses given, while the name itself is left alone — Nextendo's sni-router
+picks the auth server from the TLS SNI, so rewriting it would break routing.
+
+Off unless DM_NEXTENDO=1, so an offline build resolves exactly as before. Plain C with no
+hle.h and no game profile: the test builds and runs without GAME, and the map logic was also
+exercised off Darwin (gcc) while the in-tree suite stays macOS-only.
+
+Upstream-Status: fork-only
+Reason: upstream cuts every online service on purpose (hle_offline.c), so it has no seam for a name to resolve through; Nextendo is a fork product choice until upstream takes online play
+Issue: none opened yet — notes/nextendo-spike.md carries the plan and the open question for Nextendo
+
+---
+ dm/host/hle_nextendo.c         | 116 +++++++++++++++++++++++++++++++++
+ dm/host/hle_nextendo.h         |  18 +++++
+ dm/host/tests/Makefile         |   4 ++
+ dm/host/tests/t_nextendo_map.c |  69 ++++++++++++++++++++
+ 4 files changed, 207 insertions(+)
+ create mode 100644 dm/host/hle_nextendo.c
+ create mode 100644 dm/host/hle_nextendo.h
+ create mode 100644 dm/host/tests/t_nextendo_map.c
+
+diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
+new file mode 100644
+index 0000000..2ebb61d
+--- /dev/null
++++ b/dm/host/hle_nextendo.c
+@@ -0,0 +1,116 @@
++// The Nextendo hostname map: the "emulator's DNS layer" that ARCHITECTURE.md describes.
++//
++// A console pointed at Nextendo finds its servers through DNS. The host has no resolver to point
++// anywhere, so this is the seam instead: the names the game asks for (`*.ndas.srv.nintendo.net`,
++// `g2b309e01-….srv.nintendo.net`, …) answer with the addresses given here. The name is not
++// rewritten — only the address is — because the TLS ClientHello must still carry the retail SNI:
++// Nextendo's sni-router reads that name to pick which game's auth server answers.
++//
++// No hle.h: this file has no HLE entry to register (the GetAddrInfo hook that uses it lives in
++// hle_net.c), so it stays plain C and can be compiled and tested anywhere, off Darwin included.
++#include "hle_nextendo.h"
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#define ND_MAX 256
++#define ND_NAME_MAX 128
++
++typedef struct { char pattern[ND_NAME_MAX]; uint32_t addr; } nd_rule;
++
++static nd_rule g_nd[ND_MAX];
++static int g_nd_n;
++static int g_nd_loaded;
++static pthread_mutex_t g_nd_m = PTHREAD_MUTEX_INITIALIZER;
++
++int dm_nd_enabled(void) {
++    const char *e = getenv("DM_NEXTENDO");
++    return e && e[0] == '1';
++}
++
++// "a.b.c.d" → host byte order. Anything else is not an address and the line is dropped.
++static int nd_ipv4(const char *s, uint32_t *out) {
++    unsigned a, b, c, d;
++    char tail;
++    if (sscanf(s, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return 0;
++    if (a > 255 || b > 255 || c > 255 || d > 255) return 0;
++    *out = a << 24 | b << 16 | c << 8 | d;
++    return 1;
++}
++
++// One "ip hostname" per line; '#' starts a comment; blank lines are skipped.
++static void nd_parse_line(char *line) {
++    char ip[64], name[ND_NAME_MAX];
++    char *hash = strchr(line, '#');
++    if (hash) *hash = 0;
++    if (sscanf(line, "%63s %127s", ip, name) != 2) return;
++    if (g_nd_n >= ND_MAX) return;
++    if (!nd_ipv4(ip, &g_nd[g_nd_n].addr)) return;
++    snprintf(g_nd[g_nd_n].pattern, sizeof g_nd[g_nd_n].pattern, "%s", name);
++    g_nd_n++;
++}
++
++void dm_nd_reload(void) {
++    pthread_mutex_lock(&g_nd_m);
++    g_nd_n = 0;
++    g_nd_loaded = 1;
++    if (!dm_nd_enabled()) {
++        pthread_mutex_unlock(&g_nd_m);
++        return;
++    }
++    const char *tbl = getenv("DM_NEXTENDO_HOSTS");        /* inline, one rule per line */
++    if (tbl && *tbl) {
++        char *copy = strdup(tbl);
++        if (copy) {
++            char *save = NULL;
++            for (char *l = strtok_r(copy, "\n", &save); l; l = strtok_r(NULL, "\n", &save))
++                nd_parse_line(l);
++            free(copy);
++        }
++    }
++    if (!g_nd_n) {                                        /* else: the launcher's per-game file */
++        const char *f = getenv("DM_NEXTENDO_HOSTS_FILE");
++        FILE *fp = f && *f ? fopen(f, "r") : NULL;
++        if (fp) {
++            char line[512];
++            while (fgets(line, sizeof line, fp)) nd_parse_line(line);
++            fclose(fp);
++        }
++    }
++    pthread_mutex_unlock(&g_nd_m);
++}
++
++static int nd_match(const char *pattern, const char *host) {
++    if (pattern[0] == '*' && pattern[1] == '.') {         /* "*.suffix": any name that ends in it */
++        size_t hl = strlen(host), pl = strlen(pattern + 1);
++        if (hl <= pl) return 0;                            /* the bare suffix is not a match */
++        return strcasecmp(host + hl - pl, pattern + 1) == 0;
++    }
++    return strcasecmp(host, pattern) == 0;
++}
++
++int dm_nd_lookup(const char *host, uint32_t *addrs, int max) {
++    if (!host || !addrs || max < 1 || !dm_nd_enabled()) return 0;
++    if (!g_nd_loaded) dm_nd_reload();
++    int found = 0;
++    pthread_mutex_lock(&g_nd_m);
++    for (int i = 0; i < g_nd_n && found < max; i++) {
++        if (!nd_match(g_nd[i].pattern, host)) continue;
++        int dup = 0;
++        for (int j = 0; j < found; j++) dup |= addrs[j] == g_nd[i].addr;
++        if (!dup) addrs[found++] = g_nd[i].addr;
++    }
++    pthread_mutex_unlock(&g_nd_m);
++    return found;
++}
++
++int dm_nd_rule_count(void) {
++    if (!dm_nd_enabled()) return 0;
++    if (!g_nd_loaded) dm_nd_reload();
++    pthread_mutex_lock(&g_nd_m);
++    int n = g_nd_n;
++    pthread_mutex_unlock(&g_nd_m);
++    return n;
++}
+diff --git a/dm/host/hle_nextendo.h b/dm/host/hle_nextendo.h
+new file mode 100644
+index 0000000..cec1d40
+--- /dev/null
++++ b/dm/host/hle_nextendo.h
+@@ -0,0 +1,18 @@
++// Nextendo Network: the hostname map the host resolves through, and the switch that turns the
++// online seams on. Off by default: with DM_NEXTENDO unset nothing here is consulted and every cut
++// branch (hle_offline.c, hle_account.c) keeps behaving exactly as before.
++#pragma once
++#include <stdint.h>
++
++//: DM_NEXTENDO=1 turns the online seams on. Read on every call: the launcher may set it late.
++int dm_nd_enabled(void);
++
++//: Reload the map. Called lazily by dm_nd_lookup; call it after changing the environment.
++void dm_nd_reload(void);
++
++//: Map a hostname to the addresses it must resolve to. 0 = not mapped (resolve normally).
++//: `addrs` holds up to `max` addresses in host byte order, same as in_addr.s_addr.
++int dm_nd_lookup(const char *host, uint32_t *addrs, int max);
++
++//: How many rules the current map holds; 0 when the switch is off or nothing was given.
++int dm_nd_rule_count(void);
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 7ef1b45..8fa1a41 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -50,6 +50,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_pctl
+ 	$(B)/t_net_eventfd
+ 	$(B)/t_net_loopback
++	$(B)/t_nextendo_map
+ 	$(B)/t_sf
+ 	$(B)/t_audren_sv
+ 	$(B)/t_time
+@@ -232,6 +233,9 @@ $(B)/t_net_eventfd: t_net_eventfd.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h $
+ run: $(B)/t_net_loopback
+ $(B)/t_net_loopback: t_net_loopback.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_loopback.c
++# The Nextendo hostname map is plain C with no game profile: this test builds without GAME.
++$(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
+ 
+ $(B)/t_pctl: t_pctl.c ../hle_misc.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pctl.c
+diff --git a/dm/host/tests/t_nextendo_map.c b/dm/host/tests/t_nextendo_map.c
+new file mode 100644
+index 0000000..d540f2b
+--- /dev/null
++++ b/dm/host/tests/t_nextendo_map.c
+@@ -0,0 +1,69 @@
++// The Nextendo hostname map: retail names answer with the map's addresses, nothing else moves,
++// and with DM_NEXTENDO unset the map does not exist at all.
++#include "../hle_nextendo.c"
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static void expect(int cond, const char *what) {
++    if (!cond) {
++        fprintf(stderr, "not true: %s\n", what);
++        exit(1);
++    }
++}
++
++int main(void) {
++    unsetenv("DM_NEXTENDO_HOSTS_FILE");
++    setenv("DM_NEXTENDO", "1", 1);
++    setenv("DM_NEXTENDO_HOSTS",
++           "# the names a game asks for, and where they go\n"
++           "10.0.0.9 g2b309e01-0000000000000000.srv.nintendo.net\n"
++           "10.0.0.9 *.ndas.srv.nintendo.net\n"
++           "10.0.0.10 nncs1-lp1.n.n.srv.nintendo.net\n"
++           "not-an-address *.example.org\n"
++           "   \n", 1);
++    dm_nd_reload();
++    expect(dm_nd_rule_count() == 3, "three usable rules (comments, blanks and a bad IP dropped)");
++
++    uint32_t got[4] = {0};
++    expect(dm_nd_lookup("g2b309e01-0000000000000000.srv.nintendo.net", got, 4) == 1, "exact name mapped");
++    expect(got[0] == 0x0A000009u, "exact name gives 10.0.0.9");
++
++    got[0] = 0;
++    expect(dm_nd_lookup("AAUTH-LP1.NDAS.SRV.NINTENDO.NET", got, 4) == 1, "match is case-insensitive");
++    expect(got[0] == 0x0A000009u, "wildcard gives 10.0.0.9");
++
++    expect(dm_nd_lookup("ndas.srv.nintendo.net", got, 4) == 0, "the bare suffix is not a wildcard match");
++    expect(dm_nd_lookup("nncs1-lp1.n.n.srv.nintendo.net", got, 4) == 1, "second rule's name mapped");
++    expect(dm_nd_lookup("example.com", got, 4) == 0, "a name nobody listed is not mapped");
++    expect(dm_nd_lookup("*.example.org", got, 4) == 0, "a bad address never becomes a rule");
++
++    setenv("DM_NEXTENDO", "0", 1);
++    dm_nd_reload();
++    expect(dm_nd_rule_count() == 0, "no rules with the switch off");
++    expect(dm_nd_lookup("g2b309e01-0000000000000000.srv.nintendo.net", got, 4) == 0,
++           "nothing is mapped with the switch off");
++
++    unsetenv("DM_NEXTENDO");
++    expect(dm_nd_enabled() == 0, "the switch is off when unset");
++
++    // the launcher's per-game file, used when no inline table is given
++    char path[] = "/tmp/t_nextendo_map_XXXXXX";
++    int fd = mkstemp(path);
++    expect(fd >= 0, "temp file");
++    FILE *fp = fdopen(fd, "w");
++    fputs("10.1.2.3 aauth-lp1.ndas.srv.nintendo.net\n", fp);
++    fclose(fp);
++    setenv("DM_NEXTENDO", "1", 1);
++    unsetenv("DM_NEXTENDO_HOSTS");
++    setenv("DM_NEXTENDO_HOSTS_FILE", path, 1);
++    dm_nd_reload();
++    expect(dm_nd_lookup("aauth-lp1.ndas.srv.nintendo.net", got, 4) == 1, "a rule read from the file");
++    expect(got[0] == 0x0A010203u, "the file's address");
++    unlink(path);
++
++    puts("ok");
++    return 0;
++}
