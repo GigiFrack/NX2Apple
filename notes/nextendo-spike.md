@@ -101,7 +101,12 @@ protocol.
    and needs a public OAuth client whose token answer carries `nex_token` — either let us use the
    `nextendo-emulator` client id, or add a client/scope that does the same."* Without it, in-game
    online cannot work at all, however much host code is written.
-4. **Open question to confirm with them/their emulator**: that the `nex_token` is what the host must
+4. **The product is the iPhone app, not the Mac host.** The port's target for this work is the
+   `DmShell.app` IPA started on the phone: the HLE changes land in the iOS build, the acceptance test
+   is a game going online on the device, and `dmhost` on a Mac is only a debugging shortcut for
+   whoever has one. The UI that matters first is therefore `frontend-ios` (`ShellSettingsView`,
+   `GameSettingsStore`), not the Qt launcher.
+5. **Open question to confirm with them/their emulator**: that the `nex_token` is what the host must
    return from `nn::account::LoadNetworkServiceAccountIdTokenCache` (the SDK call games feed to
    `LoginEx`). The name and the flow strongly suggest it; the emulator's source is the proof, and it
    is not public (the `Ryujinx-Nextendo` README link 404s).
