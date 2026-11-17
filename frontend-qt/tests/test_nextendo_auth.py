@@ -219,5 +219,79 @@ class StorageTests(unittest.TestCase):
         self.assertIn('Non connesso', na.describe(None))
 
 
+class RegisteredClientTests(unittest.TestCase):
+    """A registered app is confidential and its redirect is an exact string (oauth.go:299)."""
+
+    def test_a_file_with_only_the_client_id_gets_the_defaults(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'nextendo-app.json'
+            p.write_text(json.dumps({'client_id': 'nxc_TEST'}))
+            cfg = na.Config.load(p)
+        self.assertEqual(cfg.client_id, 'nxc_TEST')
+        self.assertEqual(cfg.authorize_url, na.DEFAULT_AUTHORIZE_URL)
+        self.assertEqual(cfg.token_url, na.DEFAULT_TOKEN_URL)
+        self.assertEqual(cfg.redirect_port, na.DEFAULT_REDIRECT_PORT)
+        self.assertEqual(cfg.redirect_uri, 'http://127.0.0.1:47821/callback')
+        self.assertIsNone(cfg.client_secret)
+
+    def test_the_sign_in_uses_the_registered_port(self):
+        import socket
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', redirect_port=port)
+        seen = []
+
+        def browser(url):
+            seen.append(urllib.parse.parse_qs(urllib.parse.urlparse(url).query))
+            cb = seen[0]['redirect_uri'][0] + '?' + urllib.parse.urlencode(
+                {'code': 'C', 'state': seen[0]['state'][0]})
+            threading.Thread(target=fire, args=(cb,), daemon=True).start()
+            return True
+
+        tokens = TokenServer()
+        try:
+            cfg = na.Config('https://x/a', tokens.url, 'nxc_1', redirect_port=port)
+            na.sign_in(cfg, open_browser=browser, timeout=5)
+        finally:
+            tokens.close()
+        self.assertEqual(seen[0]['redirect_uri'][0], f'http://127.0.0.1:{port}/callback')
+
+    def test_a_busy_port_names_the_port_and_what_to_do(self):
+        import socket
+        busy = socket.socket()
+        busy.bind(('127.0.0.1', 0))
+        busy.listen(1)
+        port = busy.getsockname()[1]
+        try:
+            cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', redirect_port=port)
+            with self.assertRaises(na.AuthError) as cm:
+                na.sign_in(cfg, open_browser=lambda url: True, timeout=0.2)
+            self.assertIn(str(port), str(cm.exception))
+        finally:
+            busy.close()
+
+    def test_a_confidential_client_sends_its_secret(self):
+        tokens = TokenServer()
+        try:
+            cfg = na.Config('https://x/a', tokens.url, 'nxc_1', client_secret='shh')
+            na.exchange_code(cfg, 'CODE', 'verifier', cfg.redirect_uri)
+            self.assertEqual(tokens.form['client_secret'], ['shh'])
+            self.assertEqual(tokens.form['code_verifier'], ['verifier'])
+        finally:
+            tokens.close()
+
+    def test_a_public_client_sends_no_secret(self):
+        tokens = TokenServer()
+        try:
+            cfg = na.Config('https://x/a', tokens.url, 'nxc_1')
+            na.exchange_code(cfg, 'CODE', 'verifier', cfg.redirect_uri)
+            self.assertNotIn('client_secret', tokens.form)
+        finally:
+            tokens.close()
+
+
 if __name__ == '__main__':
     unittest.main()

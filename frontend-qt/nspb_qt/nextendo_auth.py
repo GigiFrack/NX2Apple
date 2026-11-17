@@ -61,30 +61,63 @@ def check_state(got: str | None, expect: str) -> None:
 
 # ---------------------------------------------------------------- config
 
+#: Where Nextendo's account service answers, as its source routes them
+#: (`/api/oauth/authorize`, `/api/oauth/token`). Kept here only as a default: an app whose
+#: deployment differs names its own two URLs in nextendo-app.json.
+DEFAULT_AUTHORIZE_URL = 'https://nextendo.network/api/oauth/authorize'
+DEFAULT_TOKEN_URL = 'https://nextendo.network/api/oauth/token'
+
+#: The redirect port. A *registered* client's redirect URI is compared as a string
+#: (`nextendo-account/oauth.go:299`), unlike the built-in emulator client, which may use any
+#: loopback port: so this number must be the one typed on nextendo.network/developers.
+DEFAULT_REDIRECT_PORT = 47821
+
+
 @dataclass(frozen=True)
 class Config:
     authorize_url: str
     token_url: str
     client_id: str
     scope: str = 'openid profile'
+    redirect_port: int = DEFAULT_REDIRECT_PORT
+    #: Only for a registered (confidential) app: Nextendo's registration always issues a secret
+    #: (`oauth.go:522-542`). A secret inside an app can be read out of it, so the right fix is a
+    #: public client; until then the file holding it stays on the player's machine, mode 0600.
+    client_secret: str | None = None
+
+    @property
+    def redirect_uri(self) -> str:
+        return f'http://127.0.0.1:{self.redirect_port}/callback'
 
     @classmethod
     def load(cls, path: str | Path) -> 'Config':
-        """Read ``nextendo-app.json``: the app the player registered on Nextendo."""
+        """Read ``nextendo-app.json``: the app the player registered on Nextendo.
+
+        Only ``client_id`` is required; the URLs and the port fall back to the values above, so
+        a file carrying just the id from the portal works.
+        """
         p = Path(path)
         try:
             d = json.loads(p.read_text(encoding='utf-8'))
         except FileNotFoundError as e:
             raise AuthError(
                 f'{p} is missing: register an application on nextendo.network/developers and '
-                'save its authorize and token URLs and its client id there') from e
+                'save its client id there') from e
         except json.JSONDecodeError as e:
             raise AuthError(f'{p} is not valid JSON: {e}') from e
-        missing = [k for k in ('authorize_url', 'token_url', 'client_id') if not d.get(k)]
-        if missing:
-            raise AuthError(f'{p} is missing {", ".join(missing)}')
-        return cls(str(d['authorize_url']), str(d['token_url']), str(d['client_id']),
-                   str(d.get('scope') or cls.scope))
+        if not d.get('client_id'):
+            raise AuthError(f'{p} is missing client_id')
+        port = d.get('redirect_port') or cls.redirect_port
+        try:
+            port = int(port)
+        except (TypeError, ValueError) as e:
+            raise AuthError(f'{p}: redirect_port must be a number, not {port!r}') from e
+        return cls(str(d.get('authorize_url') or DEFAULT_AUTHORIZE_URL),
+                   str(d.get('token_url') or DEFAULT_TOKEN_URL),
+                   str(d['client_id']),
+                   str(d.get('scope') or cls.scope),
+                   port,
+                   str(d['client_secret']) if d.get('client_secret') else None)
 
 
 # ---------------------------------------------------------------- loopback redirect
@@ -159,7 +192,11 @@ def sign_in(cfg: Config, open_browser=webbrowser.open, timeout: float = 300.0) -
     """PKCE, browser, loopback answer, token exchange. Returns the token JSON."""
     verifier = new_verifier()
     state = secrets.token_urlsafe(16)
-    srv = LoopbackServer(expect_state=state)
+    try:
+        srv = LoopbackServer(port=cfg.redirect_port, expect_state=state)
+    except OSError as e:
+        raise AuthError(f'port {cfg.redirect_port} is busy ({e}): close the other NX2Apple window '
+                        'and try again — the registered redirect URI names this port') from e
     try:
         url = cfg.authorize_url + '?' + urllib.parse.urlencode({
             'response_type': 'code',
@@ -189,6 +226,8 @@ def exchange_code(cfg: Config, code: str, verifier: str, redirect_uri: str) -> d
         'client_id': cfg.client_id,
         'redirect_uri': redirect_uri,
     }
+    if cfg.client_secret:
+        form['client_secret'] = cfg.client_secret
     req = urllib.request.Request(cfg.token_url, data=urllib.parse.urlencode(form).encode('ascii'),
                                  headers={'Content-Type': 'application/x-www-form-urlencoded',
                                           'Accept': 'application/json'})
