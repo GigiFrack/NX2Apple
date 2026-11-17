@@ -37,6 +37,7 @@ from . import build_failure as bf
 from . import features as feat
 from . import inputs
 from . import library as lib
+from . import nextendo_auth
 from . import platform_util as pu
 from . import refresh_flow as rf
 from . import style
@@ -2404,12 +2405,73 @@ class MainWindow(QMainWindow):
         self.tools_group = self._build_tools_card()
         scol.addWidget(self.tools_group)
 
-        # 3. App Card (section.app: 13-Language Dropdown + Notify + Setup Wizard + Version)
+        # 3. Nextendo Card (account + token for online play)
+        self.nextendo_group = self._build_nextendo_card()
+        scol.addWidget(self.nextendo_group)
+
+        # 4. App Card (section.app: 13-Language Dropdown + Notify + Setup Wizard + Version)
         self.app_group = self._build_app_card()
         scol.addWidget(self.app_group)
 
         scol.addStretch(1)
         return sbody
+
+    def _build_nextendo_card(self) -> CardGroup:
+        """The account row: sign in once, and the token file the game on the phone reads."""
+        grp = CardGroup(title=self.m.t('section.nextendo'))
+
+        row = QWidget()
+        col = QVBoxLayout(row)
+        col.setContentsMargins(18, 14, 18, 14)
+        col.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self.nextendo_dot = _dot(style.NEUTRAL_DOT)
+        head.addWidget(self.nextendo_dot)
+        self.nextendo_title = QLabel(self.m.t('nextendo.title'))
+        self.nextendo_title.setObjectName('rowTitle')
+        head.addWidget(self.nextendo_title)
+        self.nextendo_status_lbl = QLabel(self.m.t('nextendo.signedOut'))
+        self.nextendo_status_lbl.setObjectName('muted')
+        head.addWidget(self.nextendo_status_lbl, 1)
+        self.nextendo_btn = QPushButton(self.m.t('nextendo.signIn'))
+        self.nextendo_btn.setObjectName('creamPill')
+        self.nextendo_btn.clicked.connect(self.m.nextendo_sign_in)
+        head.addWidget(self.nextendo_btn)
+        self.nextendo_show_btn = QPushButton(self.m.t('nextendo.showFile'))
+        self.nextendo_show_btn.clicked.connect(lambda: pu.reveal(self.m.nextendo_token_path))
+        head.addWidget(self.nextendo_show_btn)
+        col.addLayout(head)
+
+        self.nextendo_note_lbl = QLabel(self.m.t('nextendo.note'))
+        self.nextendo_note_lbl.setObjectName('muted')
+        self.nextendo_note_lbl.setWordWrap(True)
+        col.addWidget(self.nextendo_note_lbl)
+        grp.add_row(row)
+
+        self.m.nextendoChanged.connect(self._refresh_nextendo)
+        self._refresh_nextendo()
+        return grp
+
+    def _refresh_nextendo(self) -> None:
+        token = None
+        if self.m.nextendo_token_path:
+            token = nextendo_auth.read_token_file(self.m.nextendo_token_path)
+        if self.m.nextendo_error:
+            _set_dot(self.nextendo_dot, style.AMBER)
+            self.nextendo_status_lbl.setText(self.m.t('nextendo.failed', self.m.nextendo_error))
+        elif token:
+            _set_dot(self.nextendo_dot, style.GREEN)
+            self.nextendo_status_lbl.setText(
+                self.m.t('nextendo.signedIn', nextendo_auth.display_name(token) or '—'))
+        else:
+            _set_dot(self.nextendo_dot, style.NEUTRAL_DOT)
+            self.nextendo_status_lbl.setText(self.m.t('nextendo.signedOut'))
+        has_app = bool(self.m.nextendo_app_path) and Path(self.m.nextendo_app_path).is_file()
+        self.nextendo_btn.setEnabled(not self.m.nextendo_busy and has_app)
+        self.nextendo_show_btn.setVisible(bool(token))
+        self.nextendo_note_lbl.setText(self.m.t('nextendo.note' if has_app else 'nextendo.noApp'))
 
     def _build_tools_card(self) -> CardGroup:
         grp = CardGroup(title=self.m.t('section.tools'))

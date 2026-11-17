@@ -305,9 +305,23 @@ def nextendo_env(token_file: str | Path | None) -> dict[str, str]:
 
 # ---------------------------------------------------------------- helpers for the UI
 
-def describe(token: dict | None) -> str:
-    """One line for the settings row: who is signed in, or that nobody is."""
+def display_name(token: dict | None) -> str | None:
+    """Who the token belongs to, for a label: the answer's own fields, best first.
+
+    The name is composed by the caller (the row's text is translated); this only picks the field,
+    because Nextendo's answer for the emulator-class client carries `account`, not `name`.
+    """
     if not token:
-        return 'Non connesso a Nextendo'
-    name = token.get('name') or token.get('username') or token.get('email')
-    return f'Connesso a Nextendo come {name}' if name else 'Connesso a Nextendo'
+        return None
+    for key in ('name', 'username', 'display_name', 'email'):
+        v = token.get(key)
+        if isinstance(v, str) and v:
+            return v
+    account = token.get('account')
+    if isinstance(account, dict):
+        for key in ('username', 'name', 'display_name'):
+            v = account.get(key)
+            if isinstance(v, str) and v:
+                return v
+    pid = token.get('pid') or (account or {}).get('pid') if isinstance(account, dict) else token.get('pid')
+    return str(pid) if pid else None

@@ -54,6 +54,7 @@ from . import engine
 from . import input_staging
 from . import inputs
 from . import library as lib
+from . import nextendo_auth
 from . import platform_util as pu
 from . import post_build_cleanup as pbc
 from . import romfs_languages
@@ -267,6 +268,7 @@ class Model(QObject):
     driveCopyProgress = Signal(object, object)   # done_bytes, total_bytes
     driveCopyFinished = Signal(bool, bool, str)  # ok, cancelled, info
     upstreamStateChanged = Signal()
+    nextendoChanged = Signal()             # the account row: signed in, busy, or the failure's text
 
     #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
     #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
@@ -349,6 +351,10 @@ class Model(QObject):
         self.repo_busy = False
         self.repo_behind: int | None = None
         self.repo_status = ''
+        self.nextendo_token_path = self._find_nextendo_token()
+        self.nextendo_busy = False
+        self.nextendo_error = ''
+        self._nextendo_thread: threading.Thread | None = None
         self.app_update: app_update.Release | None = None
         self.app_update_busy = False
         self.app_update_progress: float | None = None
@@ -505,6 +511,53 @@ class Model(QObject):
                 self.libraryChanged.emit()
             else:
                 QMetaObject.invokeMethod(self, '_emit_library_changed', Qt.QueuedConnection)
+        except RuntimeError:
+            pass
+
+    # ---------------------------------------------------------------- Nextendo
+
+    def _find_nextendo_token(self) -> str:
+        """The token a previous run left: the row starts signed in without asking Nextendo again."""
+        path = nextendo_auth.default_token_path()
+        return str(path) if nextendo_auth.read_token_file(path) else ''
+
+    @property
+    def nextendo_app_path(self) -> str:
+        """Where the player's registered application lives (client id, and a secret if it has one)."""
+        return str(nextendo_auth.default_app_path())
+
+    def nextendo_sign_in(self) -> None:
+        """Open the browser, wait for the loopback answer, keep the token; off the UI thread."""
+        if self.nextendo_busy:
+            return
+        self.nextendo_busy = True
+        self.nextendo_error = ''
+        self._emit_nextendo_changed()
+
+        def work() -> None:
+            try:
+                cfg = nextendo_auth.Config.load(self.nextendo_app_path)
+                token = nextendo_auth.sign_in(cfg)
+                self.nextendo_token_path = str(
+                    nextendo_auth.write_token_file(token, nextendo_auth.default_token_path()))
+            except nextendo_auth.AuthError as e:
+                self.nextendo_error = str(e)
+            except Exception as e:                     # noqa: BLE001 - the row shows whatever it was
+                self.nextendo_error = f'{type(e).__name__}: {e}'
+            finally:
+                self.nextendo_busy = False
+                self._emit_nextendo_changed()
+
+        self._nextendo_thread = threading.Thread(target=work, daemon=True)
+        self._nextendo_thread.start()
+
+    @Slot()
+    def _emit_nextendo_changed(self) -> None:
+        try:
+            if QThread.currentThread() is self.thread():
+                self.nextendoChanged.emit()
+            else:
+                QMetaObject.invokeMethod(self, '_emit_nextendo_changed', Qt.QueuedConnection)
         except RuntimeError:
             pass
 

@@ -214,9 +214,11 @@ class StorageTests(unittest.TestCase):
                 na.Config.load(p)
             self.assertIn('client_id', str(cm.exception))
 
-    def test_describe_names_the_account_when_it_can(self):
-        self.assertIn('Mattia', na.describe(TOKEN))
-        self.assertIn('Non connesso', na.describe(None))
+    def test_the_displayed_name_comes_from_the_answer(self):
+        self.assertEqual(na.display_name(TOKEN), 'Mattia')
+        self.assertIsNone(na.display_name(None))
+        self.assertEqual(na.display_name({'access_token': 't', 'account': {'username': 'mattia'}}), 'mattia')
+        self.assertEqual(na.display_name({'access_token': 't', 'account': {'pid': 42}}), '42')
 
 
 class RegisteredClientTests(unittest.TestCase):
