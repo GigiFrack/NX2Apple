@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 09:40:21 +0000
+Subject: [PATCH] fonts: the source font may be a collection
+
+On Windows the standard font is often a .ttc (Microsoft YaHei, Malgun Gothic, Yu Gothic: the CJK
+faces ship as collections), and fontTools refuses a collection without a face number
+(TTLibFileIsCollectionError). The first face is the one a font picker shows, so both readers take
+it: the cuts in make_shared_fonts and the letter font of make_ext_font.
+
+Verified with a two-face collection: the five cuts and the Nintendo extension font are made from it.
+
+Upstream-Status: pending
+Reason: a build that a Windows font breaks: the shared-font cuts open the source font with TTFont(path), and Windows' CJK faces are .ttc collections. Not fork-specific — worth a PR upstream
+Issue: none opened yet
+
+---
+ dm/tools/make_ext_font.py     |  8 ++++++--
+ dm/tools/make_shared_fonts.py | 14 ++++++++++++--
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/dm/tools/make_ext_font.py b/dm/tools/make_ext_font.py
+index 145c7d2..122ae68 100644
+--- a/dm/tools/make_ext_font.py
++++ b/dm/tools/make_ext_font.py
+@@ -3,7 +3,7 @@
+ # The host has no original system fonts; button icons in game text (e.g. Mario's GameMsg/Key.msbt: U+E0E0 = A button) render as "?" when the glyph is missing. Letters come from macOS's Arial Rounded Bold, knocked out of a solid plate.
+ # Usage: make_ext_font.py out.ttf [letter-font.ttf]; needs fontTools (pip install fonttools)
+ import math, sys
+-from fontTools.ttLib import TTFont
++from fontTools.ttLib import TTFont, TTLibFileIsCollectionError
+ from fontTools.fontBuilder import FontBuilder
+ from fontTools.pens.ttGlyphPen import TTGlyphPen
+ from fontTools.pens.transformPen import TransformPen
+@@ -43,7 +43,11 @@ def rot(pts, cx, cy, deg):
+ 
+ class Letters:
+     def __init__(self, path):
+-        self.f = TTFont(path); self.gs = self.f.getGlyphSet(); self.cmap = self.f.getBestCmap()
++        try:                      # a .ttc is a collection: fontTools needs a face number, and the first
++            f = TTFont(path)      # face is the one a font picker shows (see make_shared_fonts.open_font)
++        except TTLibFileIsCollectionError:
++            f = TTFont(path, fontNumber=0)
++        self.f = f; self.gs = self.f.getGlyphSet(); self.cmap = self.f.getBestCmap()
+     def knock(self, pen, text, cx, cy, h):
+         # knock text out of the plate, centred at (cx, cy) with height h
+         names = [self.cmap[ord(ch)] for ch in text]; x = 0; parts = []
+diff --git a/dm/tools/make_shared_fonts.py b/dm/tools/make_shared_fonts.py
+index f9d4c69..36f86b9 100644
+--- a/dm/tools/make_shared_fonts.py
++++ b/dm/tools/make_shared_fonts.py
+@@ -8,7 +8,17 @@ holds the characters of its type only, as Nintendo's set splits them; each takes
+ Usage: make_shared_fonts.py out_dir [source.ttf]; needs fontTools (pip install fonttools)"""
+ import os, sys
+ from fontTools import subset
+-from fontTools.ttLib import TTFont
++from fontTools.ttLib import TTFont, TTLibFileIsCollectionError
++
++
++def open_font(path):
++    """The source font, which may be a .ttc: a collection needs a face number and fontTools refuses
++    one without it (TTLibFileIsCollectionError). Its first face is the one a font picker shows, and
++    Windows' CJK fonts are collections, so the build's font often is one."""
++    try:
++        return TTFont(path)
++    except TTLibFileIsCollectionError:
++        return TTFont(path, fontNumber=0)
+ 
+ SOURCE = '/System/Library/Fonts/Supplemental/Arial Unicode.ttf'   # macOS's; STD_FONT / the second argument names another (build_ipa.sh, the NSP script)
+ LETTERS = '/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf'   # the button icons' letters (make_ext_font.py)
+@@ -45,7 +55,7 @@ def charsets():
+     }
+ 
+ def cut(src, out, chars, name):
+-    f = TTFont(src)
++    f = open_font(src)
+     have = sorted(c for c in chars if c in (f.getBestCmap() or {}))
+     # No hinting: its program sizes the engine's interpreter memory (Arial Unicode: 4,139 stack elements, a 9 KB prep). Of the layout tables only kerning: GSUB's forms grow the tables and the glyph count
+     o = subset.Options(hinting=False, layout_features=['kern'], name_IDs=['*'], name_languages=['*'], notdef_outline=True, recalc_bounds=True)
