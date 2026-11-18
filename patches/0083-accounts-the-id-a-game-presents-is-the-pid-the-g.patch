@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 21:25:35 +0000
+Subject: [PATCH] accounts: the id a game presents is the pid the game token
+ proves
+
+Upstream-Status: fork-only
+Reason: Nextendo's integration guide: the network service account id a game presents must be the `pid` that the
+ `nx2` game token proves, because the server accepts the login only for the account the signed `nnex` claim names
+ (`LoadNetworkServiceAccountIdTokenCache`'s token, see the previous patch). The host used to answer an id derived
+ from its own device id, which no token can prove. Only read when DM_NEXTENDO=1 and DM_NEXTENDO_PID is set.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_account.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_account.c b/dm/host/hle_account.c
+index 1272184..0adbd35 100644
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -6,6 +6,8 @@
+ #include "hle_dauth.h"
+ #include "hle_nextendo.h"
+ 
++#include <stdlib.h>                 // getenv, strtoull: DM_NEXTENDO_PID
++
+ typedef struct { uint64_t v[2]; } Uid;                 // nn::account::Uid, 16 bytes
+ typedef struct { uint64_t v[3]; } UserHandle;          // nn::account::UserHandle, 24 bytes
+ _Static_assert(sizeof(Uid) == 16, "Uid");
+@@ -63,11 +65,22 @@ HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHand
+     if (!dm_nd_enabled()) return RES_FAIL;
+     return dm_acc_nsa_ensure() ? RES_FAIL : RES_OK;
+ }
+-HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", "the account id, stable per device (DM_NEXTENDO=1); cut otherwise", Result, h_acc_GetNsaId, void *id, const UserHandle *h) {
++// The account id a game shows the network as. With a Nextendo game token in the environment it must be
++// the `pid` that token proves (`DM_NEXTENDO_PID`): the server binds the login to the account the signed
++// `nnex` claim names, so an id this host made up on its own would be refused. Without one, the old
++// device-derived id stands.
++HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", "the Nextendo pid when DM_NEXTENDO_PID is set, else an id stable per device (DM_NEXTENDO=1); cut otherwise", Result, h_acc_GetNsaId, void *id, const UserHandle *h) {
+     (void)h;
+     if (!dm_nd_enabled()) return RES_FAIL;
+-    uint64_t v;
+-    if (dm_acc_nsa_id(&v)) return RES_FAIL;
++    uint64_t v = 0;
++    const char *pid = getenv("DM_NEXTENDO_PID");
++    if (pid && *pid) {
++        char *end = NULL;
++        v = strtoull(pid, &end, 10);
++        if (!v || (end && *end)) return RES_FAIL;          // a malformed pid is a configuration error
++    } else if (dm_acc_nsa_id(&v)) {
++        return RES_FAIL;
++    }
+     if (id) *(uint64_t *)id = v;
+     return RES_OK;
+ }
