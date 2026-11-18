@@ -164,6 +164,12 @@ blocking.
 SecureTransport is deprecated since iOS 13 but present in every iPhoneOS SDK, including the 27.2 one
 the Windows path fetches — the same trade the iOS port already makes elsewhere.
 
+**State: done and verified.** Run 44246904669: the four network tests plus `t_ssl_local` all print
+`ok`, and the unit compiles for `arm64-apple-ios26.0`. What is proven is the handshake and one message
+each way against a local server with a throwaway certificate, verification off; what is not proven is
+anything specific to Nextendo's server (their certificate chain, ALPN, session tickets), because that
+needs the account to exist first.
+
 Order of work: context objects first (a handle table via `objmap`), then one connection that
 handshakes over a guest fd, then read/write, then the diagnostics that games call after a failure.
 The test is a local TLS server (Python's `ssl` module) that the host test speaks to; it runs in the
