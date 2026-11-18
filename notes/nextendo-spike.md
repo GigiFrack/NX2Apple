@@ -164,6 +164,28 @@ blocking.
 SecureTransport is deprecated since iOS 13 but present in every iPhoneOS SDK, including the 27.2 one
 the Windows path fetches — the same trade the iOS port already makes elsewhere.
 
+## 5e. The network service account, and the surprise
+
+`hle_account.c` has carried the whole `nn::account` surface with real mangled names all along, and
+the online cut was six entries: `EnsureNetworkServiceAccountAvailable`,
+`GetNetworkServiceAccountId`, `LoadNetworkServiceAccountIdTokenCache`,
+`IsNetworkServiceAccountAvailable`, `ShowLicenseRequirementsForNetworkService`, and the async form
+with `AsyncContext::GetResult`. So there was never a symbol-name guessing problem — the binding
+existed, it just answered "no".
+
+They answer from the chain now, behind `DM_NEXTENDO`: the token is `aauth`'s, the account id is
+FNV-1a over the device id (stable between runs, different between installs), and the application id
+is `DM_NEXTENDO_APP_ID` because it is per-game data the launcher already has.
+
+**State: verified against the mock** (run 44250236052: the test prints `ok`, and every one of the
+four endpoints answered 200). Two costs worth knowing, both seen there:
+
+- The **first** TLS call costs ~35 s against a self-signed certificate and later ones are instant:
+  macOS's trust evaluation tries to reach a responder that does not exist. A CA-signed certificate
+  should not do this, but if the phone's first online call looks frozen, this is why.
+- The chain runs **twice** when the test asks for the token directly and then through the account:
+  `dm_acc_nsa_ensure` keeps its own cache, which is the intended behaviour in the launcher.
+
 **State: done and verified.** Run 44246904669: the four network tests plus `t_ssl_local` all print
 `ok`, and the unit compiles for `arm64-apple-ios26.0`. What is proven is the handshake and one message
 each way against a local server with a throwaway certificate, verification off; what is not proven is

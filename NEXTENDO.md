@@ -33,6 +33,9 @@ The layers below the game's own code, in the order a game uses them:
    blocking mode, timeouts and errno stay where they already are (`0066`).
 3. **The dauth chain.** Challenge, device tokens, edge tokens, application auth token — the four
    calls `nx-dauth` serves, as a host module (`0070`).
+4. **The network service account.** `nn::account`'s six online entries, which used to answer "no",
+   now answer from that chain: available, an id stable per device, and the token itself (`0073`).
+   They need `DM_NEXTENDO_APP_ID`, the title id the launcher already knows.
 
 ## What is proven, and how
 
@@ -50,9 +53,9 @@ The layers below the game's own code, in the order a game uses them:
 
 ## What is not built
 
-- **The `nn::dauth` and `nn::account` IPC bindings.** The chain exists as a host module; the
-  service surface a game calls is not written, because the mangled names have to come from the
-  game's own imports rather than from guessing.
+- **The `nn::dauth` service surface.** `nn::account` is bound (`hle_account.c` always had the real
+  names), but the dauth entry points a game calls directly are not written: no symbol of them has
+  been seen yet, and guessing mangled names is how a day disappears.
 - **The iPhone shell.** `frontend-ios` has no Nextendo settings yet: the token, the switch and the
   map have to reach the engine when a game is launched. Today the card exists only in the Qt
   launcher.

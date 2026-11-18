@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:19:16 +0000
+Subject: [PATCH] host: the dauth client is quiet when it works
+
+The per-call lines were there to find out why the chain stopped; it works now. A failure still
+prints its status and the start of the answer, which is the line worth having when it breaks.
+
+Upstream-Status: fork-only
+Reason: the diagnostics of 0074/0075 did their job; a failing call still prints its status and body, a working one says nothing
+Issue: none opened yet — folds into the dauth PR
+
+---
+ dm/host/hle_dauth.c | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/dm/host/hle_dauth.c b/dm/host/hle_dauth.c
+index dbfbe6b..56750f2 100644
+--- a/dm/host/hle_dauth.c
++++ b/dm/host/hle_dauth.c
+@@ -37,9 +37,7 @@ static int dauth_connect(const char *host, int port) {
+     sa.sin_family = AF_INET;
+     sa.sin_port = htons((uint16_t)port);
+     uint32_t addrs[4];
+-    int mapped = dm_nd_lookup(host, addrs, 4);
+-    fprintf(stderr, "dauth: %s -> %d via the map\n", host, mapped);
+-    if (mapped > 0) {
++    if (dm_nd_lookup(host, addrs, 4) > 0) {
+         sa.sin_addr.s_addr = htonl(addrs[0]);      // the map keeps addresses in host order
+     } else {
+         struct addrinfo hints, *res = NULL;
+@@ -141,10 +139,9 @@ static int http_call(const char *host, int port, const char *method, const char
+                 out[len] = 0;
+             }
+         }
+-        fprintf(stderr, "dauth: %s%s -> status %d, %zu bytes: %.60s\n", host, path, status, got, buf);
++        if (status != 200)                            // a failure is worth a line; a success is not
++            fprintf(stderr, "dauth: %s%s -> status %d, %zu bytes: %.60s\n", host, path, status, got, buf);
+         free(buf);
+-    } else {
+-        fprintf(stderr, "dauth: %s%s -> no buffer\n", host, path);
+     }
+     return status;
+ }
