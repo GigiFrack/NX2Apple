@@ -1,0 +1,621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 01:20:03 +0000
+Subject: [PATCH] host: real TCP sockets behind DM_NEXTENDO
+
+The offline BSD service is a self-contained datagram transport: nothing leaves the process,
+every address is 127.x, and the receive queue is memory. nextendo-nex speaks PRUDP over TCP
+(and TLS later), so stream sockets now get their own table, their own descriptors and the
+real stack, while the datagram and EventFd paths stay byte-for-byte what they were.
+
+Descriptors start at 512, above the offline table's range, so each entry point answers from
+the right table with one compare and the old bitmasks never see a descriptor they cannot
+hold. Blocking send/recv release the guest core the way the rest of the host does, poll
+samples both kinds (a millisecond of granularity on a network wait), and with DM_NEXTENDO
+unset a stream socket is refused exactly as before.
+
+t_net_tcp opens a listener on 127.0.0.1, connects through the service, carries one message
+each way, checks GetPeerName, and checks that the switch-off answer is still ENETDOWN.
+
+Upstream-Status: fork-only
+Reason: upstream keeps every online service cut (hle_offline.c) so there is no stream socket to speak PRUDP over; the fork needs one for Nextendo and keeps it behind DM_NEXTENDO
+Issue: none opened yet — notes/nextendo-spike.md carries the plan and the open question for Nextendo
+
+---
+ dm/host/hle_net.c         | 357 +++++++++++++++++++++++++++++++++++++-
+ dm/host/tests/Makefile    |   3 +
+ dm/host/tests/t_net_tcp.c | 103 +++++++++++
+ 3 files changed, 460 insertions(+), 3 deletions(-)
+ create mode 100644 dm/host/tests/t_net_tcp.c
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index dd4e68b..20807fb 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -47,10 +47,308 @@ void dm_guest_sleep_ns(int64_t ns);
+ void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns);
+ static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000); return 0; }
+ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
++
+ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLNVAL = 0x20,
+        SK_EBADF = 9, SK_EAGAIN = 35, SK_EINVAL = 22, SK_EMSGSIZE = 40, SK_EOPNOTSUPP = 45, SK_EADDRINUSE = 48, SK_ENOTCONN = 57,
+        SK_NONBLOCK = 0x800, SK_MSG_PEEK = 2, SK_MSG_DONTWAIT = 0x80, SK_UDP = 2, SK_EFD = 1,
+        SK_UDP_MAX = 65507, SK_QUEUE_MAX = 1024 * 1024, SK_PACKET_MAX = 256, SK_DEFAULT_BUF = 256 * 1024 };
++
++// ---------------------------------------------------------------- Nextendo: real TCP (DM_NEXTENDO=1)
++// The service above is deliberately a self-contained datagram transport: nothing leaves the process,
++// every address is 127.x, and the receive queue is memory. A game talking to Nextendo needs the
++// opposite, so stream sockets get their own table and the real stack, and every datagram/EventFd path
++// above keeps behaving exactly as before (DM_NEXTENDO unset: dm_nd_enabled() is 0 and no branch here
++// is taken). Descriptors start at ND_TCP_BASE, above the offline table's range, so an existing entry
++// point tells the two apart with one compare and the old bitmasks never see a descriptor they cannot
++// hold. Horizon's sockaddr_in is the FreeBSD one the comment above describes: {len, family, port,
++// address} with port and address in network byte order.
++#include "hle_nextendo.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#define ND_TCP_MAX 32
++#define ND_TCP_BASE 512            // above EFD_MAX (64), inside the 1024 bits of an fd_set
++#define ND_NOT (-2)                // "not one of ours": the caller runs its datagram path
++#define ND_ENOTCONN 57
++#define ND_EPIPE 32
++#define ND_EISCONN 56
++#define ND_ECONNREFUSED 61
++#define ND_EINPROGRESS 36
++#define ND_ETIMEDOUT 60
++#define ND_EMSGSIZE 40
++
++typedef struct {
++    int used, host, nonblock, shut_r, shut_w;
++    int64_t rtimeo, stimeo;        // nanoseconds, 0 = no timeout
++    uint32_t local, peer; uint16_t local_port, peer_port;
++} nd_tcp_ent;
++
++static nd_tcp_ent g_nd_tcp[ND_TCP_MAX];
++static pthread_mutex_t g_nd_tcp_m = PTHREAD_MUTEX_INITIALIZER;
++
++static int nd_tcp_range(int fd) { int i = fd - ND_TCP_BASE; return i >= 0 && i < ND_TCP_MAX; }
++static nd_tcp_ent *nd_tcp_locked(int fd) {
++    int i = fd - ND_TCP_BASE;
++    return nd_tcp_range(fd) && g_nd_tcp[i].used ? &g_nd_tcp[i] : NULL;
++}
++static int nd_errno(int e) {
++    switch (e) {
++    case EAGAIN: return 35;
++    case EINVAL: return 22;
++    case ECONNREFUSED: return ND_ECONNREFUSED;
++    case EINPROGRESS: return ND_EINPROGRESS;
++    case ETIMEDOUT: return ND_ETIMEDOUT;
++    case EISCONN: return ND_EISCONN;
++    case EPIPE: return ND_EPIPE;
++    case ENOTCONN: return ND_ENOTCONN;
++    case EADDRINUSE: return 48;
++    case EMSGSIZE: return ND_EMSGSIZE;
++    default: return SK_ENETDOWN;
++    }
++}
++static int nd_addr_read(const void *a, unsigned n, uint32_t *addr, uint16_t *port) {
++    if (!a || n < 16) return sk_error(22);
++    const uint8_t *b = a;
++    if (b[1] != 2 || (b[0] && b[0] != 16)) return sk_error(22);
++    *port = (uint16_t)((unsigned)b[2] << 8 | b[3]);
++    *addr = (uint32_t)b[4] << 24 | (uint32_t)b[5] << 16 | (uint32_t)b[6] << 8 | b[7];
++    return 0;
++}
++static void nd_addr_write(void *a, unsigned *n, uint32_t addr, uint16_t port) {
++    if (!a) return;
++    uint8_t b[16] = {16, 2, (uint8_t)(port >> 8), (uint8_t)port,
++                     (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr};
++    unsigned c = n && *n < 16 ? *n : 16;
++    memcpy(a, b, c);
++    if (n) *n = 16;
++}
++
++// A stream socket: af inet, type stream. Returns -1 with the guest errno on failure, ND_NOT when this
++// is not a stream socket at all (the caller then answers as it always did).
++int dm_nd_tcp_socket(int family, int type, int protocol) {
++    if (family != 2 || type != 1 || (protocol && protocol != 6)) return ND_NOT;
++    if (!dm_nd_enabled()) return sk_error(SK_ENETDOWN);
++    int h = (int)socket(AF_INET, SOCK_STREAM, 0);
++    if (h < 0) return sk_error(nd_errno(errno));
++    pthread_mutex_lock(&g_nd_tcp_m);
++    for (int i = 0; i < ND_TCP_MAX; i++) if (!g_nd_tcp[i].used) {
++        memset(&g_nd_tcp[i], 0, sizeof g_nd_tcp[i]);
++        g_nd_tcp[i].used = 1; g_nd_tcp[i].host = h;
++        pthread_mutex_unlock(&g_nd_tcp_m);
++        return ND_TCP_BASE + i;
++    }
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    close(h);
++    return sk_error(24);           // EMFILE
++}
++
++int dm_nd_tcp_close(int fd) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host; e->used = 0; e->host = -1;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (h >= 0) close(h);
++    return 0;
++}
++
++int dm_nd_tcp_bind(int fd, const void *a, unsigned n) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    uint32_t addr = 0; uint16_t port = 0;
++    if (nd_addr_read(a, n, &addr, &port)) return -1;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host;
++    e->local = addr; e->local_port = port;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (!port) return 0;                       // ephemeral: the host picks one at connect time
++    struct sockaddr_in sa = {0};
++    sa.sin_family = AF_INET; sa.sin_port = htons(port);
++    sa.sin_addr.s_addr = htonl(addr);
++    int one = 1;
++    setsockopt(h, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++    if (bind(h, (struct sockaddr *)&sa, sizeof sa) < 0) return sk_error(nd_errno(errno));
++    return 0;
++}
++
++int dm_nd_tcp_connect(int fd, const void *a, unsigned n) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    uint32_t addr = 0; uint16_t port = 0;
++    if (nd_addr_read(a, n, &addr, &port)) return -1;
++    if (!port) return sk_error(22);
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host, nonblock = e->nonblock;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    struct sockaddr_in sa = {0};
++    sa.sin_family = AF_INET; sa.sin_port = htons(port); sa.sin_addr.s_addr = htonl(addr);
++    int r = connect(h, (struct sockaddr *)&sa, sizeof sa);
++    if (r < 0) {
++        int err = errno;
++        if (err == EINPROGRESS && nonblock) return sk_error(ND_EINPROGRESS);
++        return sk_error(nd_errno(err));
++    }
++    pthread_mutex_lock(&g_nd_tcp_m);
++    e->peer = addr; e->peer_port = port;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    return 0;
++}
++
++long dm_nd_tcp_send(int fd, const void *data, unsigned long n, int flags) {
++    (void)flags;
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    if (!data && n) return sk_error(22);
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host, nonblock = e->nonblock, shut = e->shut_w;
++    int64_t deadline = e->stimeo ? guest_ns() + e->stimeo : 0;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (shut) return sk_error(ND_EPIPE);
++    for (;;) {
++        ssize_t w = send(h, data, n, MSG_NOSIGNAL);
++        if (w >= 0) return (long)w;
++        if (errno != EAGAIN && errno != EWOULDBLOCK) return sk_error(nd_errno(errno));
++        if (nonblock) return sk_error(35);
++        if (deadline && guest_ns() > deadline) return sk_error(ND_ETIMEDOUT);
++        dm_guest_sleep_ns(1000000);
++    }
++}
++
++long dm_nd_tcp_recv(int fd, void *data, unsigned long n, int flags, void *a, unsigned *al) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    if (!data && n) return sk_error(22);
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host, nonblock = e->nonblock, shut = e->shut_r;
++    int64_t deadline = e->rtimeo ? guest_ns() + e->rtimeo : 0;
++    uint32_t peer = e->peer; uint16_t peer_port = e->peer_port;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (shut) return 0;
++    int sysflags = (flags & 2) ? MSG_PEEK : 0;
++    for (;;) {
++        ssize_t r = recv(h, data, n, sysflags | MSG_DONTWAIT);
++        if (r >= 0) { nd_addr_write(a, al, peer, peer_port); return (long)r; }   // 0 = the peer closed
++        if (errno != EAGAIN && errno != EWOULDBLOCK) return sk_error(nd_errno(errno));
++        if (nonblock) return sk_error(35);
++        if (deadline && guest_ns() > deadline) return sk_error(35);
++        dm_guest_sleep_ns(1000000);
++    }
++}
++
++int dm_nd_tcp_shutdown(int fd, int how) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    if (how < 0 || how > 2) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(22); }
++    int h = e->host;
++    if (how != 1) e->shut_r = 1;
++    if (how != 0) e->shut_w = 1;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    shutdown(h, how);
++    return 0;
++}
++
++int dm_nd_tcp_name(int fd, void *a, unsigned *n, int peer) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (peer) {
++        struct sockaddr_in sa; socklen_t sl = sizeof sa;
++        if (getpeername(h, (struct sockaddr *)&sa, &sl) < 0) return sk_error(ND_ENOTCONN);
++        nd_addr_write(a, n, ntohl(sa.sin_addr.s_addr), ntohs(sa.sin_port));
++    } else {
++        struct sockaddr_in sa; socklen_t sl = sizeof sa;
++        if (getsockname(h, (struct sockaddr *)&sa, &sl) < 0) return sk_error(22);
++        nd_addr_write(a, n, ntohl(sa.sin_addr.s_addr), ntohs(sa.sin_port));
++    }
++    return 0;
++}
++
++int dm_nd_tcp_fcntl(int fd, int cmd, int value) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host, r = 0;
++    if (cmd == 3) r = e->nonblock ? SK_NONBLOCK : 0;
++    else if (cmd == 4) { e->nonblock = (value & SK_NONBLOCK) != 0; fcntl(h, F_SETFL, e->nonblock ? O_NONBLOCK : 0); }
++    else if (cmd != 1 && cmd != 2) r = sk_error(22);
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    return r;
++}
++
++int dm_nd_tcp_setopt(int fd, int level, int option, const void *value, unsigned size) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    if (!value) return sk_error(22);
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int h = e->host, r = 0;
++    if (level == 0xffff && (option == 0x1006 || option == 0x1005) && size >= 16) {
++        int64_t tv[2]; memcpy(tv, value, sizeof tv);
++        int64_t ns = tv[0] < 0 ? 0 : tv[0] * 1000000000 + tv[1] * 1000;
++        if (option == 0x1006) e->rtimeo = ns; else e->stimeo = ns;
++    } else if (level == 6 && option == 1 && size >= sizeof(int)) {      // IPPROTO_TCP, TCP_NODELAY
++        int v; memcpy(&v, value, sizeof v); setsockopt(h, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
++    } else if (level == 0xffff) {
++        /* SO_REUSEADDR and friends: accepted and not needed on a stream socket here */
++    } else r = sk_error(42);
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    return r;
++}
++
++int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    if (!value || !size) return sk_error(22);
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
++    int v = 0;
++    if (level == 0xffff && (option == 0x1006 || option == 0x1005) && *size >= 16) {
++        int64_t ns = option == 0x1006 ? e->rtimeo : e->stimeo;
++        int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000};
++        memcpy(value, tv, sizeof tv); *size = sizeof tv;
++    } else if (*size >= sizeof v) {
++        if (option == 0x1008) v = 1;            // SOCK_STREAM
++        else if (option == 0x1007) v = 0;       // IPPROTO_IP
++        else if (option == 0x1016) v = 6;       // IPPROTO_TCP
++        memcpy(value, &v, sizeof v); *size = sizeof v;
++    }
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    return 0;
++}
++
++// Readiness of one stream socket, without waiting: the poll loop below samples it.
++static int nd_tcp_ready(int fd, int16_t events) {
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return SK_POLLNVAL; }
++    int h = e->host, shut_r = e->shut_r;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (shut_r) return (int)(events & (SK_POLLIN | SK_POLLRDNORM));
++    struct pollfd hp = {h, 0, 0};
++    if (events & (SK_POLLIN | SK_POLLRDNORM)) hp.events |= POLLIN;
++    if (events & (SK_POLLOUT | SK_POLLWRNORM)) hp.events |= POLLOUT;
++    if (poll(&hp, 1, 0) <= 0) return 0;
++    int rev = 0;
++    if (hp.revents & (POLLIN | POLLHUP | POLLERR)) rev |= events & (SK_POLLIN | SK_POLLRDNORM);
++    if (hp.revents & POLLOUT) rev |= events & (SK_POLLOUT | SK_POLLWRNORM);
++    return rev;
++}
+ typedef struct sk_packet { struct sk_packet *next; uint32_t addr; uint16_t port; size_t size; uint8_t data[]; } sk_packet;
+ static struct {
+     uint64_t count, generation; int used, flags, fdflags;
+@@ -78,10 +376,14 @@ static int efd_create(uint64_t v, int flags) {
+     pthread_mutex_unlock(&g_efd_m); return fd;
+ }
+ int dm_sk_socket(int family, int type, int protocol) {
++    int tcp = dm_nd_tcp_socket(family, type, protocol);
++    if (tcp != ND_NOT) return tcp;
+     if (family != 2 || type != 2 || (protocol && protocol != 17)) return sk_fail();
+     dm_host_mutex_lock(&g_efd_m); int fd = sk_new_locked(SK_UDP); pthread_mutex_unlock(&g_efd_m); return fd;
+ }
+ int dm_sk_close(int fd) {
++    int tcp = dm_nd_tcp_close(fd);
++    if (tcp != ND_NOT) return tcp;
+     dm_host_mutex_lock(&g_efd_m);
+     if (!sk_used(fd)) { pthread_mutex_unlock(&g_efd_m); return sk_fail(); }
+     sk_packet *p = g_efd[fd].head;
+@@ -149,10 +451,14 @@ static int sk_bind_locked(int fd, uint32_t addr, uint16_t port) {
+     g_efd[fd].addr = addr; g_efd[fd].port = port; return 0;
+ }
+ int dm_sk_bind(int fd, const void *a, unsigned n) {
++    int tcp = dm_nd_tcp_bind(fd, a, n);
++    if (tcp != ND_NOT) return tcp;
+     uint32_t addr; uint16_t port; if (sk_addr_read(a, n, &addr, &port)) return -1;
+     dm_host_mutex_lock(&g_efd_m); int r = sk_udp_locked(fd) ? sk_bind_locked(fd, addr, port) : sk_error(SK_EBADF); pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ int dm_sk_connect(int fd, const void *a, unsigned n) {
++    int tcp = dm_nd_tcp_connect(fd, a, n);
++    if (tcp != ND_NOT) return tcp;
+     uint32_t addr = 0; uint16_t port = 0; int disconnect = a && n >= 2 && ((const uint8_t *)a)[1] == 0;
+     if (!disconnect && sk_addr_read(a, n, &addr, &port)) return -1;
+     if (!disconnect && !port) return sk_error(SK_EINVAL);
+@@ -163,6 +469,8 @@ int dm_sk_connect(int fd, const void *a, unsigned n) {
+     pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ int dm_sk_name(int fd, void *a, unsigned *n, int peer) {
++    int tcp = dm_nd_tcp_name(fd, a, n, peer);
++    if (tcp != ND_NOT) return tcp;
+     if (!a || !n) return sk_error(SK_EINVAL);
+     dm_host_mutex_lock(&g_efd_m); int r;
+     if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+@@ -171,6 +479,8 @@ int dm_sk_name(int fd, void *a, unsigned *n, int peer) {
+     pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ int dm_sk_shutdown(int fd, int how) {
++    int tcp = dm_nd_tcp_shutdown(fd, how);
++    if (tcp != ND_NOT) return tcp;
+     dm_host_mutex_lock(&g_efd_m); int r = 0;
+     if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+     else if (how < 0 || how > 2) r = sk_error(SK_EINVAL);
+@@ -179,6 +489,8 @@ int dm_sk_shutdown(int fd, int how) {
+     pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ int dm_sk_fcntl(int fd, int cmd, int value) {
++    int tcp = dm_nd_tcp_fcntl(fd, cmd, value);
++    if (tcp != ND_NOT) return tcp;
+     dm_host_mutex_lock(&g_efd_m); int r = 0;
+     if (!sk_used(fd)) r = sk_error(SK_EBADF);
+     else if (cmd == 1) r = g_efd[fd].fdflags;
+@@ -189,6 +501,8 @@ int dm_sk_fcntl(int fd, int cmd, int value) {
+     pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ int dm_sk_setopt(int fd, int level, int option, const void *value, unsigned size) {
++    int tcp = dm_nd_tcp_setopt(fd, level, option, value, size);
++    if (tcp != ND_NOT) return tcp;
+     if (!value) return sk_error(SK_EINVAL);
+     dm_host_mutex_lock(&g_efd_m); int r = 0;
+     if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+@@ -209,6 +523,8 @@ int dm_sk_setopt(int fd, int level, int option, const void *value, unsigned size
+     pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ int dm_sk_getopt(int fd, int level, int option, void *value, unsigned *size) {
++    int tcp = dm_nd_tcp_getopt(fd, level, option, value, size);
++    if (tcp != ND_NOT) return tcp;
+     if (!value || !size) return sk_error(SK_EINVAL);
+     dm_host_mutex_lock(&g_efd_m); int r = 0, v = 0;
+     if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+@@ -228,6 +544,8 @@ int dm_sk_getopt(int fd, int level, int option, void *value, unsigned *size) {
+     pthread_mutex_unlock(&g_efd_m); return r;
+ }
+ long dm_sk_sendto(int fd, const void *data, unsigned long n, int flags, const void *a, unsigned al) {
++    long tcp = dm_nd_tcp_send(fd, data, n, flags);
++    if (tcp != ND_NOT) return tcp;
+     if ((!data && n) || n > SK_UDP_MAX) return sk_error(n > SK_UDP_MAX ? SK_EMSGSIZE : SK_EINVAL);
+     if (flags & ~(SK_MSG_DONTWAIT | 4 | 0x20000)) return sk_error(SK_EOPNOTSUPP);
+     uint32_t addr = 0; uint16_t port = 0; if (a && sk_addr_read(a, al, &addr, &port)) return -1;
+@@ -272,6 +590,8 @@ long dm_sk_write(int fd, const void *data, unsigned long size) {
+     uint64_t v; memcpy(&v, data, sizeof v); return efd_write(fd, v) ? -1 : (long)sizeof v;
+ }
+ long dm_sk_recvfrom(int fd, void *data, unsigned long n, int flags, void *a, unsigned *al) {
++    long tcp = dm_nd_tcp_recv(fd, data, n, flags, a, al);
++    if (tcp != ND_NOT) return tcp;
+     if ((!data && n) || (a && !al)) return sk_error(SK_EINVAL);
+     if (flags & ~(SK_MSG_DONTWAIT | SK_MSG_PEEK)) return sk_error(SK_EOPNOTSUPP);
+     dm_host_mutex_lock(&g_efd_m); long r = -1;
+@@ -308,7 +628,7 @@ static int efd_ready(sk_pollfd *p, uint64_t n, uint64_t open, const uint64_t gen
+     }
+     return ready;
+ }
+-int dm_sk_poll(void *fds, uint64_t n, int ms) {
++static int sk_poll_local(void *fds, uint64_t n, int ms) {
+     sk_pollfd *p = fds; uint64_t open = 0, generation[EFD_MAX] = {0};
+     if (!p && n) return sk_error(SK_EINVAL);
+     dm_host_mutex_lock(&g_efd_m);
+@@ -324,12 +644,43 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {
+     }
+     pthread_mutex_unlock(&g_efd_m); return ready;
+ }
++// One wait over both kinds: the datagram/EventFd entries are sampled with a zero timeout, the stream
++// sockets by the host's poll, and the loop sleeps a millisecond between samples. PRUDP is a network
++// wait, not a hot path, so a millisecond of granularity costs nothing and keeps the two locks apart.
++static int nd_poll_mixed(sk_pollfd *p, uint64_t n, int ms) {
++    int64_t start = guest_ns(), limit = (ms < 0 ? 100 : (int64_t)ms) * 1000000;
++    for (;;) {
++        int ready = 0;
++        sk_pollfd local[EFD_MAX]; int idx[EFD_MAX]; int nl = 0;
++        for (uint64_t i = 0; i < n; i++) {
++            p[i].revents = 0;
++            if (nd_tcp_range(p[i].fd)) {
++                p[i].revents = (int16_t)nd_tcp_ready(p[i].fd, p[i].events);
++                if (p[i].revents) ready++;
++            } else if (p[i].fd >= 0 && p[i].fd < EFD_MAX) { idx[nl] = (int)i; local[nl++] = p[i]; }
++        }
++        if (nl) {
++            sk_poll_local(local, (uint64_t)nl, 0);
++            for (int k = 0; k < nl; k++) if (local[k].revents) { p[idx[k]].revents = local[k].revents; ready++; }
++        }
++        if (ready) return ready;
++        int64_t left = limit - (int64_t)(guest_ns() - start);
++        if (left <= 0) return 0;
++        dm_guest_sleep_ns(left > 1000000 ? 1000000 : left);
++    }
++}
++int dm_sk_poll(void *fds, uint64_t n, int ms) {
++    sk_pollfd *p = fds;
++    if (!p && n) return sk_error(SK_EINVAL);
++    for (uint64_t i = 0; i < n; i++) if (nd_tcp_range(p[i].fd)) return nd_poll_mixed(p, n, ms);
++    return sk_poll_local(fds, n, ms);
++}
+ // fd_set is1024 bits; timeval is {i64 seconds, i64 microseconds}. Only this service's small descriptors can become ready.
+ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t *tv) {
+-    uint64_t *sets[3] = {r, w, e}; static const int16_t ask[3] = {SK_POLLIN, SK_POLLOUT, 0}; sk_pollfd p[EFD_MAX]; int np = 0;
++    uint64_t *sets[3] = {r, w, e}; static const int16_t ask[3] = {SK_POLLIN, SK_POLLOUT, 0};    sk_pollfd p[EFD_MAX + ND_TCP_MAX]; int np = 0;
+     if (nfds < 0 || (tv && (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000))) return sk_error(SK_EINVAL);
+     if (nfds > 1024) nfds = 1024;
+-    for (int fd = 0; fd < nfds && fd < EFD_MAX; fd++) { int in = 0; int16_t ev = 0;
++    for (int fd = 0; fd < nfds && (fd < EFD_MAX || nd_tcp_range(fd)); fd++) { int in = 0; int16_t ev = 0;
+         for (int k = 0; k < 3; k++) if (sets[k] && sets[k][fd >> 6] >> (fd & 63) & 1) { in = 1; ev |= ask[k]; }
+         if (in) p[np++] = (sk_pollfd){fd, ev, 0};
+     }
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 8fa1a41..5915bbc 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -50,6 +50,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_pctl
+ 	$(B)/t_net_eventfd
+ 	$(B)/t_net_loopback
++	$(B)/t_net_tcp
+ 	$(B)/t_nextendo_map
+ 	$(B)/t_sf
+ 	$(B)/t_audren_sv
+@@ -233,6 +234,8 @@ $(B)/t_net_eventfd: t_net_eventfd.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h $
+ run: $(B)/t_net_loopback
+ $(B)/t_net_loopback: t_net_loopback.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_loopback.c
++$(B)/t_net_tcp: t_net_tcp.c ../hle_net.c ../hle_net.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_tcp.c
+ # The Nextendo hostname map is plain C with no game profile: this test builds without GAME.
+ $(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+new file mode 100644
+index 0000000..1a7a904
+--- /dev/null
++++ b/dm/host/tests/t_net_tcp.c
+@@ -0,0 +1,103 @@
++// Real TCP through the BSD service: with DM_NEXTENDO=1 a stream socket reaches a listener this test
++// opens on 127.0.0.1, carries one message each way, and closes; with the switch off the same call is
++// refused with ENETDOWN, as every offline build answers it.
++//
++// The listener is a real host socket in a thread: this test proves that the service hands the guest a
++// socket that speaks to the network, not the memory queue the datagram tests check.
++#include "../hle_net.c"
++#include "../hle_nextendo.c"
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++__thread _Atomic int dm_host_work;
++
++// The host hooks hle_net.c expects from the host it is linked into (t_net_loopback's set, portable
++// here so the test also builds off Darwin).
++void dm_guest_sleep_ns(int64_t ns) {
++    struct timespec ts = {ns / 1000000000, ns % 1000000000};
++    nanosleep(&ts, NULL);
++}
++void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns) {
++    struct timespec now, abs;
++    clock_gettime(CLOCK_REALTIME, &now);
++    abs.tv_sec = now.tv_sec + ns / 1000000000;
++    abs.tv_nsec = now.tv_nsec + ns % 1000000000;
++    if (abs.tv_nsec >= 1000000000) { abs.tv_sec++; abs.tv_nsec -= 1000000000; }
++    pthread_cond_timedwait(c, m, &abs);
++}
++uint64_t guest_ns(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
++}
++int dm_detclock_enabled(void) { return 0; }
++
++static void fail(const char *what) {
++    fprintf(stderr, "not true: %s (errno %d)\n", what, dm_sk_errno());
++    exit(1);
++}
++
++static int g_port;
++
++static void *echo_server(void *arg) {
++    (void)arg;
++    int ls = socket(AF_INET, SOCK_STREAM, 0);
++    struct sockaddr_in a = {0};
++    a.sin_family = AF_INET;
++    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    a.sin_port = htons((uint16_t)g_port);
++    int one = 1;
++    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++    if (bind(ls, (struct sockaddr *)&a, sizeof a) || listen(ls, 1)) { perror("bind/listen"); return NULL; }
++    int cs = accept(ls, NULL, NULL);
++    char buf[8];
++    ssize_t n = read(cs, buf, sizeof buf);
++    if (n > 0) write(cs, buf, (size_t)n);
++    close(cs);
++    close(ls);
++    return NULL;
++}
++
++int main(void) {
++    int probe = socket(AF_INET, SOCK_STREAM, 0);            // a free port, then given to the listener
++    struct sockaddr_in a = {0};
++    a.sin_family = AF_INET;
++    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    if (bind(probe, (struct sockaddr *)&a, sizeof a)) { perror("bind"); return 1; }
++    socklen_t al = sizeof a;
++    getsockname(probe, (struct sockaddr *)&a, &al);
++    g_port = ntohs(a.sin_port);
++    close(probe);
++
++    pthread_t th;
++    pthread_create(&th, NULL, echo_server, NULL);
++    struct timespec settle = {0, 100000000};
++    nanosleep(&settle, NULL);   // the listener is up before the first connect
++
++    setenv("DM_NEXTENDO", "1", 1);
++    dm_nd_reload();
++
++    int fd = dm_sk_socket(2, 1, 0);                          // AF_INET, SOCK_STREAM
++    if (fd < ND_TCP_BASE) fail("a stream socket did not come from the stream table");
++
++    uint8_t sa[16] = {16, 2, (uint8_t)(g_port >> 8), (uint8_t)g_port, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++    if (dm_sk_connect(fd, sa, sizeof sa)) fail("connect");
++    if (dm_sk_sendto(fd, "hello", 5, 0, NULL, 0) != 5) fail("send");
++    char out[6] = {0};
++    if (dm_sk_recvfrom(fd, out, 5, 0, NULL, NULL) != 5 || memcmp(out, "hello", 5)) fail("echo");
++    if (dm_sk_name(fd, sa, &(unsigned){16}, 1)) fail("GetPeerName");
++    dm_sk_close(fd);
++    pthread_join(th, NULL);
++
++    unsetenv("DM_NEXTENDO");
++    if (dm_sk_socket(2, 1, 0) != -1) fail("a stream socket with the switch off");
++    if (dm_sk_errno() != SK_ENETDOWN) fail("the switch-off errno");
++
++    puts("ok");
++    return 0;
++}
