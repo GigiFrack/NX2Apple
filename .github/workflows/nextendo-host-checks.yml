@@ -34,11 +34,11 @@ jobs:
       - name: Engine (seedds/nxnative at the pin, plus this branch's patches)
         run: python3 tools/engine.py sync
 
-      - name: Build the two host tests (the game profile is Mario Kart 8 Deluxe)
+      - name: Build the host tests (the game profile is Mario Kart 8 Deluxe)
         run: |
           make -C engine/dm/host/tests GAME=0100152000022000 -j3 \
             build/t_nextendo_map build/t_nextendo_gai build/t_net_tcp build/t_net_udp_remote build/t_ssl_local \
-            build/t_dauth_local \
+            build/t_dauth_local build/t_nifm_nextendo \
             build/t_net_loopback \
             2>&1 | tee host-tests-build.log
 
@@ -49,6 +49,7 @@ jobs:
           engine/dm/host/tests/build/t_net_tcp
           engine/dm/host/tests/build/t_net_udp_remote
           engine/dm/host/tests/build/t_net_loopback
+          engine/dm/host/tests/build/t_nifm_nextendo
 
       - name: The TLS connection, against a real server
         run: |
