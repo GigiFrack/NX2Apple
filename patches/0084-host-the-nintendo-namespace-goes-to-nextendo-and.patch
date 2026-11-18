@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 21:56:24 +0000
+Subject: [PATCH] host: the Nintendo namespace goes to Nextendo, and the game's
+ TLS accepts their certificates
+
+Upstream-Status: fork-only
+Reason: Without a redirect the game asks the real DNS for `*.nintendo.net` and reaches Nintendo, which refuses it: the
+ hostname map alone only helps a launcher that writes every rule by hand. The reference client (Ryujinx-Nextendo's
+ DnsMitmResolver.cs) bakes no address either — it sends the whole Nintendo namespace to the server behind
+ `nex.nextendo.network` and the NAT hosts to `nat.nextendo.network`, resolved at run time. Same here, plus the two
+ TLS details that client documents: Nextendo signs those hostnames with its own roots, so a redirected connection
+ accepts their certificate instead of failing verification, and ALPN offers http/1.1 only, because NEX carries PRUDP
+ over a WebSocket and a server allowed to pick h2 never upgrades. Off with DM_NEXTENDO unset; the built-in table can be
+ turned off alone with DM_NEXTENDO_BUILTIN_HOSTS=0.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_nextendo.c         | 93 ++++++++++++++++++++++++++++++++++
+ dm/host/hle_nextendo.h         |  3 ++
+ dm/host/hle_ssl.c              | 23 ++++++++-
+ dm/host/tests/t_nextendo_gai.c |  1 +
+ dm/host/tests/t_nextendo_map.c |  1 +
+ 5 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
+index 2ebb61d..b501033 100644
+--- a/dm/host/hle_nextendo.c
++++ b/dm/host/hle_nextendo.c
+@@ -9,6 +9,7 @@
+ // No hle.h: this file has no HLE entry to register (the GetAddrInfo hook that uses it lives in
+ // hle_net.c), so it stays plain C and can be compiled and tested anywhere, off Darwin included.
+ #include "hle_nextendo.h"
++#include <netdb.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -82,6 +83,84 @@ void dm_nd_reload(void) {
+     pthread_mutex_unlock(&g_nd_m);
+ }
+ 
++// ---------------------------------------------------------------- Nextendo's built-in table
++// The reference client (Ryujinx-Nextendo, DnsMitmResolver.cs) bakes no address into its tree either:
++// it redirects the whole Nintendo namespace at the server behind `nex.nextendo.network`, and the NAT
++// hosts at the one behind `nat.nextendo.network`. Same here, resolved once on first use, and skipped
++// when DM_NEXTENDO_BUILTIN_HOSTS=0 (tests that want the map alone).
++static uint32_t g_nd_nex_ip, g_nd_nat_ip;
++static int g_nd_builtin_done;
++
++static uint32_t nd_resolve_name(const char *name) {
++    struct addrinfo hints, *res = NULL;
++    memset(&hints, 0, sizeof hints);
++    hints.ai_family = AF_INET;
++    hints.ai_socktype = SOCK_STREAM;
++    if (getaddrinfo(name, NULL, &hints, &res) || !res) return 0;
++    uint32_t ip = 0;
++    for (struct addrinfo *a = res; a; a = a->ai_next) {
++        if (a->ai_addr && a->ai_addrlen >= sizeof(struct sockaddr_in)) {
++            const struct sockaddr_in *sin = (const struct sockaddr_in *)a->ai_addr;
++            memcpy(&ip, &sin->sin_addr.s_addr, sizeof ip);   // already network order
++            break;
++        }
++    }
++    freeaddrinfo(res);
++    return ip;
++}
++
++//: 0 when the switch is off or the caller asked for its own table alone.
++static int nd_builtin_enabled(void) {
++    const char *e = getenv("DM_NEXTENDO_BUILTIN_HOSTS");
++    return !(e && e[0] == '0');
++}
++
++static void nd_builtin_resolve(void) {
++    if (g_nd_builtin_done) return;
++    g_nd_builtin_done = 1;
++    g_nd_nex_ip = nd_resolve_name("nex.nextendo.network");
++    g_nd_nat_ip = nd_resolve_name("nat.nextendo.network");
++    fprintf(stderr, "[dm] nextendo: built-in redirects, nex %08x nat %08x\n", g_nd_nex_ip, g_nd_nat_ip);
++}
++
++static int nd_ends_with(const char *host, const char *suffix) {
++    size_t hl = strlen(host), sl = strlen(suffix);
++    return hl > sl && strcasecmp(host + hl - sl, suffix) == 0;
++}
++
++//: The NAT responder's hosts answer from `nat.`: the three the reference client names first, plus the
++//: `nncs2-*.n.n.srv` family for the games whose NAT check needs a second public address.
++static int nd_is_nat_host(const char *host) {
++    return !strcasecmp(host, "g2b309e01-lp1.s.n.srv.nintendo.net") ||
++           !strcasecmp(host, "g2df33d01-lp1.p.srv.nintendo.net") ||
++           nd_ends_with(host, ".n.n.srv.nintendo.net");
++}
++
++//: Everything Nintendo's online services live under, which Nextendo answers for wholesale.
++static int nd_is_namespace(const char *host) {
++    static const char *const tails[] = {".nintendo.net", ".nintendo.com", ".nintendowifi.net",
++                                        ".nintendo.co.jp"};
++    for (size_t i = 0; i < sizeof tails / sizeof tails[0]; i++)
++        if (nd_ends_with(host, tails[i])) return 1;
++    return 0;
++}
++
++static int nd_builtin_lookup(const char *host, uint32_t *addr) {
++    if (!nd_builtin_enabled()) return 0;
++    nd_builtin_resolve();
++    if (nd_is_nat_host(host)) {
++        if (!g_nd_nat_ip) return 0;
++        *addr = g_nd_nat_ip;
++        return 1;
++    }
++    if (nd_is_namespace(host)) {
++        if (!g_nd_nex_ip) return 0;
++        *addr = g_nd_nex_ip;
++        return 1;
++    }
++    return 0;
++}
++
+ static int nd_match(const char *pattern, const char *host) {
+     if (pattern[0] == '*' && pattern[1] == '.') {         /* "*.suffix": any name that ends in it */
+         size_t hl = strlen(host), pl = strlen(pattern + 1);
+@@ -91,6 +170,15 @@ static int nd_match(const char *pattern, const char *host) {
+     return strcasecmp(host, pattern) == 0;
+ }
+ 
++// The last name that resolved through this map. A game that opens TLS to a bare address sends no
++// hostname, and Nextendo's router reads the SNI to pick the service, so the TLS layer asks for this
++// (`SslManagedSocketConnection.cs` reconstructs it the same way).
++static char g_nd_last[ND_NAME_MAX];
++
++const char *dm_nd_last_host(void) {
++    return g_nd_last[0] ? g_nd_last : NULL;
++}
++
+ int dm_nd_lookup(const char *host, uint32_t *addrs, int max) {
+     if (!host || !addrs || max < 1 || !dm_nd_enabled()) return 0;
+     if (!g_nd_loaded) dm_nd_reload();
+@@ -103,6 +191,11 @@ int dm_nd_lookup(const char *host, uint32_t *addrs, int max) {
+         if (!dup) addrs[found++] = g_nd[i].addr;
+     }
+     pthread_mutex_unlock(&g_nd_m);
++    if (!found) {                        // the fork's own table first, then Nextendo's built-in one
++        uint32_t ip = 0;
++        if (nd_builtin_lookup(host, &ip)) addrs[found++] = ip;
++    }
++    if (found) snprintf(g_nd_last, sizeof g_nd_last, "%s", host);
+     return found;
+ }
+ 
+diff --git a/dm/host/hle_nextendo.h b/dm/host/hle_nextendo.h
+index ec5b7e2..25db0e4 100644
+--- a/dm/host/hle_nextendo.h
++++ b/dm/host/hle_nextendo.h
+@@ -14,6 +14,9 @@ void dm_nd_reload(void);
+ //: `addrs` holds up to `max` addresses in host byte order, same as in_addr.s_addr.
+ int dm_nd_lookup(const char *host, uint32_t *addrs, int max);
+ 
++//: The last hostname this map resolved, for the SNI of a connection the game opened by address.
++const char *dm_nd_last_host(void);
++
+ //: How many rules the current map holds; 0 when the switch is off or nothing was given.
+ int dm_nd_rule_count(void);
+ 
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 955f5dc..bcf9f3f 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -11,6 +11,7 @@
+ #include "hle.h"
+ #include "hle_net.h"
+ #include "hle_nextendo.h"
++#include <CoreFoundation/CoreFoundation.h>   // CFData/CFArray for SSLSetALPNProtocols
+ #include "hle_ssl.h"
+ 
+ // The guest's MSG_DONTWAIT, as hle_net.c's SK_MSG_DONTWAIT defines it for the socket service.
+@@ -150,10 +151,28 @@ static int dm_ssl_open(dm_ssl_conn *c) {
+     if (!c->st) return -1;
+     SSLSetIOFuncs(c->st, dm_ssl_io_read, dm_ssl_io_write);
+     SSLSetConnection(c->st, c);
+-    if (c->host[0]) SSLSetPeerDomainName(c->st, c->host, strlen(c->host));
++    // SNI: the name the game set, else the last one the Nextendo map resolved. A game that dials an
++    // address sends none, and Nextendo's router picks the service from that name.
++    const char *sni = c->host[0] ? c->host : (dm_nd_enabled() ? dm_nd_last_host() : NULL);
++    if (sni && *sni) SSLSetPeerDomainName(c->st, sni, strlen(sni));
+     // iOS has no "verify on/off" switch: verification is the default, and asking for none means
+     // breaking the handshake after the server's certificate so the host can carry on regardless.
+-    if (!c->verify) SSLSetSessionOption(c->st, kSSLSessionOptionBreakOnServerAuth, true);
++    // Nextendo signs the redirected Nintendo hostnames with its own roots, so a game asking for the
++    // usual verification would fail on them; the reference client accepts any certificate there
++    // (SslManagedSocketConnection.cs) and so does this, for redirected names only.
++    if (!c->verify || (dm_nd_enabled() && sni && *sni))
++        SSLSetSessionOption(c->st, kSSLSessionOptionBreakOnServerAuth, true);
++    // ALPN http/1.1 only: NEX carries PRUDP over a WebSocket, which needs the HTTP/1.1 upgrade, and a
++    // server that may pick h2 would never upgrade (the NPLN hosts want h2 and are a later step).
++    if (dm_nd_enabled()) {
++        CFDataRef proto = CFDataCreate(NULL, (const UInt8 *)"http/1.1", 8);
++        if (proto) {
++            const void *one[] = {proto};
++            CFArrayRef list = CFArrayCreate(NULL, one, 1, &kCFTypeArrayCallBacks);
++            if (list) { SSLSetALPNProtocols(c->st, list); CFRelease(list); }
++            CFRelease(proto);
++        }
++    }
+     return 0;
+ }
+ 
+diff --git a/dm/host/tests/t_nextendo_gai.c b/dm/host/tests/t_nextendo_gai.c
+index 05d8259..1d287a1 100644
+--- a/dm/host/tests/t_nextendo_gai.c
++++ b/dm/host/tests/t_nextendo_gai.c
+@@ -20,6 +20,7 @@ typedef struct {
+ } ai_view;
+ 
+ int main(void) {
++    setenv("DM_NEXTENDO_BUILTIN_HOSTS", "0", 1);   // these tests check the map alone, not the built-in redirects
+     unsetenv("DM_NEXTENDO_HOSTS_FILE");
+     setenv("DM_NEXTENDO", "1", 1);
+     setenv("DM_NEXTENDO_HOSTS", "10.0.0.9 g2b309e01-lp1.srv.nintendo.net\n*.ndas.srv.nintendo.net\n", 1);
+diff --git a/dm/host/tests/t_nextendo_map.c b/dm/host/tests/t_nextendo_map.c
+index d540f2b..cc902e3 100644
+--- a/dm/host/tests/t_nextendo_map.c
++++ b/dm/host/tests/t_nextendo_map.c
+@@ -15,6 +15,7 @@ static void expect(int cond, const char *what) {
+ }
+ 
+ int main(void) {
++    setenv("DM_NEXTENDO_BUILTIN_HOSTS", "0", 1);   // these tests check the map alone, not the built-in redirects
+     unsetenv("DM_NEXTENDO_HOSTS_FILE");
+     setenv("DM_NEXTENDO", "1", 1);
+     setenv("DM_NEXTENDO_HOSTS",

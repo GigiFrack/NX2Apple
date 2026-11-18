@@ -162,7 +162,7 @@ def py(*args, env=None, capture=True) -> str:
 #: file to either line, silently missing it here would produce a link error or a subtly
 #: incomplete host.
 WANT_SRC = ('SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m '
-            'haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S')
+            'haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) dmidtoken.c front_mac.m controllers_mac.m web_apple.m entry.S')
 WANT_GFX = ('GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S '
             '../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))')
 _GFX_PATS = ('../gfx/*.c', '../gfx/nvn/*.c', '../gfx/nvn/*.m', '../gfx/nvn/*.S',
@@ -193,6 +193,8 @@ def host_sources(repo: Path, game_h_dir: Path) -> tuple[list[Path], list[Path]]:
     src = [host / n for n in 'main.c loader.c hle.c crash.c probe.c thread.c save_sync.c '
                             'memstat.m haptics_apple.m pad_switch2_apple.m'.split()]
     src += sorted(host.glob('hle_*.c'), key=lambda p: p.name)
+    # Not `hle_*.c`: the portable half of the id_token builder, so the wildcard above misses it.
+    src += [host / 'dmidtoken.c']
     src += [host / 'front_mac.m', host / 'controllers_mac.m', host / 'web_apple.m', host / 'entry.S']
     gfx: list[Path] = []
     for pat in _GFX_PATS:
