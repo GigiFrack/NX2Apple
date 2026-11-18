@@ -28,7 +28,11 @@ jobs:
       - name: Engine (upstream at the pin, plus this branch's patches)
         run: python3 tools/engine.py sync
 
+      - name: xcodegen (tools/build_shell_template.py generates the project with it)
+        run: brew install xcodegen
+
       - name: Build the unsigned DmShell.app template
+        timeout-minutes: 30
         run: python3 tools/build_shell_template.py --engine engine --out out/DmShell.app
 
       - name: The template carries the shell's commit
