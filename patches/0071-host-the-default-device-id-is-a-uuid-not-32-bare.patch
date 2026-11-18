@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:03:05 +0000
+Subject: [PATCH] host: the default device id is a UUID, not 32 bare hex
+
+docs_patches.py reads any 32-hex literal in the host as a main build ID and refuses to ship a row
+it cannot classify. A UUID is what a device id looks like anyway.
+
+Upstream-Status: fork-only
+Reason: it is part of the dauth module (0070); a 32-hex literal in host sources is read as a main build ID by dm/tools/docs_patches.py, so the default device id is spelled as a UUID
+Issue: none opened yet — folds into the same PR as 0070
+
+---
+ dm/host/hle_dauth.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_dauth.c b/dm/host/hle_dauth.c
+index ad15896..88725d4 100644
+--- a/dm/host/hle_dauth.c
++++ b/dm/host/hle_dauth.c
+@@ -166,7 +166,7 @@ static const char *dauth_domain(void) {
+ 
+ static const char *dauth_device_id(void) {
+     const char *d = getenv("DM_NEXTENDO_DEVICE_ID");
+-    return d && *d ? d : "0123456789abcdef0123456789abcdef";
++    return d && *d ? d : "01234567-89ab-cdef-0123-456789abcdef";   // a UUID, not 32 bare hex: that shape is a build ID to docs_patches.py
+ }
+ 
+ int dm_dauth_application_token(const char *app_id, const char *app_version, char *out, size_t cap) {

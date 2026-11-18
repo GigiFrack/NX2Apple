@@ -66,3 +66,4 @@
 0068-host-the-ssl-entries-live-with-the-ssl-implement.patch
 0069-tests-corefoundation-for-cfrelease-and-a-tls-ser.patch
 0070-host-the-dauth-chain-as-a-host-module.patch
+0071-host-the-default-device-id-is-a-uuid-not-32-bare.patch
