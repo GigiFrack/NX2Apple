@@ -136,6 +136,39 @@ address it accepts is 127.x. NEX auth is TCP+TLS (patch 0063 covers TCP), but PR
 server, and the NAT check — is **UDP to a remote host**, which this layer cannot do yet. So before
 TLS there is one more brick: real UDP egress, bounded by `DM_NEXTENDO` exactly as the TCP path is.
 
+## 5d. TLS: what `nn::ssl` is, and how it maps onto the platform
+
+The service surface is the one libnx mirrors (`nx/include/switch/services/ssl.h`), and it is small
+once grouped:
+
+| Group | Calls |
+|---|---|
+| context | `sslCreateContext`, `sslContextClose`, `sslContextSetOption/GetOption`, `sslContextImportServerPki`, `sslContextImportClientPki`, `sslContextImportCrl`, `sslContextGetCertificateBufSize` |
+| connection | `sslContextCreateConnection`, `sslConnectionClose`, `sslConnectionSetSocketDescriptor`, `sslConnectionSetHostName`, `sslConnectionSetVerifyOption`, `sslConnectionSetIoMode` |
+| traffic | `sslConnectionDoHandshake`, `sslConnectionRead`, `sslConnectionWrite`, `sslConnectionPending`, `sslConnectionPeek`, `sslConnectionPoll` |
+| diagnostics | `sslConnectionGetVerifyCertError(s)`, `sslConnectionGetServerCertDetail`, `sslConnectionGetNeededServerCertBufferSize` |
+
+Mapping onto the platform: **SecureTransport**, not a vendored library. `SSLNewContext` +
+`SSLSetIOFuncs` lets the handshake and the traffic run over the guest's own socket descriptor
+through `dm_sk_read`/`dm_sk_write`, which is exactly what patches 0063 and 0065 just made real —
+so timeouts, `EAGAIN` and the guest's own non-blocking mode stay in one place instead of being
+duplicated inside a TLS library. `SSLSetPeerDomainName` is `SetHostName`; `SSLSetCertificate` with a
+`SecIdentity` is `ImportClientPki` + `SetSocketDescriptor` on a client-certificate connection;
+`SSLGetPeerCertificates` is `GetServerCertDetail`.
+
+Why not mbedTLS: it would be a ~50 000-line vendored tree in the patch queue for a port that only
+ever runs on Apple platforms, and it would have to re-implement the socket seam that already exists.
+Why not Network.framework: it is asynchronous and block-based, while every `nn::ssl` call here is
+blocking.
+
+SecureTransport is deprecated since iOS 13 but present in every iPhoneOS SDK, including the 27.2 one
+the Windows path fetches — the same trade the iOS port already makes elsewhere.
+
+Order of work: context objects first (a handle table via `objmap`), then one connection that
+handshakes over a guest fd, then read/write, then the diagnostics that games call after a failure.
+The test is a local TLS server (Python's `ssl` module) that the host test speaks to; it runs in the
+fork's macOS workflow next to the other host tests.
+
 ## 6. What is verifiable without a human
 
 - `nextendo_auth.py`: PKCE, loopback, state check, token file, environment — 15 tests, all local
