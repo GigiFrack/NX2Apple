@@ -64,3 +64,4 @@
 0066-host-nn-ssl-over-securetransport-on-the-game-s-o.patch
 0067-tests-the-tls-connection-against-a-real-server.patch
 0068-host-the-ssl-entries-live-with-the-ssl-implement.patch
+0069-tests-corefoundation-for-cfrelease-and-a-tls-ser.patch
