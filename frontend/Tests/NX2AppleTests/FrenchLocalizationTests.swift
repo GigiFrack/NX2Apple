@@ -18,6 +18,7 @@ final class FrenchLocalizationTests: IsolatedDefaultsTestCase {
         "controls.fn.B", "controls.fn.X", "controls.fn.Y", "controls.fn.L", "controls.fn.R",
         "controls.fn.ZL", "controls.fn.ZR", "controls.fn.Plus", "controls.fn.Minus", "launch.mods",
         "pad.options", "engine.channel.stable", "launch.opt.DM_PRESENT_UPSCALE.off", "launch.opt.DM_PRESENT_UPSCALE.metalfx", "launch.opt.DM_UPSCALER.metalfx", "launch.opt.DM_SCREEN_ASPECT.0", "key.tab",
+        "section.nextendo",   // the network's name
         "switch2.badge",   // the console's name
         "ios.ui.switch2Badge",   // the console's name
         "console.mapping.place.Plus", "console.menu", "console.mapping.group.menus",   // the Switch's Plus button, and Menu and Menus, as French writes them

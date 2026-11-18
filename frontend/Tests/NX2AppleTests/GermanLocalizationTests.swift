@@ -21,6 +21,7 @@ final class GermanLocalizationTests: IsolatedDefaultsTestCase {
         "update.pill", "launch.opt.DM_OPMODE.0", "launch.opt.DM_PRESENT_UPSCALE.off",
         "launch.opt.DM_FPS_TARGET.30", "launch.opt.DM_FPS_TARGET.60", "launch.opt.DM_FPS_TARGET.120", "launch.opt.DM_PRESENT_UPSCALE.metalfx", "launch.opt.DM_UPSCALER.metalfx",
         "launch.opt.DM_SCREEN_ASPECT.0",   // 16:9 (Switch) reads the same in every language
+        "section.nextendo",   // the network's name
         "switch2.badge",   // the console's name
         "ios.ui.switch2Badge", "appearance.system", "sort.name", "launch.opt.DM_PRESENT_INTERVAL.display", "launch.opt.DM_PRESENT_INTERVAL.game",   // the console's name, System, Name, the frame rates
         // Steam Controller names and button labels, and Touchscreen, read the same in German.
