@@ -12,12 +12,9 @@ concurrency:
   group: shell-template-${{ github.ref }}
   cancel-in-progress: false
 
+# Manual only: with the macOS runners queuing for fifteen minutes and then cancelling, a push-triggered
+# run only burns the queue. Start it from the Actions tab when a macOS machine is free.
 on:
-  push:
-    paths:
-      - '.github/workflows/shell-template.yml'
-      - 'frontend-ios/**'
-      - 'tools/build_shell_template.py'
   workflow_dispatch:
 
 jobs:
