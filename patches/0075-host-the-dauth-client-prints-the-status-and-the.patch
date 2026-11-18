@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:13:44 +0000
+Subject: [PATCH] host: the dauth client prints the status and the start of the
+ answer
+
+The first call took 35 s against the mock and said nothing: the map matched, no connect error, no
+handshake error, and an answer that was not empty. What is left to know is the status and the bytes,
+so it prints both, once, for every call.
+
+Upstream-Status: fork-only
+Reason: the dauth client (0070) needs to say what a server answered, not only that it failed; this is the diagnostic that turns a silent failure into a status and a body
+Issue: none opened yet — folds into the same PR as 0070
+
+---
+ dm/host/hle_dauth.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_dauth.c b/dm/host/hle_dauth.c
+index 54825b4..64d48e9 100644
+--- a/dm/host/hle_dauth.c
++++ b/dm/host/hle_dauth.c
+@@ -129,7 +129,6 @@ static int http_call(const char *host, int port, const char *method, const char
+     close(fd);
+ 
+     int status = -1;
+-    if (buf && !*buf) fprintf(stderr, "dauth: %s%s answered nothing\n", host, path);
+     if (buf) {
+         if (!strncmp(buf, "HTTP/1.", 7)) status = atoi(buf + 9);
+         char *sep = strstr(buf, "\r\n\r\n");
+@@ -142,7 +141,10 @@ static int http_call(const char *host, int port, const char *method, const char
+                 out[len] = 0;
+             }
+         }
++        fprintf(stderr, "dauth: %s%s -> status %d, %zu bytes: %.60s\n", host, path, status, got, buf);
+         free(buf);
++    } else {
++        fprintf(stderr, "dauth: %s%s -> no buffer\n", host, path);
+     }
+     return status;
+ }
