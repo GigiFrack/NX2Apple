@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:10:32 +0000
+Subject: [PATCH] host: the dauth client says where it stops (map, connect,
+ handshake, answer)
+
+Upstream-Status: fork-only
+Reason: the dauth client (0070) failed silently against the mock; every step that can fail now says which one did — map, connect, handshake, or an empty answer
+Issue: none opened yet — folds into the same PR as 0070
+
+---
+ dm/host/hle_dauth.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_dauth.c b/dm/host/hle_dauth.c
+index 4b33f11..54825b4 100644
+--- a/dm/host/hle_dauth.c
++++ b/dm/host/hle_dauth.c
+@@ -16,6 +16,7 @@
+ 
+ #include <Security/SecureTransport.h>
+ #include <Security/Security.h>
++#include <errno.h>
+ #include <netdb.h>
+ #include <pthread.h>
+ #include <stdio.h>
+@@ -36,7 +37,9 @@ static int dauth_connect(const char *host, int port) {
+     sa.sin_family = AF_INET;
+     sa.sin_port = htons((uint16_t)port);
+     uint32_t addrs[4];
+-    if (dm_nd_lookup(host, addrs, 4) > 0) {
++    int mapped = dm_nd_lookup(host, addrs, 4);
++    fprintf(stderr, "dauth: %s -> %d via the map\n", host, mapped);
++    if (mapped > 0) {
+         sa.sin_addr.s_addr = htonl(addrs[0]);      // the map keeps addresses in host order
+     } else {
+         struct addrinfo hints, *res = NULL;
+@@ -50,11 +53,12 @@ static int dauth_connect(const char *host, int port) {
+         freeaddrinfo(res);
+     }
+     int fd = socket(AF_INET, SOCK_STREAM, 0);
+-    if (fd < 0) return -1;
++    if (fd < 0) { fprintf(stderr, "dauth: socket: %d\n", errno); return -1; }
+     struct timeval tv = {10, 0};
+     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+     if (connect(fd, (struct sockaddr *)&sa, sizeof sa)) {
++        fprintf(stderr, "dauth: connect %s:%d: %d\n", host, port, errno);
+         close(fd);
+         return -1;
+     }
+@@ -94,6 +98,7 @@ static int http_call(const char *host, int port, const char *method, const char
+     OSStatus hs = SSLHandshake(st);
+     while (hs == errSSLServerAuthCompleted) hs = SSLHandshake(st);   // only with TLS_INSECURE
+     if (hs != noErr) {
++        fprintf(stderr, "dauth: handshake %s: %d\n", host, (int)hs);
+         CFRelease(st);
+         close(fd);
+         return -1;
+@@ -124,6 +129,7 @@ static int http_call(const char *host, int port, const char *method, const char
+     close(fd);
+ 
+     int status = -1;
++    if (buf && !*buf) fprintf(stderr, "dauth: %s%s answered nothing\n", host, path);
+     if (buf) {
+         if (!strncmp(buf, "HTTP/1.", 7)) status = atoi(buf + 9);
+         char *sep = strstr(buf, "\r\n\r\n");
