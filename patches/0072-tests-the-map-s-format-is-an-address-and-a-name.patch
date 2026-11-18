@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:06:16 +0000
+Subject: [PATCH] tests: the map's format is an address and a name, one per
+ line
+
+The dauth test wrote dauth.local=127.0.0.1; the parser wants 127.0.0.1 dauth.local, so no rule
+matched and the chain never left the process.
+
+Upstream-Status: fork-only
+Reason: a fix to the dauth test (0070); the map's grammar is <ip> <name> one per line, not <name>=<ip>, so the test never left the process
+Issue: none opened yet — folds into the same PR as 0070
+
+---
+ dm/host/tests/t_dauth_local.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dm/host/tests/t_dauth_local.c b/dm/host/tests/t_dauth_local.c
+index 7660290..e46120d 100644
+--- a/dm/host/tests/t_dauth_local.c
++++ b/dm/host/tests/t_dauth_local.c
+@@ -20,7 +20,7 @@ int main(void) {
+     setenv("DM_NEXTENDO_DOMAIN", "local", 1);
+     setenv("DM_NEXTENDO_HTTPS_PORT", port, 1);
+     setenv("DM_NEXTENDO_TLS_INSECURE", "1", 1);
+-    setenv("DM_NEXTENDO_HOSTS", "dauth.local=127.0.0.1,aauth.local=127.0.0.1", 1);
++    setenv("DM_NEXTENDO_HOSTS", "127.0.0.1 dauth.local\n127.0.0.1 aauth.local", 1);   // <ip> <name>
+     dm_nd_reload();
+ 
+     char token[256] = {0};
