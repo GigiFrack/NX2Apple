@@ -52,3 +52,5 @@ DM_NEXTENDO_HTTPS_PORT	path	`=<port>` (default 443) where the dauth chain is rea
 DM_NEXTENDO_TLS_INSECURE	switch	`1` accepts a certificate the system does not trust — only for the mock server the tests start, never for a real deployment
 DM_TEST_DAUTH_PORT	test	`=<port>` (host tests) the mock dauth chain `t_dauth_local` speaks to; only that test reads it
 DM_NEXTENDO_APP_ID	path	`=<title id>` the application id the dauth chain asks a token for; per-game data the launcher already knows, so it comes from there and not from the source
+DM_NEXTENDO_NEX_TOKEN	switch	The `nx2` game token from `/api/nex-token`: with it set, `LoadIdTokenCache` answers the signed BAAS id_token instead of the dauth chain's token. A secret with a 24 hour life, so it lives in the app's own `Documents/env.txt`, never in this repository.
+DM_NEXTENDO_GAME_VERSION	path	Claim `tv` of that id_token: the installed display version the game server checks. The launcher knows it at build time; without it the claim is left out.

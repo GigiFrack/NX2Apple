@@ -1,0 +1,603 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 21:15:20 +0000
+Subject: [PATCH] account: the id_token a game forwards to NEX is built and
+ signed here, with the game token in its nnex claim
+
+Upstream-Status: fork-only
+Reason: Nextendo's integration guide names this the one thing a client must build for itself: a game never logs in
+ with a password, it asks the system for a BAAS id_token and forwards it as its NEX login, and the server accepts the
+ login only for the account the signed `nnex` claim proves. `LoadIdTokenCache` is that call (the reference client's
+ `LoadIdTokenCache` in Ryujinx-Nextendo's ManagerServer.cs); the cut answer was a failure and the dauth chain's token
+ is not what the server reads. Off unless `DM_NEXTENDO_NEX_TOKEN` is set, so every build without a game token is
+ unchanged, and the signature comes from the Security framework with a generated key when no PEM is named.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/Makefile          |   2 +-
+ dm/host/dmidtoken.c       | 144 +++++++++++++++++++++++++++++++
+ dm/host/dmidtoken.h       |  43 ++++++++++
+ dm/host/hle_account.c     |   9 ++
+ dm/host/hle_idtoken.c     | 173 ++++++++++++++++++++++++++++++++++++++
+ dm/host/tests/Makefile    |   4 +
+ dm/host/tests/t_idtoken.c | 128 ++++++++++++++++++++++++++++
+ 7 files changed, 502 insertions(+), 1 deletion(-)
+ create mode 100644 dm/host/dmidtoken.c
+ create mode 100644 dm/host/dmidtoken.h
+ create mode 100644 dm/host/hle_idtoken.c
+ create mode 100644 dm/host/tests/t_idtoken.c
+
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index 5ebc177..8e2dc63 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -26,7 +26,7 @@ ifeq ($(filter -j%,$(MAKEFLAGS)),)
+ MAKEFLAGS += -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+ endif
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
++SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) dmidtoken.c front_mac.m controllers_mac.m web_apple.m entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+diff --git a/dm/host/dmidtoken.c b/dm/host/dmidtoken.c
+new file mode 100644
+index 0000000..03efa1d
+--- /dev/null
++++ b/dm/host/dmidtoken.c
+@@ -0,0 +1,144 @@
++#include "dmidtoken.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++#if defined(__APPLE__)
++#include <stdlib.h>                 // arc4random_buf
++#else
++#include <sys/random.h>
++#endif
++
++static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++
++size_t dm_idtoken_b64url(const void *data, size_t len, char *out, size_t cap) {
++    const uint8_t *p = (const uint8_t *)data;
++    size_t need = (len / 3) * 4;
++    if (len % 3 == 1) need += 2;
++    else if (len % 3 == 2) need += 3;
++    if (!out || cap < need + 1) return 0;
++    size_t o = 0;
++    for (size_t i = 0; i < len; i += 3) {
++        uint32_t v = (uint32_t)p[i] << 16;
++        if (i + 1 < len) v |= (uint32_t)p[i + 1] << 8;
++        if (i + 2 < len) v |= p[i + 2];
++        out[o++] = B64[(v >> 18) & 63];
++        out[o++] = B64[(v >> 12) & 63];
++        if (i + 1 < len) out[o++] = B64[(v >> 6) & 63];
++        if (i + 2 < len) out[o++] = B64[v & 63];
++    }
++    out[o] = 0;
++    return o;
++}
++
++static void random_bytes(uint8_t *dst, size_t n) {
++#if defined(__APPLE__)
++    arc4random_buf(dst, n);
++#else
++    size_t got = 0;
++    while (got < n) {
++        ssize_t r = getrandom(dst + got, n - got, 0);
++        if (r <= 0) break;
++        got += (size_t)r;
++    }
++#endif
++}
++
++static void hex16(const uint8_t *b, char out[33]) {
++    static const char H[] = "0123456789abcdef";
++    for (int i = 0; i < 16; i++) { out[i * 2] = H[b[i] >> 4]; out[i * 2 + 1] = H[b[i] & 15]; }
++    out[32] = 0;
++}
++
++//: A v4 UUID as `Guid.NewGuid()` stringifies it.
++static void uuid4(char out[37]) {
++    uint8_t b[16];
++    random_bytes(b, sizeof b);
++    b[6] = (uint8_t)((b[6] & 0x0F) | 0x40);
++    b[8] = (uint8_t)((b[8] & 0x3F) | 0x80);
++    snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12],
++             b[13], b[14], b[15]);
++}
++
++//: Appends `"key":<number>` — `iat` and `exp` are numeric claims, and a quoted one is not a JWT.
++static int add_num(char *buf, size_t cap, int *w, const char *key, const char *value) {
++    int r = snprintf(buf + *w, cap - (size_t)*w, ",\"%s\":%s", key, value);
++    if (r < 0 || (size_t)r >= cap - (size_t)*w) return 0;
++    *w += r;
++    return 1;
++}
++
++//: Appends one `"key":"value"` pair before the closing brace. `*w` is the length so far.
++static int add_pair(char *buf, size_t cap, int *w, const char *key, const char *value) {
++    int r = snprintf(buf + *w, cap - (size_t)*w, ",\"%s\":\"%s\"", key, value);
++    if (r < 0 || (size_t)r >= cap - (size_t)*w) return 0;
++    *w += r;
++    return 1;
++}
++
++size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *version,
++                        const char *app_id, dm_sign_fn sign) {
++    if (!out || cap < 2 || !nnex || !*nnex || !sign) return 0;
++
++    static const char HEADER[] =
++        "{\"alg\":\"RS256\",\"typ\":\"id_token\",\"kid\":\"nextendo-baas-key-1\"}";
++    static const char JKU[] =
++        "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates";
++    static const char ISSUER[] = "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
++    static const char AUDIENCE[] = "ted9e2f05d286f7b8";
++
++    uint8_t r_sub[16], r_dev[16], r_acc[16];
++    random_bytes(r_sub, sizeof r_sub);
++    random_bytes(r_dev, sizeof r_dev);
++    random_bytes(r_acc, sizeof r_acc);
++    char sub[33], di[33], did[33], jti[37];
++    hex16(r_sub, sub);
++    hex16(r_dev, di);
++    hex16(r_acc, did);
++    uuid4(jti);
++
++    time_t now = time(NULL);
++    char iat[24], exp[24];
++    snprintf(iat, sizeof iat, "%lld", (long long)now);
++    snprintf(exp, sizeof exp, "%lld", (long long)(now + DM_IDTOKEN_TTL_SECONDS));
++
++    char body[1200];
++    int w = snprintf(body, sizeof body,
++                     "{\"jku\":\"%s\",\"jti\":\"%s\",\"di\":\"%s\",\"sn\":\"XAW10000000000\","
++                     "\"bs:did\":\"%s\",\"hm\":true,\"nnex\":\"%s\"",
++                     JKU, jti, di, did, nnex);
++    if (w < 0 || (size_t)w >= sizeof body) return 0;
++    // Only the titles that route by application id carry it: the NSO classics and two that share
++    // another title's tenant. Every other game's token stays byte-identical in shape.
++    if (app_id && *app_id && !add_pair(body, sizeof body, &w, "app_id", app_id)) return 0;
++    if (version && *version && !add_pair(body, sizeof body, &w, "tv", version)) return 0;
++    if (!add_pair(body, sizeof body, &w, "iss", ISSUER)) return 0;
++    if (!add_pair(body, sizeof body, &w, "aud", AUDIENCE)) return 0;
++    if (!add_pair(body, sizeof body, &w, "sub", sub)) return 0;
++    if (!add_num(body, sizeof body, &w, "iat", iat)) return 0;
++    if (!add_num(body, sizeof body, &w, "exp", exp)) return 0;
++    if ((size_t)w + 2 > sizeof body) return 0;
++    body[w++] = '}';
++    body[w] = 0;
++
++    char h64[256], p64[sizeof body * 2];
++    if (!dm_idtoken_b64url(HEADER, sizeof HEADER - 1, h64, sizeof h64)) return 0;
++    if (!dm_idtoken_b64url(body, (size_t)w, p64, sizeof p64)) return 0;
++
++    char msg[sizeof h64 + sizeof p64];
++    int mlen = snprintf(msg, sizeof msg, "%s.%s", h64, p64);
++    if (mlen < 0 || (size_t)mlen >= sizeof msg) return 0;
++
++    uint8_t sig[512];
++    size_t siglen = sign(msg, (size_t)mlen, sig, sizeof sig);
++    if (!siglen) return 0;
++
++    char s64[768];
++    if (!dm_idtoken_b64url(sig, siglen, s64, sizeof s64)) return 0;
++
++    int total = snprintf(out, cap, "%s.%s", msg, s64);
++    if (total < 0 || (size_t)total >= cap) return 0;
++    return (size_t)total;
++}
+diff --git a/dm/host/dmidtoken.h b/dm/host/dmidtoken.h
+new file mode 100644
+index 0000000..368b5ca
+--- /dev/null
++++ b/dm/host/dmidtoken.h
+@@ -0,0 +1,43 @@
++// The BAAS id_token a game forwards as its NEX login.
++//
++// A Switch game never logs in with a password: it asks the system for an id_token and passes it to
++// the game server, which reads the `nnex` claim. Nextendo documents the whole claim table and says
++// plainly that an emulator does not contact BAAS for it — the client builds and signs the JWT itself
++// (https://wiki.nextendo.network/integration, "Step 4"). The reference client is
++// `ManagerServer.cs` in Ryujinx-Nextendo: RS256, three hours, `kid` nextendo-baas-key-1, and a `jku`
++// claim pointing at the key set the server publishes.
++//
++// This file is the portable half: header, claims, base64url, and the shape of the token. The
++// signature comes from a callback, so the builder compiles and runs anywhere (tests on Linux) while
++// the RS256 signer itself lives with the Darwin code that owns the key.
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++
++//: How long a token is good for: the reference builds `exp = iat + 3 hours`.
++#define DM_IDTOKEN_TTL_SECONDS (3 * 3600)
++
++//: Enough for the claims plus a 2048-bit signature, with room to spare.
++#define DM_IDTOKEN_MAX 2048
++
++//: Fills `sig` with the RS256 signature over `msg` (`cap` bytes available); returns its length, or 0.
++typedef size_t (*dm_sign_fn)(const void *msg, size_t len, void *sig, size_t cap);
++
++//: Builds the token into `out` (a NUL-terminated string) and returns its length, or 0 on failure.
++//: `nnex` is the nx2 game token, `version` the installed display version (claim `tv`), `app_id` the
++//: title id when the game needs one (the NSO classics and two titles that share another tenant).
++//: `app_id` may be NULL; `nnex` must not be.
++size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *version,
++                        const char *app_id, dm_sign_fn sign);
++
++//: base64url without padding, as a JWT needs it. Returns the length written.
++size_t dm_idtoken_b64url(const void *data, size_t len, char *out, size_t cap);
++
++//: Builds the token for the running game, from `DM_NEXTENDO_NEX_TOKEN` / `_GAME_VERSION` / `_APP_ID`;
++//: 0 when no game token is set. Darwin only: it signs through the Security framework.
++size_t dm_idtoken_for_game(char *buf, size_t cap);
++
++//: The Darwin implementation of `dm_sign_fn`: RS256 with the key in `DM_NEXTENDO_BAAS_KEY` (a PEM
++//: path), or a throwaway 2048-bit key when there is none. Declared here so `hle_account.c` can wire
++//: the entry without knowing where the key comes from.
++size_t dm_idtoken_sign_rs256(const void *msg, size_t len, void *sig, size_t cap);
+diff --git a/dm/host/hle_account.c b/dm/host/hle_account.c
+index 794dd65..1272184 100644
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -1,6 +1,7 @@
+ // nn::account: the real device manages users via the acc:u0 service; the host has one fixed local user.
+ // Online accounts (network service account / Nintendo Account authorization / tokens) are out of scope and uniformly return RES_FAIL; the async context's completion event fires immediately.
+ // Environment switch: DM_NICK=nickname (default Player).
++#include "dmidtoken.h"
+ #include "hle.h"
+ #include "hle_dauth.h"
+ #include "hle_nextendo.h"
+@@ -73,6 +74,14 @@ HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccou
+ HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "the application auth token (DM_NEXTENDO=1); cut otherwise", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) {
+     (void)h;
+     if (!dm_nd_enabled()) { if (n) *n = 0; return RES_FAIL; }
++    // This is the call a game makes to get the id_token it forwards as its NEX login
++    // (`LoadIdTokenCache` in the reference client). With a game token in the environment the answer
++    // is the signed BAAS JWT, whose `nnex` claim is what the server accepts; the dauth chain below
++    // answered the older, tokenless path.
++    if (buf && sz) {
++        size_t got = dm_idtoken_for_game(buf, (size_t)sz);
++        if (got) { if (n) *n = got; return RES_OK; }
++    }
+     uint64_t size = sz;
+     if (dm_acc_nsa_token(buf, &size)) { if (n) *n = size; return RES_FAIL; }
+     if (n) *n = size;
+diff --git a/dm/host/hle_idtoken.c b/dm/host/hle_idtoken.c
+new file mode 100644
+index 0000000..d50079f
+--- /dev/null
++++ b/dm/host/hle_idtoken.c
+@@ -0,0 +1,173 @@
++// The RS256 signer and the bridge that hands a game its BAAS id_token (Darwin only: the key lives in
++// the Security framework).
++//
++// The key: `DM_NEXTENDO_BAAS_KEY` names a PEM file. Nextendo's own builds inject the key whose public
++// half the server publishes at the token's `jku` URL; the open-source trees carry none, and without it
++// a throwaway 2048-bit key is generated — every game still logs in, and only Splatoon 2, which checks
++// the signature locally against that URL, would not (see ManagerServer.cs in Ryujinx-Nextendo).
++#include "dmidtoken.h"
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <CoreFoundation/CoreFoundation.h>
++#include <Security/Security.h>
++
++static SecKeyRef g_key;
++static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
++
++// ---------------------------------------------------------------- PEM → SecKeyRef
++
++static int b64_value(char c) {
++    if (c >= 'A' && c <= 'Z') return c - 'A';
++    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++    if (c >= '0' && c <= '9') return c - '0' + 52;
++    if (c == '+' || c == '-') return 62;
++    if (c == '/' || c == '_') return 63;
++    return -1;
++}
++
++//: Decodes the body of a PEM into DER. Returns the length, or 0.
++static size_t pem_to_der(const char *pem, unsigned char *out, size_t cap) {
++    const char *body = strstr(pem, "-----BEGIN");
++    if (!body) return 0;
++    body = strchr(body, '\n');
++    if (!body) return 0;
++    size_t o = 0;
++    unsigned acc = 0;
++    int bits = 0, done = 0;
++    for (const char *p = body; *p && !done; p++) {
++        if (*p == '-') { done = 1; break; }              // the END line
++        int v = b64_value(*p);
++        if (v < 0) continue;                             // newlines, spaces, CR
++        acc = acc << 6 | (unsigned)v;
++        bits += 6;
++        if (bits >= 8) {
++            bits -= 8;
++            if (o >= cap) return 0;
++            out[o++] = (unsigned char)((acc >> bits) & 0xFF);
++        }
++    }
++    return o;
++}
++
++//: Wraps a PKCS#1 RSAPrivateKey in a PKCS#8 PrivateKeyInfo, which is what SecKeyCreateWithData wants.
++//: SEQUENCE { INTEGER 0, SEQUENCE { OID rsaEncryption, NULL }, OCTET STRING <pkcs1> }
++static size_t der_to_pkcs8(const unsigned char *pkcs1, size_t len, unsigned char *out, size_t cap) {
++    static const unsigned char rsa_alg[] = {0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86,
++                                            0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00};
++    size_t inner = 2 + 3 + sizeof rsa_alg + 4 + len;     // version(3) + alg + octet header(4) + body
++    size_t total = inner + 4;
++    if (total > cap) return 0;
++    size_t o = 0;
++    out[o++] = 0x30;
++    if (inner < 0x80) out[o++] = (unsigned char)inner;
++    else { out[o++] = 0x82; out[o++] = (unsigned char)(inner >> 8); out[o++] = (unsigned char)inner; }
++    out[o++] = 0x02; out[o++] = 0x01; out[o++] = 0x00;                        // INTEGER 0
++    memcpy(out + o, rsa_alg, sizeof rsa_alg); o += sizeof rsa_alg;
++    out[o++] = 0x04;                                                          // OCTET STRING
++    if (len < 0x80) out[o++] = (unsigned char)len;
++    else { out[o++] = 0x82; out[o++] = (unsigned char)(len >> 8); out[o++] = (unsigned char)len; }
++    memcpy(out + o, pkcs1, len); o += len;
++    return o;
++}
++
++//: {kSecAttrKeyType: RSA, kSecAttrKeyClass: private} without Objective-C literals (this is a .c file).
++static CFDictionaryRef private_key_attrs(void) {
++    const void *keys[] = {kSecAttrKeyType, kSecAttrKeyClass};
++    const void *vals[] = {kSecAttrKeyTypeRSA, kSecAttrKeyClassPrivate};
++    return CFDictionaryCreate(NULL, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
++                              &kCFTypeDictionaryValueCallBacks);
++}
++
++static SecKeyRef key_from_pem_file(const char *path) {
++    FILE *f = fopen(path, "rb");
++    if (!f) return NULL;
++    static char pem[16384];
++    size_t n = fread(pem, 1, sizeof pem - 1, f);
++    fclose(f);
++    pem[n] = 0;
++
++    static unsigned char der[16384];
++    size_t dlen = pem_to_der(pem, der, sizeof der);
++    if (!dlen) return NULL;
++
++    SecKeyRef key = NULL;
++    CFDataRef data;
++    if (!strstr(pem, "BEGIN RSA PRIVATE KEY")) {
++        // Already PKCS#8 (or a PKCS#1 with a modern header): hand it over as it is.
++        data = CFDataCreate(NULL, der, (CFIndex)dlen);
++        if (data) {
++            CFDictionaryRef attrs = private_key_attrs();
++            key = SecKeyCreateWithData(data, attrs, NULL);
++            CFRelease(attrs);
++            CFRelease(data);
++        }
++        return key;
++    }
++
++    static unsigned char pkcs8[16800];
++    size_t plen = der_to_pkcs8(der, dlen, pkcs8, sizeof pkcs8);
++    if (!plen) return NULL;
++    data = CFDataCreate(NULL, pkcs8, (CFIndex)plen);
++    if (!data) return NULL;
++    CFDictionaryRef attrs = private_key_attrs();
++    key = SecKeyCreateWithData(data, attrs, NULL);
++    CFRelease(attrs);
++    CFRelease(data);
++    return key;
++}
++
++static void key_init(void) {
++    const char *path = getenv("DM_NEXTENDO_BAAS_KEY");
++    if (path && *path) g_key = key_from_pem_file(path);
++    if (g_key) return;
++    // No key, or one Security will not take: sign with a throwaway one, as the open-source clients do.
++    if (path && *path) fprintf(stderr, "[dm] nextendo: %s is not a usable RSA key, signing with a throwaway one\n", path);
++    int bits = 2048;
++    CFNumberRef size = CFNumberCreate(NULL, kCFNumberIntType, &bits);
++    const void *keys[] = {kSecAttrKeyType, kSecAttrKeySizeInBits};
++    const void *vals[] = {kSecAttrKeyTypeRSA, size};
++    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
++                                               &kCFTypeDictionaryValueCallBacks);
++    g_key = SecKeyCreateRandomKey(attrs, NULL);
++    CFRelease(attrs);
++    CFRelease(size);
++}
++
++size_t dm_idtoken_sign_rs256(const void *msg, size_t len, void *sig, size_t cap) {
++    pthread_once(&g_key_once, key_init);
++    if (!g_key) return 0;
++    CFDataRef data = CFDataCreate(NULL, (const UInt8 *)msg, (CFIndex)len);
++    if (!data) return 0;
++    CFErrorRef err = NULL;
++    CFDataRef out = SecKeyCreateSignature(g_key, kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256,
++                                          data, &err);
++    CFRelease(data);
++    if (err) { CFRelease(err); return 0; }
++    if (!out) return 0;
++    CFIndex n = CFDataGetLength(out);
++    size_t got = 0;
++    if (n > 0 && (size_t)n <= cap) {
++        memcpy(sig, CFDataGetBytePtr(out), (size_t)n);
++        got = (size_t)n;
++    }
++    CFRelease(out);
++    return got;
++}
++
++// ---------------------------------------------------------------- the game's token
++
++//: Builds the token a game forwards as its NEX login. 0 when the player has no game token in the
++//: environment, which is also how a build without Nextendo behaves.
++size_t dm_idtoken_for_game(char *buf, size_t cap) {
++    const char *nnex = getenv("DM_NEXTENDO_NEX_TOKEN");
++    if (!nnex || !*nnex) return 0;
++    const char *version = getenv("DM_NEXTENDO_GAME_VERSION");   // claim `tv`: the installed version
++    const char *app_id = getenv("DM_NEXTENDO_APP_ID");
++    size_t n = dm_idtoken_build(buf, cap, nnex, version, app_id, dm_idtoken_sign_rs256);
++    if (!n) fprintf(stderr, "[dm] nextendo: could not build the id_token\n");
++    return n;
++}
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index b98b74d..0f5a608 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -55,6 +55,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_nextendo_map
+ 	$(B)/t_nextendo_gai
+ 	$(B)/t_nifm_nextendo
++	$(B)/t_idtoken
+ 	$(B)/t_sf
+ 	$(B)/t_audren_sv
+ 	$(B)/t_time
+@@ -252,6 +253,9 @@ $(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
+ $(B)/t_nextendo_gai: t_nextendo_gai.c ../hle_nextendo.c ../hle_nextendo_gai.c ../hle_nextendo.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_gai.c
++# The id_token's builder is portable: the signer is injected, so this one runs on Linux too.
++$(B)/t_idtoken: t_idtoken.c ../dmidtoken.c ../dmidtoken.h | $(B)
++	$(CC) -O1 -g -Wall -Wextra -Werror -I.. -o $@ t_idtoken.c ../dmidtoken.c
+ # nifm needs the socket service it sits in, so this one takes hle_net.c's dependencies too.
+ $(B)/t_nifm_nextendo: t_nifm_nextendo.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h ../hle_nextendo.c ../hle_nextendo.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_nifm_nextendo.c
+diff --git a/dm/host/tests/t_idtoken.c b/dm/host/tests/t_idtoken.c
+new file mode 100644
+index 0000000..e5e78f6
+--- /dev/null
++++ b/dm/host/tests/t_idtoken.c
+@@ -0,0 +1,128 @@
++// The BAAS id_token's shape: what a game reads out of it, and what it must never contain.
++// Portable: the signer is a fake here, so this runs on the Linux box as well as in the macOS CI.
++#include "../dmidtoken.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>                 // atoll
++#include <string.h>
++#include <time.h>
++
++// A 512-byte "signature" that is a function of the message, so a wrong message would show.
++static size_t fake_sign(const void *msg, size_t len, void *sig, size_t cap) {
++    const unsigned char *m = (const unsigned char *)msg;
++    unsigned char *s = (unsigned char *)sig;
++    if (cap < 512) return 0;
++    unsigned h = 2166136261u;
++    for (size_t i = 0; i < len; i++) { h ^= m[i]; h *= 16777619u; }
++    for (size_t i = 0; i < 256; i++) { s[i * 2] = (unsigned char)(h >> (i % 4 * 8)); s[i * 2 + 1] = (unsigned char)i; }
++    return 512;
++}
++
++static size_t refuse_sign(const void *msg, size_t len, void *sig, size_t cap) {
++    (void)msg; (void)len; (void)sig; (void)cap;
++    return 0;
++}
++
++// base64url without padding: alphabet, and `=` must never appear.
++static void check_b64url(const char *s) {
++    assert(strchr(s, '=') == NULL);
++    assert(strchr(s, '+') == NULL && strchr(s, '/') == NULL);
++    for (const char *p = s; *p; p++)
++        assert((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
++               *p == '-' || *p == '_');
++}
++
++//: The payload of a JWT, decoded: the claims are ASCII, so a straight base64url decode does.
++static void decode_payload(const char *jwt, char *json, size_t cap) {
++    static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++    const char *d1 = strchr(jwt, '.');
++    const char *d2 = strrchr(jwt, '.');
++    size_t o = 0;
++    unsigned acc = 0;
++    int bits = 0;
++    for (const char *p = d1 + 1; p < d2 && o + 1 < cap; p++) {
++        const char *q = strchr(A, *p);
++        assert(q);
++        acc = acc << 6 | (unsigned)(q - A);
++        bits += 6;
++        if (bits >= 8) { bits -= 8; json[o++] = (char)((acc >> bits) & 0xFF); }
++    }
++    json[o] = 0;
++}
++
++int main(void) {
++    char out[DM_IDTOKEN_MAX];
++    size_t n = dm_idtoken_build(out, sizeof out, "nx2.abc.def", "2.4.0", NULL, fake_sign);
++    assert(n > 0);
++    assert(n == strlen(out));
++
++    // Three dot-separated parts, all base64url.
++    int dots = 0;
++    for (char *p = out; *p; p++) if (*p == '.') dots++;
++    assert(dots == 2);
++    char head[512], payload[1024];
++    const char *d1 = strchr(out, '.');
++    const char *d2 = strrchr(out, '.');
++    assert(d1 && d2 && d1 != d2);
++    memcpy(head, out, (size_t)(d1 - out)); head[d1 - out] = 0;
++    memcpy(payload, d1 + 1, (size_t)(d2 - d1 - 1)); payload[d2 - d1 - 1] = 0;
++    check_b64url(head);
++    check_b64url(payload);
++    check_b64url(d2 + 1);
++
++    // Decoded payload: the claims a game and the server read.
++    char json[800];
++    // Only ASCII claims, so a base64url decode is a small loop.
++    static const char ALPHA[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++    size_t o = 0;
++    unsigned acc = 0; int bits = 0;
++    for (const char *p = payload; *p && o + 1 < sizeof json; p++) {
++        const char *q = strchr(ALPHA, *p);
++        assert(q);
++        acc = acc << 6 | (unsigned)(q - ALPHA); bits += 6;
++        if (bits >= 8) { bits -= 8; json[o++] = (char)((acc >> bits) & 0xFF); }
++    }
++    json[o] = 0;
++    assert(strstr(json, "\"nnex\":\"nx2.abc.def\""));
++    assert(strstr(json, "\"iss\":\"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com\""));
++    assert(strstr(json, "\"aud\":\"ted9e2f05d286f7b8\""));
++    assert(strstr(json, "\"tv\":\"2.4.0\""));
++    assert(strstr(json, "\"sn\":\"XAW10000000000\""));
++    assert(strstr(json, "\"hm\":true"));
++    assert(strstr(json, "\"jku\":\"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates\""));
++    assert(strstr(json, "\"app_id\"") == NULL);          // only for the titles that need it
++    // exp - iat is the three hours the reference client uses.
++    const char *iat = strstr(json, "\"iat\":");
++    const char *exp = strstr(json, "\"exp\":");
++    assert(iat && exp);
++    // Numeric claims, not strings: a JWT validator refuses `"iat":"123"`.
++    assert(iat[6] >= '0' && iat[6] <= '9');
++    assert(exp[6] >= '0' && exp[6] <= '9');
++    assert((time_t)(atoll(exp + 6) - atoll(iat + 6)) == DM_IDTOKEN_TTL_SECONDS);
++
++    // Two tokens never repeat: the random claims differ.
++    char again[DM_IDTOKEN_MAX];
++    assert(dm_idtoken_build(again, sizeof again, "nx2.abc.def", "2.4.0", NULL, fake_sign) > 0);
++    assert(strcmp(again, out) != 0);
++
++    // The app id goes in only when asked.
++    assert(dm_idtoken_build(out, sizeof out, "nx2.abc.def", "2.4.0", "0100D870045B6000", fake_sign) > 0);
++    char with_app[1024];
++    decode_payload(out, with_app, sizeof with_app);
++    assert(strstr(with_app, "\"app_id\":\"0100D870045B6000\""));
++
++    // No version, no `tv` claim (the field is optional in the reference).
++    assert(dm_idtoken_build(out, sizeof out, "nx2.abc.def", NULL, NULL, fake_sign) > 0);
++
++    // Refusals: no token, no signer, or a buffer that cannot hold the result.
++    assert(dm_idtoken_build(out, sizeof out, NULL, "2.4.0", NULL, fake_sign) == 0);
++    assert(dm_idtoken_build(out, sizeof out, "", "2.4.0", NULL, fake_sign) == 0);
++    assert(dm_idtoken_build(out, sizeof out, "nx2.abc.def", "2.4.0", NULL, NULL) == 0);
++    assert(dm_idtoken_build(out, sizeof out, "nx2.abc.def", "2.4.0", NULL, refuse_sign) == 0);
++    char tiny[64];
++    assert(dm_idtoken_build(tiny, sizeof tiny, "nx2.abc.def", "2.4.0", NULL, fake_sign) == 0);
++
++    printf("ok: %zu bytes, claims and refusals\n", n);
++    return 0;
++}
