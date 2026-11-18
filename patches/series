@@ -74,3 +74,4 @@
 0076-host-read-json-that-has-spaces-in-it.patch
 0077-host-the-dauth-client-is-quiet-when-it-works.patch
 0078-fonts-the-source-font-may-be-a-collection.patch
+0079-host-a-log-line-when-the-nextendo-switch-is-on.patch
