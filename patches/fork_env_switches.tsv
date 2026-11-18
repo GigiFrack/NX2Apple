@@ -51,3 +51,4 @@ DM_NEXTENDO_DEVICE_ID	path	`=<id>` the client id the device tokens are asked for
 DM_NEXTENDO_HTTPS_PORT	path	`=<port>` (default 443) where the dauth chain is reached; a local shim of the stack listens elsewhere
 DM_NEXTENDO_TLS_INSECURE	switch	`1` accepts a certificate the system does not trust — only for the mock server the tests start, never for a real deployment
 DM_TEST_DAUTH_PORT	test	`=<port>` (host tests) the mock dauth chain `t_dauth_local` speaks to; only that test reads it
+DM_NEXTENDO_APP_ID	path	`=<title id>` the application id the dauth chain asks a token for; per-game data the launcher already knows, so it comes from there and not from the source

@@ -68,3 +68,4 @@
 0070-host-the-dauth-chain-as-a-host-module.patch
 0071-host-the-default-device-id-is-a-uuid-not-32-bare.patch
 0072-tests-the-map-s-format-is-an-address-and-a-name.patch
+0073-accounts-the-network-service-account-answers-wit.patch
