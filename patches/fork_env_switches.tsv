@@ -45,3 +45,4 @@ DM_UI_HOLD	test	When set, keeps the controller mapping test window open for 60 s
 DM_NEXTENDO	switch	`1` turns the Nextendo Network seams on: the hostname map, and (with the rest of the work) real sockets, TLS and the network account. Unset or `0` keeps every cut branch exactly as it is
 DM_NEXTENDO_HOSTS	path	`<ip> <hostname>` one per line, `*.suffix` cases included: the names the game resolves to the Nextendo servers. `#` starts a comment. Only read with `DM_NEXTENDO=1`
 DM_NEXTENDO_HOSTS_FILE	path	`=<path>` reads the map from a file instead of `DM_NEXTENDO_HOSTS` (the launcher's per-game copy)
+DM_TEST_TLS_PORT	test	`=<port>` (host tests) the local TLS server the test `t_ssl_local` speaks to; only that test reads it, and the fork's macOS workflow starts the server
