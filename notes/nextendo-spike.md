@@ -111,6 +111,23 @@ protocol.
    `LoginEx`). The name and the flow strongly suggest it; the emulator's source is the proof, and it
    is not public (the `Ryujinx-Nextendo` README link 404s).
 
+## 5b. The Horizon `addrinfo`, for the resolver hook
+
+Taken from libnx, which mirrors the BSD service's own structures
+(`nx/external/bsd/include/netdb.h:113-122` and `.../netinet/in.h:87-93`), so the layout is not a guess:
+
+```c
+struct addrinfo { int ai_flags; int ai_family; int ai_socktype; int ai_protocol;
+                  socklen_t ai_addrlen; char *ai_canonname;
+                  struct sockaddr *ai_addr; struct addrinfo *ai_next; };   /* 48 bytes, arm64 */
+struct sockaddr_in { uint8_t sin_len; sa_family_t sin_family; in_port_t sin_port;
+                     struct in_addr sin_addr; char sin_zero[8]; };          /* 16 bytes */
+```
+
+Note `ai_canonname` **before** `ai_addr` (FreeBSD's order, which Darwin also uses; glibc swaps them),
+and that `sin_port`/`sin_addr` are in network byte order. `GetAddrInfo` therefore has to build this
+structure explicitly rather than hand back the host's, and `FreeAddrInfo` must free the same chain.
+
 ## 6. What is verifiable without a human
 
 - `nextendo_auth.py`: PKCE, loopback, state check, token file, environment — 15 tests, all local
