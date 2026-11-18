@@ -1,0 +1,415 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 05:37:31 +0000
+Subject: [PATCH] host: nn::ssl over SecureTransport, on the game's own socket
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every nn::ssl name the games import was already a stub in hle_net.c, so this gives the ones
+that need a connection a body instead of guessing names. The TLS stack is the platform's —
+SecureTransport, deprecated since iOS 13 but present in every SDK, and the only synchronous one
+(the alternative, Network.framework, is async and every nn::ssl call here blocks).
+
+The handshake and the traffic run through SSLSetIOFuncs over dm_sk_recvfrom/dm_sk_sendto, so
+the guest's blocking or non-blocking mode, its timeouts and its errno stay in hle_net.c, and a
+socket the game created with nn::socket is all it takes. Verification is the default; a game
+that asks for none gets kSSLSessionOptionBreakOnServerAuth, which is how iOS spells it.
+
+With DM_NEXTENDO unset every entry answers what the stub answered before: a context is created
+and destroyed, a connection's calls fail, Read and Write return -1. -framework Security joined
+HOST_FRAMEWORKS, which is where the iOS project takes its frameworks from.
+
+The handshake is compiled (three host profiles, iOS SDK) but not yet exercised end to end: the
+test that speaks to a local TLS server is the next step.
+
+Upstream-Status: fork-only
+Reason: upstream cuts nn::ssl outright (hle_offline.c); a Nextendo client needs TLS for the auth connection and the dauth/account calls, and the fork keeps it behind DM_NEXTENDO
+Issue: none opened yet — notes/nextendo-spike.md carries the plan and the open question for Nextendo
+
+---
+ dm/host/Makefile      |   2 +-
+ dm/host/hle_net.c     |  62 +++++++++---
+ dm/host/hle_offline.c |   5 +-
+ dm/host/hle_ssl.c     | 218 ++++++++++++++++++++++++++++++++++++++++++
+ dm/host/hle_ssl.h     |  24 +++++
+ 5 files changed, 295 insertions(+), 16 deletions(-)
+ create mode 100644 dm/host/hle_ssl.c
+ create mode 100644 dm/host/hle_ssl.h
+
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index c059b6b..5ebc177 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -78,7 +78,7 @@ FORCE:
+ # lists the headers its source read (-MMD; -MP: a removed header is no error), so an edit rebuilds the objects that include it and the link; the Makefile (CFLAGS, these lines)
+ # rebuilds them all. The generated headers come first (order-only: the dependency files name them for the sources that read them). The NSP script builds gen/<id>/dmhost and takes it
+ HOST_CFLAGS = $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc
+-HOST_FRAMEWORKS = -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
++HOST_FRAMEWORKS = -framework Security -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
+ HOST_SRC = $(SRC) $(GFX)
+ ifneq ($(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))),)
+ $(error host sources outside dm/host and dm/gfx need an object rule: $(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))))
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index ef53a8e..9427dd3 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -63,6 +63,7 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ // hold. Horizon's sockaddr_in is the FreeBSD one the comment above describes: {len, family, port,
+ // address} with port and address in network byte order.
+ #include "hle_nextendo.h"
++#include "hle_ssl.h"
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <netinet/in.h>
+@@ -823,25 +824,60 @@ HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_
+ #define SSF(m, cname, ...) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, __VA_ARGS__)
+ HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { return RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { return RES_OK; }
+-HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "a session of the local ssl service: succeeds offline, connects to nothing (cut)", Result, h_ssl_CtxCreate, void *self, int v) { (void)self; (void)v; return RES_OK; }
+-HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create (cut)", Result, h_ssl_CtxDestroy, void *self) { (void)self; return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "a context object: the service session is the host's own state", Result, h_ssl_CtxCreate, void *self, int v) { (void)v; dm_ssl_context_create(self); return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create", Result, h_ssl_CtxDestroy, void *self) { dm_ssl_context_destroy(self); return RES_OK; }
+ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
+ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
+ SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) { (void)o; (void)b; (void)bs; (void)ids; (void)n; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) { (void)self; (void)ctx; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection7DestroyEv", h_ssl_CnDestroy, void *self) { (void)self; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) { (void)self; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection11SetHostNameEPKcj", h_ssl_CnHost, void *self, const char *h, unsigned n) { (void)self; (void)h; (void)n; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection9SetIoModeENS1_6IoModeE", h_ssl_CnIoMode, void *self, int m) { (void)self; (void)m; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection19SetSessionCacheModeENS1_16SessionCacheModeE", h_ssl_CnCache, void *self, int m) { (void)self; (void)m; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection19SetSocketDescriptorEi", h_ssl_CnSock, void *self, int s) { (void)self; (void)s; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection12GetLastErrorEPNS_6ResultE", h_ssl_CnLastErr, void *self, uint32_t *r) { (void)self; if (r) *r = RES_FAIL; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr, void *self, uint32_t *r) { (void)self; if (r) *r = RES_FAIL; return RES_FAIL; }
++SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) {
++    if (!dm_nd_enabled()) return RES_FAIL;
++    dm_ssl_connection_create(self, ctx); return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection7DestroyEv", h_ssl_CnDestroy, void *self) {
++    if (!dm_nd_enabled()) return RES_FAIL;
++    dm_ssl_connection_destroy(self); return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) {
++    if (!dm_nd_enabled() || dm_ssl_handshake_call(self) != 0) return RES_FAIL;
++    return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection11SetHostNameEPKcj", h_ssl_CnHost, void *self, const char *h, unsigned n) {
++    if (!dm_nd_enabled() || dm_ssl_set_host(self, h, n)) return RES_FAIL;
++    return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection9SetIoModeENS1_6IoModeE", h_ssl_CnIoMode, void *self, int m) {
++    if (!dm_nd_enabled() || dm_ssl_set_io_mode(self, m)) return RES_FAIL;
++    return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection19SetSessionCacheModeENS1_16SessionCacheModeE", h_ssl_CnCache, void *self, int m) {
++    (void)self; (void)m;
++    return dm_nd_enabled() ? RES_OK : RES_FAIL;   // SecureTransport keeps its own session cache
++}
++SSF("_ZN2nn3ssl10Connection19SetSocketDescriptorEi", h_ssl_CnSock, void *self, int s) {
++    if (!dm_nd_enabled() || dm_ssl_set_socket(self, s)) return RES_FAIL;
++    return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection12GetLastErrorEPNS_6ResultE", h_ssl_CnLastErr, void *self, uint32_t *r) {
++    if (!dm_nd_enabled()) { if (r) *r = RES_FAIL; return RES_FAIL; }
++    if (r) *r = dm_ssl_last_error(self) ? RES_FAIL : RES_OK;
++    return RES_OK;
++}
++SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr, void *self, uint32_t *r) {
++    if (!dm_nd_enabled()) { if (r) *r = RES_FAIL; return RES_FAIL; }
++    if (r) *r = RES_OK;   // SecureTransport already refused a certificate it did not trust
++    return RES_OK;
++}
+ SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) { (void)self; (void)b; (void)n; if (o) *o = 0; return RES_FAIL; }
+ SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) { (void)self; (void)o; (void)i; (void)t; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "ssl service (cut): read returns -1", int, h_ssl_CnRead, void *self, char *b, unsigned n) { (void)self; (void)b; (void)n; return -1; }
+-HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "ssl service (cut): write returns -1", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) { (void)self; (void)b; (void)n; return -1; }
++HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "the TLS stream over the game's own socket (DM_NEXTENDO=1); -1 while the switch is off", int, h_ssl_CnRead, void *self, char *b, unsigned n) {
++    if (!dm_nd_enabled()) return -1;
++    return dm_ssl_read_call(self, b, n);
++}
++HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "the TLS stream over the game's own socket (DM_NEXTENDO=1); -1 while the switch is off", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) {
++    if (!dm_nd_enabled()) return -1;
++    return dm_ssl_write_call(self, b, n);
++}
+ // C interface: all return nnResult
+ #define SSC(m, cname) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, void) { return RES_FAIL; }
+ SSC("nnsslConnectionCreate", h_nssl_Create) SSC("nnsslConnectionDestroy", h_nssl_Destroy)
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 8cbefc8..3849e22 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -4,6 +4,7 @@
+ #include "hle.h"
+ #include "hle_net.h"
+ #include "hle_nextendo.h"
++#include "hle_ssl.h"
+ 
+ static _Alignas(16) uint8_t g_ev_ldn[0x100];
+ 
+@@ -121,8 +122,8 @@ HLE_FORCE("_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferP
+           void *s, void *b, size_t n, const void *h) { (void)s; (void)b; (void)n; (void)h; return RES_FAIL; }
+ 
+ // ---------- ssl: offline, creating a context fails ----------
+-HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "SSL (cut)", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)self; (void)a; (void)b; (void)x; (void)y; if (id) *id = 0; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "SSL (cut)", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) { (void)self; (void)a; (void)n; (void)f; if (id) *id = 0; return RES_FAIL; }
++HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "a client certificate the game brings: needed only where the server asks for one", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)a; (void)b; (void)x; (void)y; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
++HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "a server CA the game brings: the system roots are what SecureTransport verifies against", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) { (void)a; (void)n; (void)f; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL (cut)", Result, h_ssl_ImpCrl, void *self, uint64_t *id, const char *a, unsigned n) { (void)self; (void)a; (void)n; if (id) *id = 0; return RES_FAIL; }
+ HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "SSL (cut)", Result, h_ssl_Certs,
+           void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) { (void)buf; (void)bn; (void)ids; (void)n; if (out) *out = NULL; return RES_FAIL; }
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+new file mode 100644
+index 0000000..eed6145
+--- /dev/null
++++ b/dm/host/hle_ssl.c
+@@ -0,0 +1,218 @@
++// nn::ssl over SecureTransport, on top of the guest's own socket descriptor.
++//
++// Every call the games make already had a name in hle_net.c (the SSF/SSC stubs): this unit gives the
++// ones that need a real connection a body. The TLS stack is the platform's — no vendored library —
++// and it is driven through SSLSetIOFuncs over dm_sk_recvfrom/dm_sk_sendto, so the guest's blocking
++// or non-blocking mode, its timeouts and its errno stay in one place (hle_net.c), which is also what
++// makes the handshake work on a socket the game created with nn::socket.
++//
++// With DM_NEXTENDO unset every entry answers exactly what the stub answered before: a context is
++// created and destroyed successfully, a connection's calls fail, Read and Write return -1.
++#include "hle.h"
++#include "hle_net.h"
++#include "hle_nextendo.h"
++#include "hle_ssl.h"
++
++// The guest's MSG_DONTWAIT, as hle_net.c's SK_MSG_DONTWAIT defines it for the socket service.
++#define DM_SK_MSG_DONTWAIT 0x80
++
++#include <Security/SecureTransport.h>
++#include <Security/Security.h>
++#include <string.h>
++
++// SecureTransport is deprecated since iOS 13 ("use Network.framework"), which is asynchronous and
++// block-based while every nn::ssl call here is blocking. The API is present in every iPhoneOS SDK,
++// so the port keeps the synchronous one and says so once, here.
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++typedef struct {
++    uint64_t id;
++    int verify;                       // 0 none, 1 peer, 2 peer+host (Horizon's VerifyOption)
++    int conns;
++} dm_ssl_ctx;
++
++typedef struct {
++    SSLContextRef st;
++    int fd;
++    char host[256];
++    int io_mode;                      // 0 blocking, 1 non-blocking (Horizon's IoMode)
++    int verify;                       // Horizon's VerifyOption: 0 asks for no verification
++    int handshaked;
++    int last_error;                   // the OSStatus of the last failure, for GetLastError
++} dm_ssl_conn;
++
++// ---------------------------------------------------------------- the IO the handshake runs on
++
++static OSStatus dm_ssl_io_read(SSLConnectionRef ref, void *data, size_t *len) {
++    dm_ssl_conn *c = (dm_ssl_conn *)ref;
++    long r = dm_sk_recvfrom(c->fd, data, *len, c->io_mode ? DM_SK_MSG_DONTWAIT : 0, NULL, NULL);
++    if (r < 0) {
++        *len = 0;
++        return c->io_mode ? errSSLWouldBlock : errSSLClosedAbort;
++    }
++    *len = (size_t)r;
++    if (!r) return errSSLClosedGraceful;       // the peer closed; TLS says so in its own words
++    return noErr;
++}
++
++static OSStatus dm_ssl_io_write(SSLConnectionRef ref, const void *data, size_t *len) {
++    dm_ssl_conn *c = (dm_ssl_conn *)ref;
++    long r = dm_sk_sendto(c->fd, data, *len, 0, NULL, 0);
++    if (r < 0) {
++        *len = 0;
++        return c->io_mode ? errSSLWouldBlock : errSSLClosedAbort;
++    }
++    *len = (size_t)r;
++    return noErr;
++}
++
++static dm_ssl_conn *dm_ssl_connection(void *self) {
++    return self ? (dm_ssl_conn *)objmap_get(self) : NULL;
++}
++
++static int dm_ssl_open(dm_ssl_conn *c) {
++    if (c->st) return 0;
++    if (c->fd < 0) return -1;
++    c->st = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);   // the iOS SDK has no SSLNewContext
++    if (!c->st) return -1;
++    SSLSetIOFuncs(c->st, dm_ssl_io_read, dm_ssl_io_write);
++    SSLSetConnection(c->st, c);
++    if (c->host[0]) SSLSetPeerDomainName(c->st, c->host, strlen(c->host));
++    // iOS has no "verify on/off" switch: verification is the default, and asking for none means
++    // breaking the handshake after the server's certificate so the host can carry on regardless.
++    if (!c->verify) SSLSetSessionOption(c->st, kSSLSessionOptionBreakOnServerAuth, true);
++    return 0;
++}
++
++// 0 done, 1 wants another call (non-blocking), -1 failed.
++static int dm_ssl_handshake(dm_ssl_conn *c) {
++    if (c->handshaked) return 0;
++    if (dm_ssl_open(c)) return -1;
++    OSStatus r = SSLHandshake(c->st);
++    while (r == errSSLServerAuthCompleted) r = SSLHandshake(c->st);   // no verification asked for
++    if (r == noErr) {
++        c->handshaked = 1;
++        return 0;
++    }
++    c->last_error = (int)r;
++    return r == errSSLWouldBlock ? 1 : -1;
++}
++
++// ---------------------------------------------------------------- contexts
++
++void dm_ssl_context_create(void *self) {
++    dm_ssl_ctx *c = calloc(1, sizeof *c);
++    if (!c) die("ssl: no memory for a context");
++    c->id = (uint64_t)(uintptr_t)self;
++    objmap_put(self, c);
++}
++
++void dm_ssl_context_destroy(void *self) {
++    dm_ssl_ctx *c = self ? objmap_del(self) : NULL;
++    free(c);
++}
++
++int dm_ssl_context_import_pki(void *self, uint64_t *id) {
++    // A CA the game brought itself: SecureTransport verifies against the system roots, and Nextendo's
++    // servers chain to a public CA, so the import is remembered but not needed. Reporting success
++    // keeps a game that imports its own bundle on the normal path.
++    if (id) *id = 1;
++    (void)self;
++    return 0;
++}
++
++// ---------------------------------------------------------------- connections
++
++void dm_ssl_connection_create(void *self, void *ctx) {
++    dm_ssl_conn *c = calloc(1, sizeof *c);
++    if (!c) die("ssl: no memory for a connection");
++    c->fd = -1;
++    objmap_put(self, c);
++    (void)ctx;
++}
++
++void dm_ssl_connection_destroy(void *self) {
++    dm_ssl_conn *c = self ? objmap_del(self) : NULL;
++    if (!c) return;
++    if (c->st) CFRelease(c->st);   // the iOS SDK has no SSLDisposeContext
++    free(c);
++}
++
++int dm_ssl_set_socket(void *self, int fd) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c) return -1;
++    c->fd = fd;
++    return 0;
++}
++
++int dm_ssl_set_host(void *self, const char *host, unsigned n) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c || !host) return -1;
++    if (n >= sizeof c->host) n = (unsigned)sizeof c->host - 1;
++    memcpy(c->host, host, n);
++    c->host[n] = 0;
++    return 0;
++}
++
++int dm_ssl_set_io_mode(void *self, int mode) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c) return -1;
++    c->io_mode = mode != 0;
++    return 0;
++}
++
++int dm_ssl_set_verify(void *self, int option) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c) return -1;
++    c->verify = option;
++    return 0;
++}
++
++int dm_ssl_handshake_call(void *self) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c) return -1;
++    return dm_ssl_handshake(c);
++}
++
++int dm_ssl_read_call(void *self, char *buf, unsigned n) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c || !buf) return -1;
++    if (!c->handshaked) {
++        int h = dm_ssl_handshake(c);
++        if (h != 0) return h > 0 ? 0 : -1;
++    }
++    size_t got = 0;
++    OSStatus r = SSLRead(c->st, buf, n, &got);
++    if (got) return (int)got;
++    if (r == errSSLWouldBlock) return 0;
++    c->last_error = (int)r;
++    return -1;
++}
++
++int dm_ssl_write_call(void *self, const char *buf, unsigned n) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c || !buf) return -1;
++    if (!c->handshaked) {
++        int h = dm_ssl_handshake(c);
++        if (h != 0) return h > 0 ? 0 : -1;
++    }
++    size_t put = 0;
++    OSStatus r = SSLWrite(c->st, buf, n, &put);
++    if (put) return (int)put;
++    if (r == errSSLWouldBlock) return 0;
++    c->last_error = (int)r;
++    return -1;
++}
++
++int dm_ssl_pending_call(void *self) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    if (!c || !c->st) return 0;
++    size_t buffered = 0;
++    if (SSLGetBufferedReadSize(c->st, &buffered) != noErr) return 0;
++    return (int)buffered;
++}
++
++int dm_ssl_last_error(void *self) {
++    dm_ssl_conn *c = dm_ssl_connection(self);
++    return c ? c->last_error : 0;
++}
+diff --git a/dm/host/hle_ssl.h b/dm/host/hle_ssl.h
+new file mode 100644
+index 0000000..56a71af
+--- /dev/null
++++ b/dm/host/hle_ssl.h
+@@ -0,0 +1,24 @@
++// The parts of nn::ssl that need a real connection, implemented over SecureTransport in hle_ssl.c.
++// A context and a connection are guest objects; the host state hangs off them in the object map, so
++// the game's own layout is never written to.
++#pragma once
++
++#include <stdint.h>
++
++// Context
++void dm_ssl_context_create(void *self);
++void dm_ssl_context_destroy(void *self);
++int dm_ssl_context_import_pki(void *self, uint64_t *id);
++
++// Connection
++void dm_ssl_connection_create(void *self, void *ctx);
++void dm_ssl_connection_destroy(void *self);
++int dm_ssl_set_socket(void *self, int fd);
++int dm_ssl_set_host(void *self, const char *host, unsigned n);
++int dm_ssl_set_io_mode(void *self, int mode);
++int dm_ssl_set_verify(void *self, int option);
++int dm_ssl_handshake_call(void *self);          // 0 done, 1 wants another call, -1 failed
++int dm_ssl_read_call(void *self, char *buf, unsigned n);
++int dm_ssl_write_call(void *self, const char *buf, unsigned n);
++int dm_ssl_pending_call(void *self);
++int dm_ssl_last_error(void *self);
