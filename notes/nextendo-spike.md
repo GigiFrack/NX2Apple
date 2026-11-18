@@ -128,6 +128,14 @@ Note `ai_canonname` **before** `ai_addr` (FreeBSD's order, which Darwin also use
 and that `sin_port`/`sin_addr` are in network byte order. `GetAddrInfo` therefore has to build this
 structure explicitly rather than hand back the host's, and `FreeAddrInfo` must free the same chain.
 
+## 5c. What the socket layer still lacks, after the TCP patch
+
+`dm_sk_sendto`/`dm_sk_recvfrom` deliver **inside the process only**: the datagram path looks for a
+local socket bound to the port and drops the packet when there is none (`hle_net.c`), and every
+address it accepts is 127.x. NEX auth is TCP+TLS (patch 0063 covers TCP), but PRUDP — the secure
+server, and the NAT check — is **UDP to a remote host**, which this layer cannot do yet. So before
+TLS there is one more brick: real UDP egress, bounded by `DM_NEXTENDO` exactly as the TCP path is.
+
 ## 6. What is verifiable without a human
 
 - `nextendo_auth.py`: PKCE, loopback, state check, token file, environment — 15 tests, all local
