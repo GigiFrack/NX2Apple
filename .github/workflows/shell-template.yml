@@ -1,0 +1,46 @@
+name: shell template
+
+# The Windows launcher does not compile the iOS shell: it takes a pre-built DmShell.app from the release
+# archive and drops each game's framework inside it (tools/build_shell_template.py says why). A template
+# built before the current engine therefore ships an old shell, and an old shell cannot read what a new
+# engine writes — the DMMSLTR1 trailer on a RomFS image is exactly that case. This job builds a current
+# one on macOS, so the launcher can be pointed at it (NSPB_SHELL_TEMPLATE, or the folder in the release).
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shell-template.yml'
+      - 'frontend-ios/**'
+      - 'tools/build_shell_template.py'
+  workflow_dispatch:
+
+jobs:
+  template:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Engine (upstream at the pin, plus this branch's patches)
+        run: python3 tools/engine.py sync
+
+      - name: Build the unsigned DmShell.app template
+        run: python3 tools/build_shell_template.py --engine engine --out out/DmShell.app
+
+      - name: The template carries the shell's commit
+        run: |
+          cat out/DmShell.app/Info.plist | head -40 || true
+          ls -la out/DmShell.app
+
+      - name: Zip it
+        run: cd out && ditto -c -k --sequesterRsrc --keepParent DmShell.app DmShell.app.zip && ls -lh DmShell.app.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DmShell-template
+          path: out/DmShell.app.zip
+          if-no-files-found: error
