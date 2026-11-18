@@ -600,7 +600,7 @@ class WindowsEngineContractTests(unittest.TestCase):
                 called_build = False
 
                 @classmethod
-                def run(cls, cmd, _log, env=None):
+                def run(cls, cmd, _log, env=None, fatal=True):   # mirrors the engine's run()
                     cls.called_build = True
                     out_idx = cmd.index('-o') + 1
                     (Path(cmd[out_idx]) / 'nx_extract.exe').write_bytes(b'MZ-fresh')

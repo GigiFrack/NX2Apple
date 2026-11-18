@@ -587,12 +587,18 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
         # lives in its own folder (the shim's PATH has it, but not every caller goes through it).
         dn = tc.dotnet_dir()
         dotnet = str(dn / 'dotnet.exe') if dn else 'dotnet'
+        # dotnet leaves MSBuild worker nodes alive on purpose, and the build's own process-group
+        # check counts one of them as a straggler and fails the step for it (Windows: "dotnet.exe
+        # exited, but a background process still ran 5 s later"). The build itself is fine, so the
+        # nodes are told not to linger and a straggler no longer fails the step: the artifact decides.
+        env = dict(os.environ if env is None else env, MSBUILDDISABLENODEREUSE='1',
+                   DOTNET_CLI_USE_MSBUILD_SERVER='0', DOTNET_CLI_TELEMETRY_OPTOUT='1')
         with tempfile.TemporaryDirectory(prefix='nx_extract_') as td, \
                 tempfile.TemporaryDirectory(prefix='nx_extract_art_') as art:
             mod.run([dotnet, 'build', proj, '-c', 'Release',
                      '-p:PublishAot=false', *tc.csc_tool_args(), '--artifacts-path', art,
-                     '-o', td, '-v', 'quiet', '-nologo'],
-                    Path(logs) / 'nx_extract_build.log', env=env)
+                     '-o', td, '-v', 'quiet', '-nologo', '-nodeReuse:false'],
+                    Path(logs) / 'nx_extract_build.log', env=env, fatal=False)
             exe = Path(td) / 'nx_extract.exe'
             if not exe.exists():
                 raise BuildError(f'nx_extract built without nx_extract.exe (see '
@@ -627,12 +633,14 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
         dotnet = str(dn / 'dotnet.exe') if dn else 'dotnet'
         log = tc.tools_dir() / 'nx_extract_build.log'
         log.parent.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ if env is None else env, MSBUILDDISABLENODEREUSE='1',   # see the other copy
+                   DOTNET_CLI_USE_MSBUILD_SERVER='0', DOTNET_CLI_TELEMETRY_OPTOUT='1')
         with tempfile.TemporaryDirectory(prefix='nx_extract_') as td, \
                 tempfile.TemporaryDirectory(prefix='nx_extract_art_') as art:
             mod.run([dotnet, 'build', proj, '-c', 'Release', '-p:PublishAot=false',
                      *tc.csc_tool_args(), '--artifacts-path', art, '-o', td, '-v', 'quiet',
-                     '-nologo'],
-                    log, env=env if env is not None else os.environ)
+                     '-nologo', '-nodeReuse:false'],
+                    log, env=env, fatal=False)
             exe = Path(td) / 'nx_extract.exe'
             if not exe.exists():
                 raise BuildError(f'nx_extract built without nx_extract.exe (see {log})')

@@ -2606,7 +2606,7 @@ class WindowsBuildFixesTest(unittest.TestCase):
                     return subprocess.CompletedProcess(cmd, 0, stdout=out + '\n', stderr='')
                 return real_subproc_run(cmd, *a, **kw)
 
-            def fake_mod_run(cmd, log, env=None):
+            def fake_mod_run(cmd, log, env=None, fatal=True):   # mirrors _UPSTREAM_RUN's signature
                 s_cmd = [str(c) for c in cmd]
                 seen_cmds.append(s_cmd)
                 out_dir = Path(s_cmd[s_cmd.index('-o') + 1])
