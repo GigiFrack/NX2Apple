@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 12:37:32 +0000
+Subject: [PATCH] host: the log says which names the game asks for
+
+With the switch on, GetAddrInfo is where a game's online attempt first shows what it wants, and the
+log carried neither the name nor the answer. One line per lookup: the name and its port, next to the
+UNIMPL lines that name the functions the host does not implement yet. It is what turns a game's log
+into the list of hosts to map.
+
+Upstream-Status: fork-only
+Reason: with DM_NEXTENDO on, the lookups are what a game's online attempt first reveals; naming them in the log is how the host map gets built instead of guessed
+Issue: none opened yet — folds into the same PR as 0063-0073
+
+---
+ dm/host/hle_offline.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 3849e22..3fc3d16 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -82,7 +82,7 @@ HLE_FORCE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", "Poll over process-lo
+ HLE_FORCE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", "local UDP (offline BSD service)", long, h_sk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
+ HLE_FORCE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", "local UDP (offline BSD service)", long, h_sk_SendTo2, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
+ HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "local UDP (offline BSD service)", long, h_sk_RecvFrom2, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return dm_sk_recvfrom(s, b, n, f, a, al); }
+-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "the Nextendo map, then the real resolver (DM_NEXTENDO=1); EAI_FAIL while the switch is off", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { return dm_nd_gai(h, s, hint, res); }
++HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "the Nextendo map, then the real resolver (DM_NEXTENDO=1); EAI_FAIL while the switch is off", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { if (dm_nd_enabled()) LOG("gai %s (port %s)", h ? h : "", s ? s : ""); return dm_nd_gai(h, s, hint, res); }
+ HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "frees the chain GetAddrInfo built", void, h_sk_FreeAi2, void *ai) { dm_nd_freeai(ai); }
+ HLE_FORCE("_ZN2nn6socket11GAIStrErrorENS0_7AiErrnoE", "resolver error text", const char *, h_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+ // SDK 11's overloads with plain sockaddr / int arguments (Big Brain Academy: Brain vs. Brain, through Pia)
+@@ -196,7 +196,7 @@ HLE_FORCE("nnsocketRecvMsg", "offline (cut)", int, h_c_sk_RecvMsg, void) { retur
+ HLE_FORCE("nnsocketSendMsg", "offline (cut)", int, h_c_sk_SendMsg, void) { return -1; }
+ HLE_FORCE("nnsocketShutdown", "local UDP (offline BSD service)", int, h_c_sk_Shutdown, int s, int h) { return dm_sk_shutdown(s, h); }
+ HLE_FORCE("nnsocketGetAddrInfoWithOptions", "the Nextendo map, then the real resolver; the options are not needed", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)o; (void)n; return dm_nd_gai(h, s, hint, res); }
+-HLE_FORCE("nnsocketGetAddrInfo", "the Nextendo map, then the real resolver (DM_NEXTENDO=1)", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { return dm_nd_gai(h, s, hint, res); }
++HLE_FORCE("nnsocketGetAddrInfo", "the Nextendo map, then the real resolver (DM_NEXTENDO=1)", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { if (dm_nd_enabled()) LOG("gai %s (port %s)", h ? h : "", s ? s : ""); return dm_nd_gai(h, s, hint, res); }
+ HLE_FORCE("nnsocketFreeAddrInfo", "frees the chain GetAddrInfo built", void, h_c_sk_FreeAi, void *ai) { dm_nd_freeai(ai); }
+ HLE_FORCE("nnsocketGAIStrError", "resolver error text", const char *, h_c_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+ 
