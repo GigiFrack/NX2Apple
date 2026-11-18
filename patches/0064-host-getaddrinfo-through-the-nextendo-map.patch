@@ -1,0 +1,322 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 01:35:42 +0000
+Subject: [PATCH] host: GetAddrInfo through the Nextendo map
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+nn::socket::GetAddrInfo no longer answers EAI_FAIL unconditionally: with DM_NEXTENDO=1 a name
+in the map resolves to the mapped address, anything else goes to the real resolver, and with
+the switch off the answer is the EAI_FAIL it always was.
+
+The resolver builds Horizon's addrinfo itself (libnx's FreeBSD field order: canonname before
+addr, 16-byte sockaddr_in, network byte order) instead of handing back the system's chain, and
+FreeAddrInfo frees that chain. Plain C, no hle.h, so t_nextendo_gai runs off Darwin too — the
+map, the wildcard, a hint's socktype, a real name, a name that cannot resolve, and the switch
+off are all checked.
+
+Upstream-Status: fork-only
+Reason: with every online service cut, upstream answers EAI_FAIL for ever; the fork needs a resolver that can be pointed at Nextendo, and keeps it behind DM_NEXTENDO
+Issue: none opened yet — notes/nextendo-spike.md carries the plan and the open question for Nextendo
+
+---
+ dm/host/hle_nextendo.h         |   7 ++
+ dm/host/hle_nextendo_gai.c     | 129 +++++++++++++++++++++++++++++++++
+ dm/host/hle_offline.c          |  11 +--
+ dm/host/tests/Makefile         |   5 +-
+ dm/host/tests/t_nextendo_gai.c |  73 +++++++++++++++++++
+ 5 files changed, 219 insertions(+), 6 deletions(-)
+ create mode 100644 dm/host/hle_nextendo_gai.c
+ create mode 100644 dm/host/tests/t_nextendo_gai.c
+
+diff --git a/dm/host/hle_nextendo.h b/dm/host/hle_nextendo.h
+index cec1d40..ec5b7e2 100644
+--- a/dm/host/hle_nextendo.h
++++ b/dm/host/hle_nextendo.h
+@@ -16,3 +16,10 @@ int dm_nd_lookup(const char *host, uint32_t *addrs, int max);
+ 
+ //: How many rules the current map holds; 0 when the switch is off or nothing was given.
+ int dm_nd_rule_count(void);
++
++//: Resolve a name the way nn::socket::GetAddrInfo must: the map first, then the real resolver.
++//: Returns 0 and fills *res with a chain of Horizon `addrinfo` structures, or an EAI_* code.
++int dm_nd_gai(const char *node, const char *service, const void *hints, void **res);
++
++//: Free what dm_nd_gai built (NULL is a no-op).
++void dm_nd_freeai(void *ai);
+diff --git a/dm/host/hle_nextendo_gai.c b/dm/host/hle_nextendo_gai.c
+new file mode 100644
+index 0000000..c88d9fb
+--- /dev/null
++++ b/dm/host/hle_nextendo_gai.c
+@@ -0,0 +1,129 @@
++// The resolver the online seams resolve through: the Nextendo map first, then the real one.
++//
++// nn::socket::GetAddrInfo hands the game Horizon's own `addrinfo` (libnx mirrors it in
++// nx/external/bsd/include/netdb.h): FreeBSD's field order, so `ai_canonname` comes before `ai_addr`
++// — the opposite of glibc — and every address is the 16-byte `sockaddr_in` with length and family
++// bytes first. The host therefore builds that structure itself instead of passing the system's on.
++//
++// No hle.h here: this unit has no HLE entry to register, so it stays plain C and is tested off
++// Darwin like hle_nextendo.c.
++#include "hle_nextendo.h"
++#include <netdb.h>
++#include <netinet/in.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++
++#define ND_AI_MAX 8
++#define ND_EAI_FAIL 4
++#define ND_EAI_NONAME 5
++#define ND_SOCK_STREAM 1
++#define ND_SOCK_DGRAM 2
++
++// Horizon's struct addrinfo: four ints, a socklen_t, then three pointers in FreeBSD's order.
++typedef struct {
++    int ai_flags;
++    int ai_family;
++    int ai_socktype;
++    int ai_protocol;
++    uint32_t ai_addrlen;
++    char *ai_canonname;
++    void *ai_addr;
++    void *ai_next;
++} nd_addrinfo;
++_Static_assert(sizeof(nd_addrinfo) == 48, "Horizon's addrinfo is 48 bytes on arm64");
++
++static uint16_t nd_service_port(const char *service) {
++    if (!service || !*service) return 0;
++    char *end = NULL;
++    unsigned long v = strtoul(service, &end, 10);
++    return end && !*end && v <= 65535 ? (uint16_t)v : 0;
++}
++
++static void *nd_ai_new(int socktype, int protocol, uint32_t addr, uint16_t port, void *next) {
++    nd_addrinfo *ai = calloc(1, sizeof *ai);
++    uint8_t *sa = calloc(1, 16);
++    if (!ai || !sa) {
++        free(ai);
++        free(sa);
++        return NULL;
++    }
++    sa[0] = 16;
++    sa[1] = 2;                                   // AF_INET
++    sa[2] = (uint8_t)(port >> 8);
++    sa[3] = (uint8_t)port;
++    sa[4] = (uint8_t)(addr >> 24);
++    sa[5] = (uint8_t)(addr >> 16);
++    sa[6] = (uint8_t)(addr >> 8);
++    sa[7] = (uint8_t)addr;
++    ai->ai_family = 2;
++    ai->ai_socktype = socktype;
++    ai->ai_protocol = protocol;
++    ai->ai_addrlen = 16;
++    ai->ai_addr = sa;
++    ai->ai_next = next;
++    return ai;
++}
++
++int dm_nd_gai(const char *node, const char *service, const void *hints, void **res) {
++    if (!res) return ND_EAI_FAIL;
++    *res = NULL;
++    if (!dm_nd_enabled()) return ND_EAI_FAIL;
++    const nd_addrinfo *h = hints;
++    const int want = h ? h->ai_socktype : 0;
++    const uint16_t port = nd_service_port(service);
++
++    if (node && *node) {
++        uint32_t addrs[ND_AI_MAX];
++        const int n = dm_nd_lookup(node, addrs, ND_AI_MAX);
++        if (n > 0) {
++            void *head = NULL;
++            for (int i = n - 1; i >= 0; i--)
++                head = nd_ai_new(want ? want : ND_SOCK_STREAM,
++                                 (want ? want : ND_SOCK_STREAM) == ND_SOCK_STREAM ? 6 : 17,
++                                 addrs[i], port, head);
++            if (!head) return ND_EAI_FAIL;
++            *res = head;
++            return 0;
++        }
++    }
++
++    struct addrinfo sys_hints;
++    struct addrinfo *sys = NULL;
++    memset(&sys_hints, 0, sizeof sys_hints);
++    sys_hints.ai_family = AF_INET;                // the host speaks IPv4 only
++    sys_hints.ai_socktype = want;
++    if (want) sys_hints.ai_protocol = want == ND_SOCK_STREAM ? 6 : 17;
++    const int rc = getaddrinfo(node, service, &sys_hints, &sys);
++    if (rc != 0 || !sys) return rc == EAI_NONAME ? ND_EAI_NONAME : ND_EAI_FAIL;
++
++    void *head = NULL;
++    void **tail = &head;
++    int made = 0;
++    for (struct addrinfo *p = sys; p; p = p->ai_next) {
++        if (p->ai_family != AF_INET || !p->ai_addr) continue;
++        const struct sockaddr_in *in = (const struct sockaddr_in *)p->ai_addr;
++        void *ai = nd_ai_new(p->ai_socktype ? p->ai_socktype : (want ? want : ND_SOCK_STREAM),
++                             p->ai_protocol, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), NULL);
++        if (!ai) continue;
++        *tail = ai;
++        tail = &((nd_addrinfo *)ai)->ai_next;
++        made++;
++    }
++    freeaddrinfo(sys);
++    if (!made) return ND_EAI_FAIL;
++    *res = head;
++    return 0;
++}
++
++void dm_nd_freeai(void *ai) {
++    while (ai) {
++        nd_addrinfo *e = ai;
++        void *next = e->ai_next;
++        free(e->ai_addr);
++        free(e->ai_canonname);
++        free(e);
++        ai = next;
++    }
++}
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 5c34cf5..8cbefc8 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -3,6 +3,7 @@
+ // Return convention as in hle_friends.c: Result returns RES_FAIL ("saved / submitted" kinds return RES_OK so the game does not retry); bool returns false; events get a bound SystemEvent that never fires.
+ #include "hle.h"
+ #include "hle_net.h"
++#include "hle_nextendo.h"
+ 
+ static _Alignas(16) uint8_t g_ev_ldn[0x100];
+ 
+@@ -80,8 +81,8 @@ HLE_FORCE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", "Poll over process-lo
+ HLE_FORCE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", "local UDP (offline BSD service)", long, h_sk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
+ HLE_FORCE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", "local UDP (offline BSD service)", long, h_sk_SendTo2, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
+ HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "local UDP (offline BSD service)", long, h_sk_RecvFrom2, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return dm_sk_recvfrom(s, b, n, f, a, al); }
+-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "name resolution (cut): EAI_FAIL", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
+-HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "pairs with GetAddrInfo (cut)", void, h_sk_FreeAi2, void *ai) { (void)ai; }
++HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "the Nextendo map, then the real resolver (DM_NEXTENDO=1); EAI_FAIL while the switch is off", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { return dm_nd_gai(h, s, hint, res); }
++HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "frees the chain GetAddrInfo built", void, h_sk_FreeAi2, void *ai) { dm_nd_freeai(ai); }
+ HLE_FORCE("_ZN2nn6socket11GAIStrErrorENS0_7AiErrnoE", "resolver error text", const char *, h_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+ // SDK 11's overloads with plain sockaddr / int arguments (Big Brain Academy: Brain vs. Brain, through Pia)
+ HLE_FORCE("_ZN2nn6socket7ConnectEiPK8sockaddrj", "local UDP (offline BSD service)", int, h_sk_Connect2, int s, const void *a, unsigned n) { return dm_sk_connect(s, a, n); }
+@@ -193,9 +194,9 @@ HLE_FORCE("nnsocketListen", "offline (cut)", int, h_c_sk_Listen, void) { return
+ HLE_FORCE("nnsocketRecvMsg", "offline (cut)", int, h_c_sk_RecvMsg, void) { return -1; }
+ HLE_FORCE("nnsocketSendMsg", "offline (cut)", int, h_c_sk_SendMsg, void) { return -1; }
+ HLE_FORCE("nnsocketShutdown", "local UDP (offline BSD service)", int, h_c_sk_Shutdown, int s, int h) { return dm_sk_shutdown(s, h); }
+-HLE_FORCE("nnsocketGetAddrInfoWithOptions", "name resolution with resolver options (cut): EAI_FAIL", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)h; (void)s; (void)hint; (void)o; (void)n; if (res) *res = NULL; return SK_EAI_FAIL; }
+-HLE_FORCE("nnsocketGetAddrInfo", "name resolution (cut): EAI_FAIL", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
+-HLE_FORCE("nnsocketFreeAddrInfo", "pairs with GetAddrInfo (cut)", void, h_c_sk_FreeAi, void *ai) { (void)ai; }
++HLE_FORCE("nnsocketGetAddrInfoWithOptions", "the Nextendo map, then the real resolver; the options are not needed", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)o; (void)n; return dm_nd_gai(h, s, hint, res); }
++HLE_FORCE("nnsocketGetAddrInfo", "the Nextendo map, then the real resolver (DM_NEXTENDO=1)", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { return dm_nd_gai(h, s, hint, res); }
++HLE_FORCE("nnsocketFreeAddrInfo", "frees the chain GetAddrInfo built", void, h_c_sk_FreeAi, void *ai) { dm_nd_freeai(ai); }
+ HLE_FORCE("nnsocketGAIStrError", "resolver error text", const char *, h_c_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+ 
+ // ---------- bcat: news / data delivered from the server (Super Mario Odyssey). Initialize talks to the bcat service (an SDK abort without it); mounting the delivery cache fails,
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 5915bbc..aadcd68 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -52,6 +52,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_net_loopback
+ 	$(B)/t_net_tcp
+ 	$(B)/t_nextendo_map
++	$(B)/t_nextendo_gai
+ 	$(B)/t_sf
+ 	$(B)/t_audren_sv
+ 	$(B)/t_time
+@@ -236,9 +237,11 @@ $(B)/t_net_loopback: t_net_loopback.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_loopback.c
+ $(B)/t_net_tcp: t_net_tcp.c ../hle_net.c ../hle_net.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_tcp.c
+-# The Nextendo hostname map is plain C with no game profile: this test builds without GAME.
++# The Nextendo hostname map and resolver are plain C with no game profile: these tests build without GAME.
+ $(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
++$(B)/t_nextendo_gai: t_nextendo_gai.c ../hle_nextendo.c ../hle_nextendo_gai.c ../hle_nextendo.h | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_gai.c
+ 
+ $(B)/t_pctl: t_pctl.c ../hle_misc.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pctl.c
+diff --git a/dm/host/tests/t_nextendo_gai.c b/dm/host/tests/t_nextendo_gai.c
+new file mode 100644
+index 0000000..05d8259
+--- /dev/null
++++ b/dm/host/tests/t_nextendo_gai.c
+@@ -0,0 +1,73 @@
++// The resolver: the Nextendo map answers first, the real one after it, and with the switch off the
++// answer is the same EAI_FAIL an offline build has always given.
++//
++// Portable on purpose (no hle.h): this test builds and runs anywhere, and checks the structure the
++// game is handed — FreeBSD's field order, a 16-byte sockaddr_in, network byte order.
++#include "../hle_nextendo.c"
++#include "../hle_nextendo_gai.c"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static void fail(const char *what) {
++    fprintf(stderr, "not true: %s\n", what);
++    exit(1);
++}
++
++typedef struct {
++    int ai_flags, ai_family, ai_socktype, ai_protocol;
++    uint32_t ai_addrlen; char *ai_canonname; uint8_t *ai_addr; void *ai_next;
++} ai_view;
++
++int main(void) {
++    unsetenv("DM_NEXTENDO_HOSTS_FILE");
++    setenv("DM_NEXTENDO", "1", 1);
++    setenv("DM_NEXTENDO_HOSTS", "10.0.0.9 g2b309e01-lp1.srv.nintendo.net\n*.ndas.srv.nintendo.net\n", 1);
++    dm_nd_reload();
++
++    // 1. a mapped name: one address, the port the caller asked for, and the fields a game reads
++    void *res = NULL;
++    if (dm_nd_gai("g2b309e01-lp1.srv.nintendo.net", "443", NULL, &res) != 0 || !res) fail("a mapped name");
++    ai_view *ai = res;
++    if (ai->ai_family != 2) fail("family is AF_INET");
++    if (ai->ai_socktype != 1) fail("socktype defaults to stream");
++    if (ai->ai_addrlen != 16) fail("sockaddr_in is 16 bytes");
++    if (!ai->ai_addr || ai->ai_addr[0] != 16 || ai->ai_addr[1] != 2) fail("sockaddr length and family bytes");
++    if (((unsigned)ai->ai_addr[2] << 8 | ai->ai_addr[3]) != 443) fail("port, network byte order");
++    if (ai->ai_addr[4] != 10 || ai->ai_addr[5] != 0 || ai->ai_addr[6] != 0 || ai->ai_addr[7] != 9)
++        fail("the map's address");
++    if (ai->ai_next) fail("one address for one rule");
++    dm_nd_freeai(res);
++    res = NULL;
++
++    // 2. the wildcard, and the caller's own socktype
++    ai_view hints = {0};
++    hints.ai_socktype = 2;                       // SOCK_DGRAM
++    if (dm_nd_gai("aauth-lp1.ndas.srv.nintendo.net", "0", &hints, &res) != 0 || !res) fail("the wildcard");
++    ai = res;
++    if (ai->ai_socktype != 2 || ai->ai_protocol != 17) fail("a datagram hint comes back as datagram/IPPROTO_UDP");
++    dm_nd_freeai(res);
++    res = NULL;
++
++    // 3. a name nobody mapped goes to the real resolver: localhost is in every /etc/hosts
++    if (dm_nd_gai("localhost", "80", NULL, &res) != 0 || !res) fail("an unmapped name resolves for real");
++    ai = res;
++    if (ai->ai_addr[4] != 127 || ai->ai_addr[7] != 1) fail("localhost is 127.0.0.1");
++    dm_nd_freeai(res);
++    res = NULL;
++
++    // 4. a name that does not exist is EAI_NONAME, not a crash
++    if (dm_nd_gai("no-such-host.invalid", "80", NULL, &res) == 0) fail("a name that cannot resolve");
++
++    // 5. the switch off: EAI_FAIL and nothing handed back
++    unsetenv("DM_NEXTENDO");
++    dm_nd_reload();
++    res = (void *)0x1;
++    if (dm_nd_gai("g2b309e01-lp1.srv.nintendo.net", "443", NULL, &res) != 4) fail("EAI_FAIL with the switch off");
++    if (res) fail("nothing is handed back with the switch off");
++
++    dm_nd_freeai(NULL);                         // a no-op, as FreeAddrInfo(NULL) must be
++
++    puts("ok");
++    return 0;
++}

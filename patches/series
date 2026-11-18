@@ -59,3 +59,4 @@
 0061-build-seed-infer-and-self-heal-gl-and-vulkan-gfx.patch
 0062-host-the-nextendo-hostname-map-dm-nextendo.patch
 0063-host-real-tcp-sockets-behind-dm-nextendo.patch
+0064-host-getaddrinfo-through-the-nextendo-map.patch

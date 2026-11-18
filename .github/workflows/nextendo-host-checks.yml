@@ -37,12 +37,13 @@ jobs:
       - name: Build the two host tests (the game profile is Mario Kart 8 Deluxe)
         run: |
           make -C engine/dm/host/tests GAME=0100152000022000 -j3 \
-            build/t_nextendo_map build/t_net_tcp build/t_net_loopback \
+            build/t_nextendo_map build/t_nextendo_gai build/t_net_tcp build/t_net_loopback \
             2>&1 | tee host-tests-build.log
 
       - name: Run them
         run: |
           engine/dm/host/tests/build/t_nextendo_map
+          engine/dm/host/tests/build/t_nextendo_gai
           engine/dm/host/tests/build/t_net_tcp
           engine/dm/host/tests/build/t_net_loopback
 
