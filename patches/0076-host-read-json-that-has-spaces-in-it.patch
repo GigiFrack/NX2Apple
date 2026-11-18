@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:16:40 +0000
+Subject: [PATCH] host: read JSON that has spaces in it
+
+The chain stopped after two 200s: json_string looked for "key":" and the mock serialises with a
+space after the colon, so it found nothing. It now finds the quoted key, skips the whitespace
+around the colon, and only then expects the opening quote. The quotes matter: "device_auth_token"
+must not match inside "device_auth_tokens".
+
+Upstream-Status: fork-only
+Reason: a fix to the dauth client (0070): its JSON reader assumed no whitespace after the colon, which no serialiser promises; folded into that patch's PR
+Issue: none opened yet
+
+---
+ dm/host/hle_dauth.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_dauth.c b/dm/host/hle_dauth.c
+index 64d48e9..dbfbe6b 100644
+--- a/dm/host/hle_dauth.c
++++ b/dm/host/hle_dauth.c
+@@ -215,10 +215,16 @@ int dm_acc_nsa_token(char *buf, uint64_t *size) {
+ // The first string value of a key, unescaped only as far as tokens need (no \u sequences in them).
+ static int json_string(const char *json, const char *key, char *out, size_t cap) {
+     char pat[64];
+-    snprintf(pat, sizeof pat, "\"%s\":\"", key);
++    snprintf(pat, sizeof pat, "\"%s\"", key);          // the quotes keep "tokens" from matching "token"
+     const char *p = strstr(json, pat);
+     if (!p) return 0;
+     p += strlen(pat);
++    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
++    if (*p != ':') return 0;
++    p++;
++    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
++    if (*p != '"') return 0;
++    p++;
+     size_t i = 0;
+     while (*p && *p != '"' && i + 1 < cap) out[i++] = *p++;
+     out[i] = 0;

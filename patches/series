@@ -71,3 +71,4 @@
 0073-accounts-the-network-service-account-answers-wit.patch
 0074-host-the-dauth-client-says-where-it-stops-map-co.patch
 0075-host-the-dauth-client-prints-the-status-and-the.patch
+0076-host-read-json-that-has-spaces-in-it.patch
