@@ -67,6 +67,21 @@ def check_state(got: str | None, expect: str) -> None:
 DEFAULT_AUTHORIZE_URL = 'https://nextendo.network/api/oauth/authorize'
 DEFAULT_TOKEN_URL = 'https://nextendo.network/api/oauth/token'
 
+#: The game token: the OAuth access token buys it, and a game's login carries it inside the BAAS
+#: id_token's `nnex` claim. Needs the `game.matchmaking` scope, which is why the sign-in asks for it.
+DEFAULT_NEX_TOKEN_URL = 'https://nextendo.network/api/nex-token'
+
+#: Every call this client makes carries it. Cloudflare fronts nextendo.network and answers the stock
+#: `Python-urllib/3.x` signature with "Error 1010: Access denied" — a 403 that looks like a refused
+#: token and is not.
+USER_AGENT = 'NX2Apple/1.5 (Nextendo client)'
+
+
+def _cf_blocked(body: str) -> bool:
+    """Whether a refusal is Cloudflare's bot filter rather than Nextendo answering."""
+    low = body.lower()
+    return 'cloudflare' in low or 'error 1010' in low
+
 #: The redirect port. A *registered* client's redirect URI is compared as a string
 #: (`nextendo-account/oauth.go:299`), unlike the built-in emulator client, which may use any
 #: loopback port: so this number must be the one typed on nextendo.network/developers.
@@ -78,12 +93,14 @@ class Config:
     authorize_url: str
     token_url: str
     client_id: str
-    scope: str = 'openid profile'
+    #: `game.matchmaking` is what `/api/nex-token` requires; without it the game token is refused.
+    scope: str = 'identity friends game.matchmaking'
     redirect_port: int = DEFAULT_REDIRECT_PORT
     #: Only for a registered (confidential) app: Nextendo's registration always issues a secret
     #: (`oauth.go:522-542`). A secret inside an app can be read out of it, so the right fix is a
     #: public client; until then the file holding it stays on the player's machine, mode 0600.
     client_secret: str | None = None
+    nex_token_url: str = DEFAULT_NEX_TOKEN_URL
 
     @property
     def redirect_uri(self) -> str:
@@ -117,7 +134,8 @@ class Config:
                    str(d['client_id']),
                    str(d.get('scope') or cls.scope),
                    port,
-                   str(d['client_secret']) if d.get('client_secret') else None)
+                   str(d['client_secret']) if d.get('client_secret') else None,
+                   str(d.get('nex_token_url') or DEFAULT_NEX_TOKEN_URL))
 
 
 # ---------------------------------------------------------------- loopback redirect
@@ -230,12 +248,17 @@ def exchange_code(cfg: Config, code: str, verifier: str, redirect_uri: str) -> d
         form['client_secret'] = cfg.client_secret
     req = urllib.request.Request(cfg.token_url, data=urllib.parse.urlencode(form).encode('ascii'),
                                  headers={'Content-Type': 'application/x-www-form-urlencoded',
-                                          'Accept': 'application/json'})
+                                          'Accept': 'application/json',
+                                          'User-Agent': USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             body = r.read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode('utf-8', 'replace')[:300]
+        if _cf_blocked(detail):
+            raise AuthError(
+                'Cloudflare refused the request (Error 1010), so it never reached Nextendo: the '
+                'client must send its own User-Agent instead of the stock urllib one') from e
         if 'invalid_client' in detail:
             # The app was registered as confidential (`oauth.go:386-392`: a non-empty SecretHash
             # makes the secret mandatory), while a desktop app should be the public/PKCE kind.
@@ -294,6 +317,60 @@ def read_token_file(path: str | Path) -> dict | None:
         return json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def fetch_nex_token(cfg: Config, token: dict) -> dict:
+    """Trade the OAuth access token for a game token (`GET /api/nex-token`).
+
+    The answer is ``{"nex_token", "pid", "friend_code", "username", "expires_in"}``; only
+    ``nex_token`` and ``pid`` matter to the game, the rest is for a label. It lasts 24 hours.
+    """
+    access = token.get('access_token')
+    if not access:
+        raise AuthError('not signed in: there is no access token to trade for a game token')
+    req = urllib.request.Request(cfg.nex_token_url, headers={
+        'Authorization': f'Bearer {access}',
+        'X-Nextendo-Client-Id': cfg.client_id,
+        'Accept': 'application/json',
+        'User-Agent': USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8', 'replace')[:300]
+        if _cf_blocked(detail):
+            raise AuthError('Cloudflare refused the game token request (Error 1010)') from e
+        if e.code == 403:
+            # The scope: Nextendo only hands a game token to an app the player let into games.
+            raise AuthError(
+                "Nextendo refused the game token: this application was not granted the "
+                "'game.matchmaking' scope. Sign in again and approve it") from e
+        if e.code == 401:
+            raise AuthError('the Nextendo session expired: sign in again') from e
+        raise AuthError(f'Nextendo refused the game token (HTTP {e.code}): {detail}') from e
+    except OSError as e:
+        raise AuthError(f'could not reach Nextendo for the game token: {e}') from e
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise AuthError('Nextendo answered with something that is not JSON') from e
+    if not data.get('nex_token'):
+        raise AuthError('Nextendo answered without a game token')
+    data.setdefault('obtained_at', int(time.time()))
+    return data
+
+
+def nex_env(nex: dict) -> dict[str, str]:
+    """The two values a game needs, as the environment of the shell on the phone.
+
+    `DM_NEXTENDO_NEX_TOKEN` is a secret: it opens the game servers as this account for a day.
+    It belongs in the app's own `Documents/env.txt`, never in this repository.
+    """
+    token, pid = nex.get('nex_token'), nex.get('pid')
+    if not token or not pid:
+        raise AuthError('the game token answer is missing nex_token or pid')
+    return {'DM_NEXTENDO_NEX_TOKEN': str(token), 'DM_NEXTENDO_PID': str(pid)}
 
 
 def nextendo_env(token_file: str | Path | None) -> dict[str, str]:

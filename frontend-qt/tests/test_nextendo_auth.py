@@ -45,10 +45,12 @@ class TokenServer:
         outer = self
         self.body = TOKEN if body is None else body
         self.form: dict[str, list[str]] = {}
+        self.headers_seen: dict[str, str] = {}
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):                                     # noqa: N802 - stdlib API
                 n = int(self.headers.get('Content-Length') or 0)
+                outer.headers_seen = {k.lower(): v for k, v in self.headers.items()}
                 outer.form = urllib.parse.parse_qs(self.rfile.read(n).decode('ascii'))
                 payload = json.dumps(outer.body).encode('utf-8')
                 self.send_response(200)
@@ -312,6 +314,15 @@ class RegisteredClientTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_the_exchange_sends_a_user_agent_of_its_own(self):
+        tokens = TokenServer()
+        try:
+            cfg = na.Config('https://x/a', tokens.url, 'nxc_1')
+            na.exchange_code(cfg, 'CODE', 'verifier', cfg.redirect_uri)
+            self.assertEqual(tokens.headers_seen.get('user-agent'), na.USER_AGENT)
+        finally:
+            tokens.close()
+
     def test_a_public_client_sends_no_secret(self):
         tokens = TokenServer()
         try:
@@ -320,6 +331,118 @@ class RegisteredClientTests(unittest.TestCase):
             self.assertNotIn('client_secret', tokens.form)
         finally:
             tokens.close()
+
+
+class GameTokenServer:
+    """A stand-in for `/api/nex-token`: answers the shape and records what was asked."""
+
+    def __init__(self, code: int = 200, body: dict | None = None):
+        outer = self
+        self.code = code
+        self.headers_seen: dict[str, str] = {}
+        self.body = {'nex_token': 'nx2.abc.def', 'pid': 1234567890, 'friend_code': 'SW-1234',
+                     'username': 'Mattia', 'expires_in': 86400} if body is None else body
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):                                      # noqa: N802 - stdlib API
+                outer.headers_seen = {k.lower(): v for k, v in self.headers.items()}
+                payload = json.dumps(outer.body).encode('utf-8')
+                self.send_response(outer.code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format, *args):                   # noqa: A002 - stdlib API
+                pass
+
+        self.srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self.srv.server_address[1]}/api/nex-token'
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class GameTokenTests(unittest.TestCase):
+    """The game token: what the sign-in must ask for, and what the phone is handed."""
+
+    def test_the_sign_in_asks_for_the_matchmaking_scope(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'nextendo-app.json'
+            p.write_text(json.dumps({'client_id': 'nxc_1'}), encoding='utf-8')
+            self.assertIn('game.matchmaking', na.Config.load(p).scope)
+
+    def test_the_game_token_carries_the_bearer_and_the_client_id(self):
+        srv = GameTokenServer()
+        try:
+            cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', nex_token_url=srv.url)
+            got = na.fetch_nex_token(cfg, {'access_token': 'at-123'})
+            self.assertEqual(got['nex_token'], 'nx2.abc.def')
+            self.assertEqual(srv.headers_seen.get('authorization'), 'Bearer at-123')
+            self.assertEqual(srv.headers_seen.get('x-nextendo-client-id'), 'nxc_1')
+        finally:
+            srv.close()
+
+    def test_a_refused_scope_is_named(self):
+        srv = GameTokenServer(code=403, body={'error': 'insufficient_scope'})
+        try:
+            cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', nex_token_url=srv.url)
+            with self.assertRaises(na.AuthError) as cm:
+                na.fetch_nex_token(cfg, {'access_token': 'at-123'})
+            self.assertIn('game.matchmaking', str(cm.exception))
+        finally:
+            srv.close()
+
+    def test_an_expired_session_says_sign_in_again(self):
+        srv = GameTokenServer(code=401, body={'error': 'invalid_token'})
+        try:
+            cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', nex_token_url=srv.url)
+            with self.assertRaises(na.AuthError) as cm:
+                na.fetch_nex_token(cfg, {'access_token': 'stale'})
+            self.assertIn('sign in again', str(cm.exception))
+        finally:
+            srv.close()
+
+    def test_the_game_token_request_names_this_client(self):
+        srv = GameTokenServer()
+        try:
+            cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', nex_token_url=srv.url)
+            na.fetch_nex_token(cfg, {'access_token': 'at-123'})
+            self.assertEqual(srv.headers_seen.get('user-agent'), na.USER_AGENT)
+            self.assertNotIn('python-urllib', srv.headers_seen.get('user-agent', '').lower())
+        finally:
+            srv.close()
+
+    def test_cloudflare_is_not_reported_as_a_missing_scope(self):
+        # Cloudflare's Error 1010 body: a 403 that has nothing to do with the scope.
+        srv = GameTokenServer(code=403, body={'title': 'Error 1010: Access denied',
+                                              'detail': 'The site owner has blocked your request',
+                                              'type': 'https://developers.cloudflare.com/error-1010/'})
+        try:
+            cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1', nex_token_url=srv.url)
+            with self.assertRaises(na.AuthError) as cm:
+                na.fetch_nex_token(cfg, {'access_token': 'at-123'})
+            msg = str(cm.exception)
+            self.assertIn('Cloudflare', msg)
+            self.assertNotIn('game.matchmaking', msg)
+        finally:
+            srv.close()
+
+    def test_signing_out_has_nothing_to_trade(self):
+        cfg = na.Config('https://x/a', 'https://x/t', 'nxc_1')
+        with self.assertRaises(na.AuthError):
+            na.fetch_nex_token(cfg, {})
+
+    def test_the_phone_gets_the_two_values_and_nothing_else(self):
+        env = na.nex_env({'nex_token': 'nx2.abc.def', 'pid': 42, 'username': 'Mattia'})
+        self.assertEqual(env, {'DM_NEXTENDO_NEX_TOKEN': 'nx2.abc.def', 'DM_NEXTENDO_PID': '42'})
+
+    def test_an_answer_without_a_token_is_refused_before_it_reaches_the_phone(self):
+        with self.assertRaises(na.AuthError):
+            na.nex_env({'pid': 42})
 
 
 if __name__ == '__main__':
