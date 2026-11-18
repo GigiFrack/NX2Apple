@@ -2,6 +2,9 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hermes <hermes@local>
 Date: Wed, 18 Nov 2026 01:20:03 +0000
 Subject: [PATCH] host: real TCP sockets behind DM_NEXTENDO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 The offline BSD service is a self-contained datagram transport: nothing leaves the process,
 every address is 127.x, and the receive queue is memory. nextendo-nex speaks PRUDP over TCP
@@ -20,12 +23,13 @@ each way, checks GetPeerName, and checks that the switch-off answer is still ENE
 Upstream-Status: fork-only
 Reason: upstream keeps every online service cut (hle_offline.c) so there is no stream socket to speak PRUDP over; the fork needs one for Nextendo and keeps it behind DM_NEXTENDO
 Issue: none opened yet — notes/nextendo-spike.md carries the plan and the open question for Nextendo
-
 ---
- dm/host/hle_net.c         | 357 +++++++++++++++++++++++++++++++++++++-
- dm/host/tests/Makefile    |   3 +
- dm/host/tests/t_net_tcp.c | 103 +++++++++++
- 3 files changed, 460 insertions(+), 3 deletions(-)
+ dm/host/hle_net.c              | 357 ++++++++++++++++++++++++++++++++-
+ dm/host/tests/Makefile         |   3 +
+ dm/host/tests/t_net_eventfd.c  |   1 +
+ dm/host/tests/t_net_loopback.c |   1 +
+ dm/host/tests/t_net_tcp.c      | 103 ++++++++++
+ 5 files changed, 462 insertions(+), 3 deletions(-)
  create mode 100644 dm/host/tests/t_net_tcp.c
 
 diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
@@ -510,6 +514,28 @@ index 8fa1a41..5915bbc 100644
  # The Nextendo hostname map is plain C with no game profile: this test builds without GAME.
  $(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
  	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
+diff --git a/dm/host/tests/t_net_eventfd.c b/dm/host/tests/t_net_eventfd.c
+index f0ba531..eaef6a1 100644
+--- a/dm/host/tests/t_net_eventfd.c
++++ b/dm/host/tests/t_net_eventfd.c
+@@ -1,5 +1,6 @@
+ // nn::socket::EventFd offline (hle_net.c): the local descriptor gRPC needs to wake its poll engine. Remote networking stays unavailable.
+ #include "../hle_net.c"
++#include "../hle_nextendo.c"   // the TCP path asks it whether Nextendo is on
+ __thread _Atomic int dm_host_work;
+ #include <assert.h>
+ #include <stdio.h>
+diff --git a/dm/host/tests/t_net_loopback.c b/dm/host/tests/t_net_loopback.c
+index f3f8e86..16c512c 100644
+--- a/dm/host/tests/t_net_loopback.c
++++ b/dm/host/tests/t_net_loopback.c
+@@ -1,5 +1,6 @@
+ // Offline UDP startup self-test and datagram semantics, without opening any host socket.
+ #include "../hle_net.c"
++#include "../hle_nextendo.c"   // the TCP path asks it whether Nextendo is on
+ __thread _Atomic int dm_host_work;
+ #include <assert.h>
+ #include <stdio.h>
 diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
 new file mode 100644
 index 0000000..1a7a904
