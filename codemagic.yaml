@@ -1,0 +1,30 @@
+# Codemagic: build the unsigned DmShell.app template the Windows launcher needs.
+#
+# The launcher does not compile the iOS shell: it injects each game's framework into a pre-built DmShell.app
+# (tools/build_shell_template.py says why). A template built before the engine cannot read what the engine
+# writes — an image carrying the DMMSLTR1 trailer is then rejected as another game's data. This workflow
+# builds a current template on a macOS machine and publishes it as an artifact.
+workflows:
+  shell-template:
+    name: DmShell template
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+      vars:
+        PYTHONWARNINGS: ignore
+    scripts:
+      - name: Engine (upstream at the pin, plus this branch's patches)
+        script: python3 tools/engine.py sync
+      - name: xcodegen (the template's project is generated with it)
+        script: brew install xcodegen
+      - name: Build the unsigned DmShell.app template
+        script: python3 tools/build_shell_template.py --engine engine --out out/DmShell.app
+      - name: Show what came out
+        script: |
+          ls -la out/DmShell.app
+          /usr/libexec/PlistBuddy -c 'Print :DMCommit' out/DmShell.app/Info.plist || true
+      - name: Zip it
+        script: cd out && ditto -c -k --sequesterRsrc --keepParent DmShell.app DmShell.app.zip && ls -lh DmShell.app.zip
+    artifacts:
+      - out/DmShell.app.zip
