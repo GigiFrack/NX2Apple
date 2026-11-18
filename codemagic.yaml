@@ -18,8 +18,19 @@ workflows:
         script: python3 tools/engine.py sync
       - name: xcodegen (the template's project is generated with it)
         script: brew install xcodegen
+      - name: The toolchain, on the record
+        script: |
+          xcodebuild -version
+          xcodebuild -showsdks | tail -20
+          swift --version || true
+
+      # Tee'd into a file that is published as an artifact: when xcodebuild fails, its message is the only
+      # thing worth having, and Codemagic does not hand step logs out over the API.
       - name: Build the unsigned DmShell.app template
-        script: python3 tools/build_shell_template.py --engine engine --out out/DmShell.app
+        script: |
+          set -o pipefail
+          mkdir -p out
+          python3 tools/build_shell_template.py --engine engine --out out/DmShell.app 2>&1 | tee out/template-build.log
       - name: Show what came out
         script: |
           ls -la out/DmShell.app
@@ -28,3 +39,4 @@ workflows:
         script: cd out && ditto -c -k --sequesterRsrc --keepParent DmShell.app DmShell.app.zip && ls -lh DmShell.app.zip
     artifacts:
       - out/DmShell.app.zip
+      - out/template-build.log
