@@ -18,19 +18,25 @@ workflows:
         script: python3 tools/engine.py sync
       - name: xcodegen (the template's project is generated with it)
         script: brew install xcodegen
-      - name: The toolchain, on the record
-        script: |
-          xcodebuild -version
-          xcodebuild -showsdks | tail -20
-          swift --version || true
-
-      # Tee'd into a file that is published as an artifact: when xcodebuild fails, its message is the only
-      # thing worth having, and Codemagic does not hand step logs out over the API.
+      # Tee'd into a file published as an artifact: when xcodebuild fails, its message is the only thing
+      # worth having, and Codemagic does not hand step logs out over the API. The shell uses iOS 27 APIs
+      # (UIHingeInteraction, reservedRegions), so the newest Xcode installed is selected before building:
+      # an older SDK fails with "cannot find ... in scope" rather than saying the SDK is too old.
       - name: Build the unsigned DmShell.app template
         script: |
           set -o pipefail
           mkdir -p out
-          python3 tools/build_shell_template.py --engine engine --out out/DmShell.app 2>&1 | tee out/template-build.log
+          {
+            echo "== installed Xcodes =="
+            ls -d /Applications/Xcode*.app 2>/dev/null
+            xcodebuild -version
+            echo "== SDKs =="
+            xcodebuild -showsdks || true
+          } | tee out/template-build.log
+          best=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$best" ]; then sudo xcode-select -s "$best"; xcode-select -p; fi
+          xcodebuild -version | tee -a out/template-build.log
+          python3 tools/build_shell_template.py --engine engine --out out/DmShell.app 2>&1 | tee -a out/template-build.log
       - name: Show what came out
         script: |
           ls -la out/DmShell.app
