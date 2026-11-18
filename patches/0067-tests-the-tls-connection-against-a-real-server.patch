@@ -1,0 +1,147 @@
+From e1e78aa3c9f98a3e78597774918496c696371efe Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 05:39:03 +0000
+Subject: [PATCH] tests: the TLS connection, against a real server
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+t_ssl_local builds a context and a connection the way a game does, handshakes over a socket the
+service created, and carries one message each way — against a Python TLS listener with a
+throwaway certificate, started by the fork's macOS workflow (DM_TEST_TLS_PORT). Verification is
+off, which is Horizon's VerifyOption 0 and the path iOS spells kSSLSessionOptionBreakOnServerAuth.
+
+It is not part of the make run target: without a server on that port there is nothing to talk
+to, so the workflow runs it on its own.
+Upstream-Status: fork-only
+Reason: the TLS patch (0066) has nothing to prove it without a server; this test speaks to one the workflow starts, and upstream has no TLS path to test
+Issue: none opened yet — notes/nextendo-spike.md carries the plan and the open question for Nextendo
+
+---
+ dm/host/tests/Makefile      |  3 ++
+ dm/host/tests/t_ssl_local.c | 99 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 102 insertions(+)
+ create mode 100644 dm/host/tests/t_ssl_local.c
+
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index ed6af8e..f284c4b 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -240,6 +240,9 @@ $(B)/t_net_tcp: t_net_tcp.c ../hle_net.c ../hle_net.h ../hle_nextendo.c ../hle_n
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_tcp.c
+ $(B)/t_net_udp_remote: t_net_udp_remote.c ../hle_net.c ../hle_net.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_udp_remote.c
++# The TLS test speaks to a server the caller starts (DM_TEST_TLS_PORT), so it is not in `run`.
++$(B)/t_ssl_local: t_ssl_local.c ../hle_net.c ../hle_ssl.c ../hle_ssl.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ssl_local.c -framework Security
+ # The Nextendo hostname map and resolver are plain C with no game profile: these tests build without GAME.
+ $(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
+diff --git a/dm/host/tests/t_ssl_local.c b/dm/host/tests/t_ssl_local.c
+new file mode 100644
+index 0000000..a61c55d
+--- /dev/null
++++ b/dm/host/tests/t_ssl_local.c
+@@ -0,0 +1,99 @@
++// The TLS connection, end to end, against a real server: a context and a connection built the way a
++// game builds them, a handshake over a socket the service created, and one message each way.
++//
++// The server is the workflow's: a Python TLS listener on 127.0.0.1:$DM_TEST_TLS_PORT with a
++// throwaway certificate. Verification is off for that reason (Horizon's VerifyOption 0), which is
++// also the path that has to work on iOS, where the option is kSSLSessionOptionBreakOnServerAuth.
++#include "../hle_net.c"
++#include "../hle_ssl.c"
++#include "../hle_nextendo.c"
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++// The object map hle_ssl.c hangs its state off: the host has a real one, this test a table.
++#define TEST_OBJ_MAX 8
++static struct { const void *guest; void *host; } g_obj[TEST_OBJ_MAX];
++
++void *objmap_get(const void *guest) {
++    for (int i = 0; i < TEST_OBJ_MAX; i++) if (g_obj[i].guest == guest) return g_obj[i].host;
++    return NULL;
++}
++void objmap_put(const void *guest, void *host) {
++    for (int i = 0; i < TEST_OBJ_MAX; i++) if (!g_obj[i].guest || g_obj[i].guest == guest) {
++        g_obj[i].guest = guest; g_obj[i].host = host; return;
++    }
++    fprintf(stderr, "objmap full\n"); exit(1);
++}
++void *objmap_del(const void *guest) {
++    for (int i = 0; i < TEST_OBJ_MAX; i++) if (g_obj[i].guest == guest) {
++        void *h = g_obj[i].host; g_obj[i].guest = NULL; g_obj[i].host = NULL; return h;
++    }
++    return NULL;
++}
++
++__thread _Atomic int dm_host_work;
++
++void dm_guest_sleep_ns(int64_t ns) {
++    struct timespec ts = {ns / 1000000000, ns % 1000000000};
++    nanosleep(&ts, NULL);
++}
++void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns) {
++    struct timespec now, abs;
++    clock_gettime(CLOCK_REALTIME, &now);
++    abs.tv_sec = now.tv_sec + ns / 1000000000;
++    abs.tv_nsec = now.tv_nsec + ns % 1000000000;
++    if (abs.tv_nsec >= 1000000000) { abs.tv_sec++; abs.tv_nsec -= 1000000000; }
++    pthread_cond_timedwait(c, m, &abs);
++}
++uint64_t guest_ns(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
++}
++int dm_detclock_enabled(void) { return 0; }
++
++uint8_t *dm_guest_base(void) { return NULL; }   // only die() would want it
++
++static void fail(const char *what) {
++    fprintf(stderr, "not true: %s (ssl last error %d, socket errno %d)\n", what, 0, dm_sk_errno());
++    exit(1);
++}
++
++// The game allocates these; the host only ever writes its own state beside them.
++static struct { uint64_t words[8]; } ctx_obj, conn_obj;
++
++int main(void) {
++    const char *port_env = getenv("DM_TEST_TLS_PORT");
++    if (!port_env) { fprintf(stderr, "DM_TEST_TLS_PORT is not set\n"); return 1; }
++    unsigned port = (unsigned)atoi(port_env);
++
++    setenv("DM_NEXTENDO", "1", 1);
++    dm_nd_reload();
++
++    int fd = dm_sk_socket(2, 1, 0);                       // AF_INET, SOCK_STREAM
++    if (fd < 0) fail("a stream socket");
++    uint8_t sa[16] = {16, 2, (uint8_t)(port >> 8), (uint8_t)port, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++    if (dm_sk_connect(fd, sa, sizeof sa)) fail("connect");
++
++    dm_ssl_context_create(&ctx_obj);
++    dm_ssl_connection_create(&conn_obj, &ctx_obj);
++    if (dm_ssl_set_socket(&conn_obj, fd)) fail("SetSocketDescriptor");
++    if (dm_ssl_set_host(&conn_obj, "localhost", 9)) fail("SetHostName");
++    if (dm_ssl_set_verify(&conn_obj, 0)) fail("SetVerifyOption");
++    if (dm_ssl_handshake_call(&conn_obj) != 0) fail("DoHandshake");
++
++    if (dm_ssl_write_call(&conn_obj, "ping", 4) != 4) fail("Write");
++    char out[16] = {0};
++    int n = dm_ssl_read_call(&conn_obj, out, sizeof out);
++    if (n != 4 || memcmp(out, "ping", 4)) fail("the echo over TLS");
++
++    dm_ssl_connection_destroy(&conn_obj);
++    dm_ssl_context_destroy(&ctx_obj);
++    dm_sk_close(fd);
++
++    puts("ok");
++    return 0;
++}
+-- 
+2.47.3
+

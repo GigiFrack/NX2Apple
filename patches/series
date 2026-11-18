@@ -62,3 +62,4 @@
 0064-host-getaddrinfo-through-the-nextendo-map.patch
 0065-host-udp-that-leaves-the-process-dm-nextendo.patch
 0066-host-nn-ssl-over-securetransport-on-the-game-s-o.patch
+0067-tests-the-tls-connection-against-a-real-server.patch

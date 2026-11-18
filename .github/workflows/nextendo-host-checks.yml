@@ -37,7 +37,8 @@ jobs:
       - name: Build the two host tests (the game profile is Mario Kart 8 Deluxe)
         run: |
           make -C engine/dm/host/tests GAME=0100152000022000 -j3 \
-            build/t_nextendo_map build/t_nextendo_gai build/t_net_tcp build/t_net_udp_remote build/t_net_loopback \
+            build/t_nextendo_map build/t_nextendo_gai build/t_net_tcp build/t_net_udp_remote build/t_ssl_local \
+            build/t_net_loopback \
             2>&1 | tee host-tests-build.log
 
       - name: Run them
@@ -47,6 +48,27 @@ jobs:
           engine/dm/host/tests/build/t_net_tcp
           engine/dm/host/tests/build/t_net_udp_remote
           engine/dm/host/tests/build/t_net_loopback
+
+      - name: The TLS connection, against a real server
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+            -keyout /tmp/key.pem -out /tmp/cert.pem 2>/dev/null
+          cat > /tmp/tls_echo.py <<'PY'
+          import socket, ssl, sys
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain(sys.argv[2], sys.argv[3])
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('127.0.0.1', int(sys.argv[1])))
+          s.listen(1)
+          c, _ = s.accept()
+          with ctx.wrap_socket(c, server_side=True) as t:
+              data = t.recv(64)
+              t.sendall(data)
+          PY
+          python3 /tmp/tls_echo.py 8443 /tmp/cert.pem /tmp/key.pem &
+          for i in $(seq 1 50); do nc -z 127.0.0.1 8443 2>/dev/null && break; sleep 0.2; done
+          DM_TEST_TLS_PORT=8443 engine/dm/host/tests/build/t_ssl_local
 
       - name: The iOS host still compiles for the iPhone SDK
         run: |
