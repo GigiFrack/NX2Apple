@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 22:12:12 +0000
+Subject: [PATCH] accounts: with a game token the online identity is ready
+ without walking the dauth chain
+
+Upstream-Status: fork-only
+Reason: The three calls a game makes to ask "is a network service account ready?" answered from the dauth chain, which
+ needs a dauth server it can reach; with a Nextendo game token in the environment the identity is already known and
+ nothing has to be walked. Without this the game aborted itself with nn::diag Result 0x2a2 (a generic failure) about
+ forty seconds in, before it resolved a single hostname. Only when DM_NEXTENDO_NEX_TOKEN is set; otherwise the chain's
+ answers are unchanged.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_account.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_account.c b/dm/host/hle_account.c
+index 0adbd35..65f58e3 100644
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -60,9 +60,18 @@ HLE_FORCE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", "user nickna
+ }
+ 
+ // ---------- Online accounts: cut ----------
+-HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", "network service account: with Nextendo on, the dauth chain answers (DM_NEXTENDO=1); cut otherwise", Result, h_acc_EnsureNsa, const UserHandle *h) {
++// With a Nextendo game token in the environment the identity is already known (the token proves the
++// pid and the id_token carries it), so no chain has to be walked: asking the dauth server here is what
++// made the game abort with 0x2a2 before it ever resolved a name.
++static int nd_has_token(void) {
++    const char *t = getenv("DM_NEXTENDO_NEX_TOKEN");
++    return dm_nd_enabled() && t && *t;
++}
++
++HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", "network service account: the game token's identity when one is set, else the dauth chain (DM_NEXTENDO=1); cut otherwise", Result, h_acc_EnsureNsa, const UserHandle *h) {
+     (void)h;
+     if (!dm_nd_enabled()) return RES_FAIL;
++    if (nd_has_token()) return RES_OK;
+     return dm_acc_nsa_ensure() ? RES_FAIL : RES_OK;
+ }
+ // The account id a game shows the network as. With a Nextendo game token in the environment it must be
+@@ -103,6 +112,7 @@ HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10Us
+ HLE_FORCE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE", "the online membership notice: nothing to show when the account is the network one", Result, h_acc_ShowLic, const UserHandle *h) {
+     (void)h;
+     if (!dm_nd_enabled()) return RES_FAIL;
++    if (nd_has_token()) return RES_OK;
+     return dm_acc_nsa_available() ? RES_OK : RES_FAIL;
+ }
+ // The Nintendo Account's cached profile (birthday, country): no Nintendo Account is linked on the host, so loading fails and the game skips its getters (Big Brain Academy: Brain vs. Brain, main+0xab8bc)
+@@ -186,7 +196,7 @@ HLE_FORCE("_ZN2nn7account27StoreSaveDataThumbnailImageERKNS0_3UidEPKvm", "save-d
+ HLE_FORCE("_ZN2nn7account28DeleteSaveDataThumbnailImageERKNS0_3UidE", "save-data thumbnail; the host keeps none", Result, h_acc_DeleteThumb, const Uid *uid) { (void)uid; return RES_OK; }
+ HLE_FORCE("_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", "whether the account can go online (DM_NEXTENDO=1); false otherwise", Result, h_acc_NsaAvail, uint8_t *out, const UserHandle *h) {
+     (void)h;
+-    *out = dm_nd_enabled() && dm_acc_nsa_available();
++    *out = nd_has_token() || (dm_nd_enabled() && dm_acc_nsa_available());
+     return RES_OK;
+ }
+ HLE_FORCE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", "close user; the handle holds no session", void, h_acc_CloseUser, const UserHandle *h) { (void)h; }
