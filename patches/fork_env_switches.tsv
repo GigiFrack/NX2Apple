@@ -46,3 +46,8 @@ DM_NEXTENDO	switch	`1` turns the Nextendo Network seams on: the hostname map, an
 DM_NEXTENDO_HOSTS	path	`<ip> <hostname>` one per line, `*.suffix` cases included: the names the game resolves to the Nextendo servers. `#` starts a comment. Only read with `DM_NEXTENDO=1`
 DM_NEXTENDO_HOSTS_FILE	path	`=<path>` reads the map from a file instead of `DM_NEXTENDO_HOSTS` (the launcher's per-game copy)
 DM_TEST_TLS_PORT	test	`=<port>` (host tests) the local TLS server the test `t_ssl_local` speaks to; only that test reads it, and the fork's macOS workflow starts the server
+DM_NEXTENDO_DOMAIN	path	`=<domain>` the domain the dauth and aauth hosts hang off (`dauth.<domain>`, `aauth.<domain>`); nothing about a particular service is compiled in
+DM_NEXTENDO_DEVICE_ID	path	`=<id>` the client id the device tokens are asked for; a stable value per install, so the servers see one device
+DM_NEXTENDO_HTTPS_PORT	path	`=<port>` (default 443) where the dauth chain is reached; a local shim of the stack listens elsewhere
+DM_NEXTENDO_TLS_INSECURE	switch	`1` accepts a certificate the system does not trust — only for the mock server the tests start, never for a real deployment
+DM_TEST_DAUTH_PORT	test	`=<port>` (host tests) the mock dauth chain `t_dauth_local` speaks to; only that test reads it

@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 18 Nov 2026 06:00:49 +0000
+Subject: [PATCH] host: the dauth chain, as a host module
+
+On a console the game asks the dauth system module for a token and the module does the HTTP. There
+is no system module here, so this speaks the chain itself: challenge, device tokens, edge tokens,
+application auth token - the four calls nx-dauth serves, in that order, over the same SecureTransport
+the game's own connections use.
+
+The domain, the device id, the port and the certificate policy are environment, not constants: no
+hostname of a particular service is compiled in, and TLS_INSECURE exists only so the test can talk
+to a mock with a throwaway certificate. The JWTs the servers sign are not verified here - dcert and
+acert publish those keys, and the game is the party that checks them.
+
+t_dauth_local runs the whole chain against a mock the workflow starts and asserts the token comes
+back, then that the switch off refuses.
+
+Upstream-Status: fork-only
+Reason: upstream has no network account at all; this is the client side of the dauth chain (challenge, device/edge tokens, application auth token) that any online path needs, kept behind DM_NEXTENDO
+Issue: none opened yet — notes/nextendo-spike.md has the chain and the open questions
+
+---
+ dm/host/hle_dauth.c           | 213 ++++++++++++++++++++++++++++++++++
+ dm/host/hle_dauth.h           |   8 ++
+ dm/host/tests/Makefile        |   5 +-
+ dm/host/tests/t_dauth_local.c |  37 ++++++
+ 4 files changed, 262 insertions(+), 1 deletion(-)
+ create mode 100644 dm/host/hle_dauth.c
+ create mode 100644 dm/host/hle_dauth.h
+ create mode 100644 dm/host/tests/t_dauth_local.c
+
+diff --git a/dm/host/hle_dauth.c b/dm/host/hle_dauth.c
+new file mode 100644
+index 0000000..ad15896
+--- /dev/null
++++ b/dm/host/hle_dauth.c
+@@ -0,0 +1,213 @@
++// The device/application authentication chain, as a host module.
++//
++// On a console the game asks the dauth system module for a token and the module speaks HTTP to five
++// hosts. There is no system module here, so this is the piece that does the speaking: challenge,
++// device tokens, edge tokens, application auth token — the same four calls nx-dauth serves, in the
++// same order, over the TLS stack hle_ssl.c already uses.
++//
++// What it does not do: verify the JWTs the servers sign (dcert/acert publish the keys for that, and
++// the game is the party that checks them), and the dragons/licence calls that follow aauth.
++//
++// Everything needs DM_NEXTENDO=1, and the domain comes from DM_NEXTENDO_DOMAIN so no hostname of a
++// particular service is baked into the source.
++#include "hle.h"
++#include "hle_dauth.h"
++#include "hle_nextendo.h"
++
++#include <Security/SecureTransport.h>
++#include <Security/Security.h>
++#include <netdb.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++#define DCHAUTH_MAX_BODY 65536
++
++static int dauth_connect(const char *host, int port) {
++    // The map the games resolve through first: with Nextendo on, dauth.<domain> is a rule there.
++    struct sockaddr_in sa;
++    memset(&sa, 0, sizeof sa);
++    sa.sin_family = AF_INET;
++    sa.sin_port = htons((uint16_t)port);
++    uint32_t addrs[4];
++    if (dm_nd_lookup(host, addrs, 4) > 0) {
++        sa.sin_addr.s_addr = htonl(addrs[0]);      // the map keeps addresses in host order
++    } else {
++        struct addrinfo hints, *res = NULL;
++        memset(&hints, 0, sizeof hints);
++        hints.ai_family = AF_INET;
++        hints.ai_socktype = SOCK_STREAM;
++        char p[8];
++        snprintf(p, sizeof p, "%d", port);
++        if (getaddrinfo(host, p, &hints, &res) != 0 || !res) return -1;
++        memcpy(&sa, res->ai_addr, sizeof sa);
++        freeaddrinfo(res);
++    }
++    int fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (fd < 0) return -1;
++    struct timeval tv = {10, 0};
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
++    if (connect(fd, (struct sockaddr *)&sa, sizeof sa)) {
++        close(fd);
++        return -1;
++    }
++    return fd;
++}
++
++typedef struct { int fd; } http_conn;
++
++static OSStatus http_read(SSLConnectionRef ref, void *data, size_t *len) {
++    http_conn *c = (http_conn *)ref;
++    ssize_t r = recv(c->fd, data, *len, 0);
++    if (r <= 0) { *len = 0; return r == 0 ? errSSLClosedGraceful : errSSLClosedAbort; }
++    *len = (size_t)r;
++    return noErr;
++}
++
++static OSStatus http_write(SSLConnectionRef ref, const void *data, size_t *len) {
++    http_conn *c = (http_conn *)ref;
++    ssize_t r = send(c->fd, data, *len, 0);
++    if (r < 0) { *len = 0; return errSSLClosedAbort; }
++    *len = (size_t)r;
++    return noErr;
++}
++
++// One request, one connection, Connection: close. Returns the HTTP status, or -1.
++static int http_call(const char *host, int port, const char *method, const char *path,
++                     const char *ctype, const char *body, char *out, size_t cap) {
++    int fd = dauth_connect(host, port);
++    if (fd < 0) return -1;
++    http_conn hc = {fd};
++    SSLContextRef st = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
++    if (!st) { close(fd); return -1; }
++    SSLSetIOFuncs(st, http_read, http_write);
++    SSLSetConnection(st, &hc);
++    SSLSetPeerDomainName(st, host, strlen(host));
++    SSLSetSessionOption(st, kSSLSessionOptionBreakOnServerAuth, getenv("DM_NEXTENDO_TLS_INSECURE") != NULL);
++    OSStatus hs = SSLHandshake(st);
++    while (hs == errSSLServerAuthCompleted) hs = SSLHandshake(st);   // only with TLS_INSECURE
++    if (hs != noErr) {
++        CFRelease(st);
++        close(fd);
++        return -1;
++    }
++
++    char req[1024];
++    int n = snprintf(req, sizeof req,
++                     "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: NX2Apple\r\nAccept: */*\r\n"
++                     "Connection: close\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n",
++                     method, path, host, ctype ? ctype : "application/json",
++                     body ? strlen(body) : 0);
++    size_t put = 0;
++    SSLWrite(st, req, (size_t)n, &put);
++    if (body) SSLWrite(st, body, strlen(body), &put);
++
++    char *buf = malloc(DCHAUTH_MAX_BODY);
++    size_t got = 0, rd = 0;
++    if (buf) {
++        while (got < DCHAUTH_MAX_BODY - 1) {
++            OSStatus r = SSLRead(st, buf + got, DCHAUTH_MAX_BODY - 1 - got, &rd);
++            got += rd;
++            if (r != noErr && r != errSSLWouldBlock) break;
++            if (!rd) break;
++        }
++        buf[got] = 0;
++    }
++    CFRelease(st);
++    close(fd);
++
++    int status = -1;
++    if (buf) {
++        if (!strncmp(buf, "HTTP/1.", 7)) status = atoi(buf + 9);
++        char *sep = strstr(buf, "\r\n\r\n");
++        if (out && cap) {
++            out[0] = 0;
++            if (sep) {
++                size_t len = strlen(sep + 4);
++                if (len >= cap) len = cap - 1;
++                memcpy(out, sep + 4, len);
++                out[len] = 0;
++            }
++        }
++        free(buf);
++    }
++    return status;
++}
++
++// The first string value of a key, unescaped only as far as tokens need (no \u sequences in them).
++static int json_string(const char *json, const char *key, char *out, size_t cap) {
++    char pat[64];
++    snprintf(pat, sizeof pat, "\"%s\":\"", key);
++    const char *p = strstr(json, pat);
++    if (!p) return 0;
++    p += strlen(pat);
++    size_t i = 0;
++    while (*p && *p != '"' && i + 1 < cap) out[i++] = *p++;
++    out[i] = 0;
++    return 1;
++}
++
++// 443 on a console; a local shim of the stack (nx-dauth in Docker) listens elsewhere.
++static int dauth_port(void) {
++    const char *p = getenv("DM_NEXTENDO_HTTPS_PORT");
++    return p && *p ? atoi(p) : 443;
++}
++
++static const char *dauth_domain(void) {
++    const char *d = getenv("DM_NEXTENDO_DOMAIN");
++    return d && *d ? d : NULL;
++}
++
++static const char *dauth_device_id(void) {
++    const char *d = getenv("DM_NEXTENDO_DEVICE_ID");
++    return d && *d ? d : "0123456789abcdef0123456789abcdef";
++}
++
++int dm_dauth_application_token(const char *app_id, const char *app_version, char *out, size_t cap) {
++    const char *domain = dauth_domain();
++    if (!dm_nd_enabled() || !domain || !app_id) return -1;
++    if (out && cap) out[0] = 0;
++
++    char host[256], body[512], resp[DCHAUTH_MAX_BODY];
++    snprintf(host, sizeof host, "dauth.%s", domain);
++
++    // 1. the challenge: the console would sign it, the self-hosted chain answers one it does not check
++    if (http_call(host, dauth_port(), "POST", "/v8/challenge", "application/json", "{}", resp, sizeof resp) != 200)
++        return -1;
++    char challenge[128] = {0};
++    json_string(resp, "challenge", challenge, sizeof challenge);
++
++    // 2. the device token, per client
++    snprintf(body, sizeof body, "{\"token_requests\":[{\"client_id\":\"%s\"}]}", dauth_device_id());
++    if (http_call(host, dauth_port(), "POST", "/v8/device_auth_tokens", "application/json", body, resp, sizeof resp) != 200)
++        return -1;
++    char device_token[1024] = {0};
++    if (!json_string(resp, "device_auth_token", device_token, sizeof device_token)) return -1;
++
++    // 3. the edge token, which is what the application auth call is made with
++    snprintf(body, sizeof body, "{\"token_requests\":[{\"client_id\":\"%s\",\"vendor_id\":\"0\"}]}",
++             dauth_device_id());
++    if (http_call(host, dauth_port(), "POST", "/v8/edge_tokens", "application/json", body, resp, sizeof resp) != 200)
++        return -1;
++    char edge[1024] = {0};
++    json_string(resp, "dtoken", edge, sizeof edge);
++
++    // 4. the application auth token: form-encoded, and the answer is the one the game wants
++    snprintf(host, sizeof host, "aauth.%s", domain);
++    snprintf(body, sizeof body, "application_id=%s&application_version=%s", app_id,
++             app_version ? app_version : "0");
++    if (http_call(host, dauth_port(), "POST", "/v5/application_auth_token",
++                  "application/x-www-form-urlencoded", body, resp, sizeof resp) != 200)
++        return -1;
++    if (!json_string(resp, "application_auth_token", out, cap)) return -1;
++    (void)challenge;
++    (void)device_token;
++    (void)edge;
++    return 0;
++}
+diff --git a/dm/host/hle_dauth.h b/dm/host/hle_dauth.h
+new file mode 100644
+index 0000000..a0d8aef
+--- /dev/null
++++ b/dm/host/hle_dauth.h
+@@ -0,0 +1,8 @@
++// The dauth chain as the host speaks it: the four calls a token needs, against the mock server the
++// fork's workflow starts on 127.0.0.1 (a self-signed certificate, so TLS_INSECURE for the test).
++#pragma once
++
++#include <stddef.h>
++
++// 0 on success; writes the application auth token into out.
++int dm_dauth_application_token(const char *app_id, const char *app_version, char *out, size_t cap);
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 838b621..63b929a 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -240,7 +240,10 @@ $(B)/t_net_tcp: t_net_tcp.c ../hle_net.c ../hle_net.h ../hle_nextendo.c ../hle_n
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_tcp.c
+ $(B)/t_net_udp_remote: t_net_udp_remote.c ../hle_net.c ../hle_net.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_udp_remote.c
+-# The TLS test speaks to a server the caller starts (DM_TEST_TLS_PORT), so it is not in `run`.
++$(B)/t_dauth_local: t_dauth_local.c ../hle_dauth.c ../hle_dauth.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_dauth_local.c -framework Security -framework CoreFoundation
++# The TLS and dauth tests speak to servers the caller starts (DM_TEST_TLS_PORT, DM_TEST_DAUTH_PORT),
++# so they are not in `run`.
+ $(B)/t_ssl_local: t_ssl_local.c ../hle_net.c ../hle_ssl.c ../hle_ssl.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ssl_local.c -framework Security -framework CoreFoundation
+ # The Nextendo hostname map and resolver are plain C with no game profile: these tests build without GAME.
+diff --git a/dm/host/tests/t_dauth_local.c b/dm/host/tests/t_dauth_local.c
+new file mode 100644
+index 0000000..7660290
+--- /dev/null
++++ b/dm/host/tests/t_dauth_local.c
+@@ -0,0 +1,37 @@
++// The dauth chain, end to end, against the mock the workflow starts: four calls in order, and the
++// application auth token comes back. Then the same call with the switch off, which must refuse.
++#include "../hle_nextendo.c"
++#include "../hle_dauth.c"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static void fail(const char *what) {
++    fprintf(stderr, "not true: %s\n", what);
++    exit(1);
++}
++
++int main(void) {
++    const char *port = getenv("DM_TEST_DAUTH_PORT");
++    if (!port) { fprintf(stderr, "DM_TEST_DAUTH_PORT is not set\n"); return 1; }
++
++    setenv("DM_NEXTENDO", "1", 1);
++    setenv("DM_NEXTENDO_DOMAIN", "local", 1);
++    setenv("DM_NEXTENDO_HTTPS_PORT", port, 1);
++    setenv("DM_NEXTENDO_TLS_INSECURE", "1", 1);
++    setenv("DM_NEXTENDO_HOSTS", "dauth.local=127.0.0.1,aauth.local=127.0.0.1", 1);
++    dm_nd_reload();
++
++    char token[256] = {0};
++    if (dm_dauth_application_token("0100152000022000", "0", token, sizeof token)) fail("the chain returned a token");
++    if (strcmp(token, "APP-TOKEN-42")) fail("the token is the server's");
++
++    unsetenv("DM_NEXTENDO");
++    dm_nd_reload();
++    char refused[256] = {0};
++    if (!dm_dauth_application_token("0100152000022000", "0", refused, sizeof refused)) fail("the switch off refuses");
++
++    puts("ok");
++    return 0;
++}

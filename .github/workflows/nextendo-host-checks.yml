@@ -38,6 +38,7 @@ jobs:
         run: |
           make -C engine/dm/host/tests GAME=0100152000022000 -j3 \
             build/t_nextendo_map build/t_nextendo_gai build/t_net_tcp build/t_net_udp_remote build/t_ssl_local \
+            build/t_dauth_local \
             build/t_net_loopback \
             2>&1 | tee host-tests-build.log
 
@@ -74,6 +75,46 @@ jobs:
           python3 /tmp/tls_echo.py 8443 /tmp/cert.pem /tmp/key.pem &
           sleep 1
           DM_TEST_TLS_PORT=8443 engine/dm/host/tests/build/t_ssl_local
+
+      - name: The dauth chain, against the mock
+        run: |
+          cat > /tmp/dauth_mock.py <<'PY'
+          import http.server, ssl, sys, json
+          class H(http.server.BaseHTTPRequestHandler):
+              def _send(self, obj, code=200):
+                  b = json.dumps(obj).encode()
+                  self.send_response(code)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(b)))
+                  self.end_headers()
+                  self.wfile.write(b)
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length') or 0)
+                  self.rfile.read(n)
+                  p = self.path
+                  if p == '/v8/challenge':
+                      self._send({'challenge': 'AAAA', 'data': 'BBBB'})
+                  elif p == '/v8/device_auth_tokens':
+                      self._send({'results': [{'client_id': 'x', 'device_auth_token': 'dev-token', 'expires_in': 86400}]})
+                  elif p == '/v8/edge_tokens':
+                      self._send({'results': [{'client_id': 'x', 'vendor_id': '0', 'dtoken': 'edge-token', 'expires_in': 86400}]})
+                  elif p == '/v5/application_auth_token':
+                      self._send({'expires_in': 86400, 'application_auth_token': 'APP-TOKEN-42',
+                                  'settings': [], 'online_play_policy': 'MEMBERSHIP_REQUIRED',
+                                  'policy_handler': 'SYSTEM'})
+                  else:
+                      self._send({'error': 'nope'}, 404)
+              def log_message(self, *a):
+                  pass
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain(sys.argv[2], sys.argv[3])
+          s = http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H)
+          s.socket = ctx.wrap_socket(s.socket, server_side=True)
+          s.serve_forever()
+          PY
+          python3 /tmp/dauth_mock.py 8444 /tmp/cert.pem /tmp/key.pem &
+          sleep 1
+          DM_TEST_DAUTH_PORT=8444 engine/dm/host/tests/build/t_dauth_local
 
       - name: The iOS host still compiles for the iPhone SDK
         run: |

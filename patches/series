@@ -65,3 +65,4 @@
 0067-tests-the-tls-connection-against-a-real-server.patch
 0068-host-the-ssl-entries-live-with-the-ssl-implement.patch
 0069-tests-corefoundation-for-cfrelease-and-a-tls-ser.patch
+0070-host-the-dauth-chain-as-a-host-module.patch
