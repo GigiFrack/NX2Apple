@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 09:50:56 +0000
+Subject: [PATCH] host: the catalog's patch is applied to main when the guard
+ bytes agree
+
+Upstream-Status: fork-only
+Reason: Some of a game's online decisions are code. Super Mario Party Jamboree loads a byte and returns to its
+ menu in the same frame, before it resolves a hostname or opens a socket: nifm, the account and the parental
+ controls had all said yes, and the log still ended there. Nextendo publishes the bytes that answer that
+ check, per title and per build, each with a guard - the bytes that must already be there - and the guard is
+ the whole safety: a build the catalog was not made for is refused and left untouched, with a line in the log
+ saying so. main.c applies it at startup, when the switch is on and the catalog file exists.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c           | 129 +++++++++++++++++++++++++++++++++++
+ dm/host/hle_npln.h           |  24 +++++++
+ dm/host/main.c               |   8 +++
+ dm/host/tests/Makefile       |   5 +-
+ dm/host/tests/t_npln_patch.c |  47 +++++++++++++
+ 5 files changed, 212 insertions(+), 1 deletion(-)
+ create mode 100644 dm/host/hle_npln.c
+ create mode 100644 dm/host/hle_npln.h
+ create mode 100644 dm/host/tests/t_npln_patch.c
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+new file mode 100644
+index 0000000..58f8108
+--- /dev/null
++++ b/dm/host/hle_npln.c
+@@ -0,0 +1,129 @@
++// See hle_npln.h. Portable on purpose: the host tests run this on Linux, only the game's memory differs.
++#include "dm.h"
++#include "hle_npln.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef struct {
++    char title[17];      // 16 hex digits, as the catalog writes them
++    char build[33];      // 32 hex digits (the NSO build id)
++    uint64_t offset;      // counted with the NSO header included, as the catalog states
++    uint8_t original[16];
++    size_t original_len;
++    uint8_t patched[16];
++    size_t patched_len;
++} dm_npln_row;
++
++static dm_npln_row *g_rows;
++static int g_nrows;
++
++static int hexval(int c) {
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++// Hex string to bytes; returns the count, or -1 on an odd length or a bad digit.
++static int unhex(const char *s, uint8_t *out, size_t cap) {
++    size_t n = strlen(s), i;
++    if (n % 2 || n / 2 > cap) return -1;
++    for (i = 0; i < n; i += 2) {
++        int hi = hexval((unsigned char)s[i]), lo = hexval((unsigned char)s[i + 1]);
++        if (hi < 0 || lo < 0) return -1;
++        out[i / 2] = (uint8_t)((hi << 4) | lo);
++    }
++    return (int)(n / 2);
++}
++
++int dm_npln_load(const char *path) {
++    FILE *f;
++    char line[512];
++    if (!path || !*path) return 0;
++    f = fopen(path, "r");
++    if (!f) { LOG("[npln] patch catalog %s: cannot read it", path); return 0; }
++    free(g_rows);
++    g_rows = NULL;
++    g_nrows = 0;
++    int cap = 0;
++    while (fgets(line, sizeof line, f)) {
++        // P<TAB>title<TAB>version<TAB>build<TAB>module<TAB>offset<TAB>original<TAB>patched
++        char kind, title[24], version[24], build[80], module[24], off[24], orig[64], patched[64];
++        if (line[0] != 'P' || line[1] != '\t') continue;
++        if (sscanf(line, "%c\t%23s\t%23s\t%79s\t%23s\t%23s\t%63s\t%63s",
++                   &kind, title, version, build, module, off, orig, patched) != 8) continue;
++        if (strcmp(module, "main")) continue;                       // this host patches the program, not the sdk
++        dm_npln_row row;
++        memset(&row, 0, sizeof row);
++        snprintf(row.title, sizeof row.title, "%s", title);
++        snprintf(row.build, sizeof row.build, "%s", build);
++        row.offset = strtoull(off, NULL, 10);
++        int a = unhex(orig, row.original, sizeof row.original);
++        int b = unhex(patched, row.patched, sizeof row.patched);
++        if (!row.offset || a <= 0 || b <= 0) continue;
++        row.original_len = (size_t)a;
++        row.patched_len = (size_t)b;
++        if (g_nrows == cap) {
++            cap = cap ? cap * 2 : 8;
++            dm_npln_row *grown = realloc(g_rows, (size_t)cap * sizeof *grown);
++            if (!grown) { free(g_rows); g_rows = NULL; g_nrows = 0; fclose(f); return 0; }
++            g_rows = grown;
++        }
++        g_rows[g_nrows++] = row;
++    }
++    fclose(f);
++    LOG("[npln] patch catalog %s: %d main-module row(s)", path, g_nrows);
++    return g_nrows;
++}
++
++// Where the row's bytes are in this image: the catalog counts the NSO header in, and whether the host's
++// image starts at that header or after it is the loader's business, not the catalog's. The guard answers
++// that by itself: the only offset that matches is the one the patch was made for.
++static uint8_t *dm_npln_target(dm_npln_row *row, uint8_t *base, uint64_t size) {
++    static const int guesses[2] = {0, 0x100};
++    for (int i = 0; i < 2; i++) {
++        uint64_t off = row->offset - (uint64_t)guesses[i];
++        if (off + row->original_len > size) continue;
++        if (base[off] == 0 && row->original[0] != 0 && off == 0) continue;
++        if (!memcmp(base + off, row->original, row->original_len)) return base + off;
++    }
++    return NULL;
++}
++
++int dm_npln_apply(uint64_t title_id) {
++    if (!g_nrows) return 0;
++    char title[24];
++    snprintf(title, sizeof title, "%016llx", (unsigned long long)title_id);
++    const char *build = dm_main_build();
++    module_t *main_mod = NULL;
++    for (int i = 0; i < g_nmod; i++)
++        if (!strcmp(g_mod[i].name, "main")) { main_mod = &g_mod[i]; break; }
++    if (!main_mod || !main_mod->base) return 0;
++
++    int written = 0, known_build = 0;
++    for (int i = 0; i < g_nrows; i++) {
++        dm_npln_row *row = &g_rows[i];
++        if (strcmp(row->title, title)) continue;
++        if (build && *build && strcmp(row->build, build)) continue;   // another build: this is what the guard protects
++        known_build = 1;
++        uint8_t *at = dm_npln_target(row, main_mod->base, main_mod->image_size);
++        if (!at) {
++            LOG("[npln] patch for %s at 0x%llx does not match this image (guard bytes differ): left alone",
++                row->build, (unsigned long long)row->offset);
++            continue;
++        }
++        memcpy(at, row->patched, row->patched_len);
++        written++;
++        LOG("[npln] patched %s at 0x%llx (%zu bytes)", row->build, (unsigned long long)row->offset, row->patched_len);
++    }
++    if (!known_build && g_nrows)
++        LOG("[npln] no catalog entry for title %s build %s: this game version is not one Nextendo has prepared",
++            title, build && *build ? build : "(unknown)");
++    return written;
++}
++
++int dm_npln_apply_file(const char *path, uint64_t title_id) {
++    if (!dm_npln_load(path)) return 0;
++    return dm_npln_apply(title_id);
++}
+diff --git a/dm/host/hle_npln.h b/dm/host/hle_npln.h
+new file mode 100644
+index 0000000..5ddac1a
+--- /dev/null
++++ b/dm/host/hle_npln.h
+@@ -0,0 +1,24 @@
++// Nextendo's signed patch catalog, applied to a module the way the reference clients do it.
++//
++// A game decides for itself whether it may go online, and some of those decisions are code: Super Mario
++// Party Jamboree loads a flag and returns to its menu before it resolves a single hostname. Nextendo
++// publishes the four bytes that answer that check, per title and per *build*, each with a guard: the
++// bytes that must already be there. The guard is the whole safety of this: a patch is written only where
++// the build it was made for is the build running, so a newer game version is left untouched instead of
++// being corrupted. dm/tools/npln_catalog.py verifies the signature and writes the TSV this reads.
++#ifndef DM_HLE_NPLN_H
++#define DM_HLE_NPLN_H
++
++#include <stdint.h>
++
++// Reads the TSV (title, build, module, offset, original hex, patched hex). 1 = rows loaded, 0 = none.
++int dm_npln_load(const char *path);
++
++// Applies every row whose title and build match the loaded main module, checking the guard bytes first.
++// Returns the number of guards written (0 when the build is not one the catalog covers).
++int dm_npln_apply(uint64_t title_id);
++
++// Convenience for the host's startup path: load the file if the switch and the path are there, apply.
++int dm_npln_apply_file(const char *path, uint64_t title_id);
++
++#endif
+diff --git a/dm/host/main.c b/dm/host/main.c
+index 51e2d2d..c123e10 100644
+--- a/dm/host/main.c
++++ b/dm/host/main.c
+@@ -120,6 +120,14 @@ static void host_preload(int argc, char **argv) {
+         LOG("build: commit %s, shader chain %s, profile %s", cs, DMSH_CHAIN, dm_profile()->id);
+         if (dm_nd_enabled()) {   // the switch arrived: say so once, so a log can tell "on" from "never seen"
+             dm_nd_reload();
++            {   // The game's own online gate, if the catalog covers this build: the guard bytes decide, so a
++                // game version Nextendo has not prepared is left alone instead of being corrupted.
++                const char *npln = getenv("DM_NPLN_PATCHES"), *app = getenv("DM_NEXTENDO_APP_ID");
++                if (npln && *npln && app && *app) {
++                    int dm_npln_apply_file(const char *, uint64_t);
++                    (void)dm_npln_apply_file(npln, strtoull(app, NULL, 16));
++                }
++            }
+             const char *dom = getenv("DM_NEXTENDO_DOMAIN"), *app = getenv("DM_NEXTENDO_APP_ID");
+             LOG("nextendo: on, %d host rule(s), domain %s, app %s", dm_nd_rule_count(),
+                 dom && *dom ? dom : "(none)", app && *app ? app : "(none)");
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 0f5a608..e3af4bd 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -54,7 +54,8 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_net_udp_remote
+ 	$(B)/t_nextendo_map
+ 	$(B)/t_nextendo_gai
+-	$(B)/t_nifm_nextendo
++	$(B)/t_nifm_nextendo \
++	$(B)/t_npln_patch
+ 	$(B)/t_idtoken
+ 	$(B)/t_sf
+ 	$(B)/t_audren_sv
+@@ -259,6 +260,8 @@ $(B)/t_idtoken: t_idtoken.c ../dmidtoken.c ../dmidtoken.h | $(B)
+ # nifm needs the socket service it sits in, so this one takes hle_net.c's dependencies too.
+ $(B)/t_nifm_nextendo: t_nifm_nextendo.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h ../hle_nextendo.c ../hle_nextendo.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_nifm_nextendo.c
++$(B)/t_npln_patch: t_npln_patch.c ../hle_npln.c ../hle_npln.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_npln_patch.c
+ 
+ $(B)/t_pctl: t_pctl.c ../hle_misc.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pctl.c
+diff --git a/dm/host/tests/t_npln_patch.c b/dm/host/tests/t_npln_patch.c
+new file mode 100644
+index 0000000..65e331b
+--- /dev/null
++++ b/dm/host/tests/t_npln_patch.c
+@@ -0,0 +1,47 @@
++// The guard is the safety: a patch is written only where the build's own bytes prove it belongs.
++#include "dm.h"
++#include <stdio.h>
++#include <string.h>
++
++module_t *g_mod;
++int g_nmod;
++
++#include "../hle_npln.c"
++
++static uint8_t g_image[0x400];
++static module_t g_main;
++
++static int fail(const char *what) { fprintf(stderr, "FAIL: %s\n", what); return 1; }
++
++int main(void) {
++    // The catalog's own bytes for mpj-230-certificate, at an offset this image can hold.
++    const uint64_t off = 0x0080;
++    memset(g_image, 0, sizeof g_image);
++    g_image[off] = 0xAA; g_image[off + 1] = 0xE2; g_image[off + 2] = 0x40; g_image[off + 3] = 0x39;
++
++    const char *path = "build/t_npln.tsv";
++    FILE *f = fopen(path, "w");
++    fprintf(f, "V\t0100965017338000\t2.3.0\tnpln\t1\n");
++    fprintf(f, "P\t0100965017338000\t2.3.0\tD70CE1726C979E45ED4200E9C2B23B2A258FDC18000000000000000000000000"
++               "\tmain\t128\tAAE24039\t2A008052\n");
++    fclose(f);
++
++    memset(&g_main, 0, sizeof g_main);
++    snprintf(g_main.name, sizeof g_main.name, "main");
++    g_main.base = g_image;
++    g_main.image_size = sizeof g_image;
++    snprintf(g_main.build_id, sizeof g_main.build_id, "D70CE1726C979E45ED4200E9C2B23B2A");
++    g_mod = &g_main; g_nmod = 1;
++
++    if (dm_npln_apply_file(path, 0x0100965017338000ULL) != 1) return fail("1 guard written");
++    if (memcmp(g_image + off, "\x2A\x00\x80\x52", 4)) return fail("patched bytes");
++
++    // Another build: same offset, different guard, nothing may be written.
++    g_image[off] = 0xAA; g_image[off + 1] = 0xE2; g_image[off + 2] = 0x40; g_image[off + 3] = 0x39;
++    snprintf(g_main.build_id, sizeof g_main.build_id, "37C6625DD50F7C9D0000000000000000");
++    if (dm_npln_apply(0x0100965017338000ULL) != 0) return fail("a different build is refused");
++    if (memcmp(g_image + off, "\xAA\xE2\x40\x39", 4)) return fail("a refused patch writes nothing");
++
++    printf("ok t_npln_patch\n");
++    return 0;
++}
