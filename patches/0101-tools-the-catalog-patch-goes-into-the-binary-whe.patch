@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 13:55:13 +0000
+Subject: [PATCH] tools: the catalog patch goes into the binary, where iOS can
+ keep it executable
+
+Upstream-Status: fork-only
+Reason: iOS keeps the app's code pages signed, so the catalog patch cannot be written at run time: the kernel accepts the
+ write and kills the process the next time the game executes that page (CODESIGNING / Invalid Page). The remaining
+ place is the binary, before signing. The catalog tool gains --apply: it verifies the Ed25519-signed document, then
+ writes the bytes into the file whose guard matches, given either that file or a folder to search. The guard is the
+ check: a build the patch was not made for is named and left alone.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/tools/npln_catalog.py | 77 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/npln_catalog.py b/dm/tools/npln_catalog.py
+index a77354b..4c58caa 100644
+--- a/dm/tools/npln_catalog.py
++++ b/dm/tools/npln_catalog.py
+@@ -74,6 +74,81 @@ def verify(envelope: dict, key_id: str) -> bytes:
+             raise SystemExit(f"{key_id}: signature does not verify: {r.stdout}{r.stderr}".strip())
+     return payload
+ 
++HEADER = 0x100   # the catalog counts the NSO header in, and so does the file: in the file the byte is at its offset
++
++
++def apply_file(path, title, patches):
++    # Write the catalog's patches into a main NSO on disk, before it is signed or built into an app. On iPhone
++    # there is no runtime version of this: the app's code pages are signed, so a write there is accepted and the
++    # process dies the next time the game executes that page (CODESIGNING / "Invalid Page"). The same bytes in
++    # the file before signing are simply part of the program.
++    if os.path.isdir(path):
++        # A game folder, not one file: the module the catalog calls "main" is the file whose bytes at the guard's
++        # offset are the guard itself. Nothing else about the layout has to be known.
++        targets = []
++        for root, _dirs, files in os.walk(path):
++            for name in files:
++                targets.append(os.path.join(root, name))
++        for candidate in targets:
++            try:
++                size = os.path.getsize(candidate)
++            except OSError:
++                continue
++            for p in patches["patches"]:
++                if not p.get("enabled") or p["title_id"] != title or p.get("module", "main") != "main":
++                    continue
++                for guard in p.get("guards") or []:
++                    at = int(guard["offset"])
++                    original = bytes.fromhex(guard["original_hex"])
++                    if size <= at + len(original):
++                        continue
++                    with open(candidate, "rb") as f:
++                        f.seek(at)
++                        if f.read(len(original)) != original:
++                            continue
++                    print("  found it: %s" % candidate)
++                    return apply_file(candidate, title, patches)
++        print("  no file in %s carries the guard of this title: is the game extracted?" % path)
++        return 0
++    data = bytearray(open(path, "rb").read())
++    written = 0
++    for p in patches["patches"]:
++        if not p.get("enabled") or p["title_id"] != title:
++            continue
++        for guard in p.get("guards") or []:
++            if p.get("module", "main") != "main":
++                continue
++            at = int(guard["offset"])
++            original = bytes.fromhex(guard["original_hex"])
++            patched = bytes.fromhex(guard["patched_hex"])
++            here = bytes(data[at:at + len(original)])
++            if here != original:
++                print("  " + p.get("build_id", "")[:32] + " at 0x%x: guard is %s, expected %s - not this build, left alone"
++                      % (at, here.hex(), original.hex()))
++                continue
++            data[at:at + len(patched)] = patched
++            written += 1
++            print("  " + p.get("build_id", "")[:32] + " at 0x%x: written %s (was %s), version %s"
++                  % (at, patched.hex(), original.hex(), p.get("game_version", "?")))
++    if written:
++        with open(path, "wb") as f:
++            f.write(data)
++    return written
++
++
++def main() -> int:
++    argv = sys.argv[1:]
++    if argv[:1] == ["--apply"]:
++        if len(argv) < 3 or "--title" not in argv:
++            print("usage: npln_catalog.py --apply <main NSO> --title <16 hex digits>")
++            return 2
++        path = argv[1]
++        title = argv[argv.index("--title") + 1]
++        patches = json.loads(verify(fetch("npln-patches"), "npln-patches-key-1"))
++        n = apply_file(path, title, patches)
++        print("%s: %d patch(es) written" % (path, n))
++        return 0 if n else 1
++
+ 
+ def main() -> int:
+     out = sys.argv[1] if len(sys.argv) > 1 else "npln_patches.tsv"
+@@ -104,4 +179,4 @@ def main() -> int:
+ 
+ 
+ if __name__ == "__main__":
+-    raise SystemExit(main())
++    raise SystemExit(main())
+\ No newline at end of file
