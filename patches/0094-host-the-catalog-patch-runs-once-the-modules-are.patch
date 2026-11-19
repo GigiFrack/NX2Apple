@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 11:13:49 +0000
+Subject: [PATCH] host: the catalog patch runs once the modules are in memory,
+ not before
+
+Upstream-Status: fork-only
+Reason: The catalog was read and applied where the build line is printed, which is before any module is mapped: the
+ applier found no main module, returned without a word, and the game's own online gate stayed closed. The log
+ showed the catalog loading and then nothing - no patch, no refusal - which is exactly what a silent early
+ return looks like. It now runs where the NRO manifest is announced, after main is in memory, and still refuses
+ any build whose guard bytes disagree.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/loader.c | 13 +++++++++++++
+ dm/host/main.c   | 18 ------------------
+ 2 files changed, 13 insertions(+), 18 deletions(-)
+
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 5dc4680..3a6afe6 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -1,6 +1,7 @@
+ // Multi-module loading (playing the role of Horizon's rtld): mapping, claiming thread slots, gate registration, cross-module relocation, take-over by name, segment permissions.
+ // The code area (original text and patch area) is set to read-only+execute as soon as it is copied in, and from then on the loader only writes data: on iOS these two blocks must be embedded as is as signed code segments.
+ #include "dm.h"
++#include "hle_nextendo.h"
+ #include <TargetConditionals.h>
+ #include <fcntl.h>
+ #include <errno.h>
+@@ -562,6 +563,18 @@ static void preload_nros(const char *dir, FILE *f) {
+     }
+     fclose(f);
+     LOG("NRO: %d modules mapped (%s), loaded when the game asks; initialized data %.1f MB, snapshotted on first load", g_nmod - n0, path, data / 1048576.0);
++    // Nextendo's catalog patch, now that main is in memory: it used to run where the build line is printed, which
++    // is before any module is mapped, so it found nothing and wrote nothing. The guard bytes still decide.
++    if (dm_nd_enabled()) {
++        const char *app = getenv("DM_NEXTENDO_APP_ID");
++        static char derived[1024];
++        const char *npln = getenv("DM_NPLN_PATCHES");
++        if (!npln || !*npln) {
++            const char *save = getenv("DM_SAVE"), *at = save ? strstr(save, "/games/") : NULL;
++            if (at && *at) { snprintf(derived, sizeof derived, "%.*s/npln_patches.tsv", (int)(at - save), save); npln = derived; }
++        }
++        if (app && *app) { int dm_npln_apply_file(const char *, uint64_t); (void)dm_npln_apply_file(npln, strtoull(app, NULL, 16)); }
++    }
+ }
+ 
+ module_t *nro_find(const uint8_t sha256[32]) {
+diff --git a/dm/host/main.c b/dm/host/main.c
+index ab1407a..51e2d2d 100644
+--- a/dm/host/main.c
++++ b/dm/host/main.c
+@@ -120,24 +120,6 @@ static void host_preload(int argc, char **argv) {
+         LOG("build: commit %s, shader chain %s, profile %s", cs, DMSH_CHAIN, dm_profile()->id);
+         if (dm_nd_enabled()) {   // the switch arrived: say so once, so a log can tell "on" from "never seen"
+             dm_nd_reload();
+-            {   // The game's own online gate, if the catalog covers this build: the guard bytes decide, so a
+-                // game version Nextendo has not prepared is left alone instead of being corrupted.
+-                const char *app = getenv("DM_NEXTENDO_APP_ID");
+-                static char derived[1024];
+-                const char *npln = getenv("DM_NPLN_PATCHES");
+-                if ((!npln || !*npln)) {
+-                    // No path given: the catalog is a file the player drops in Documents, and DM_SAVE is the one
+-                    // path the shell always sets (<Documents>/games/<title>/save). Cutting at /games/ keeps the
+-                    // catalog out of reach of the container id, which changes on a reinstall.
+-                    const char *save = getenv("DM_SAVE"), *at = save ? strstr(save, "/games/") : NULL;
+-                    if (at && *at) snprintf(derived, sizeof derived, "%.*s/npln_patches.tsv", (int)(at - save), save);
+-                    if (at && *at) npln = derived;
+-                }
+-                if (app && *app) {
+-                    int dm_npln_apply_file(const char *, uint64_t);
+-                    (void)dm_npln_apply_file(npln, strtoull(app, NULL, 16));
+-                }
+-            }
+             const char *dom = getenv("DM_NEXTENDO_DOMAIN"), *app = getenv("DM_NEXTENDO_APP_ID");
+             LOG("nextendo: on, %d host rule(s), domain %s, app %s", dm_nd_rule_count(),
+                 dom && *dom ? dom : "(none)", app && *app ? app : "(none)");
