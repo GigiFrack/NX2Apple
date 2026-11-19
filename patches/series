@@ -105,3 +105,4 @@
 0107-host-the-network-service-account-answers-success.patch
 0108-host-no-proxy-is-an-answer-not-a-failure.patch
 0109-host-a-log-line-reaches-the-pipe-before-the-next.patch
+0110-host-the-ssl-entries-say-their-names-too.patch

@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 15:50:50 +0000
+Subject: [PATCH] host: the ssl entries say their names too
+
+Upstream-Status: fork-only
+Reason: The log ends at the proxy answer because iOS kills the process with SIGKILL for the jump to zero, so the engine's
+ crash handler never runs and the guest's caller is lost with it. The instrumentation has to be earlier: the ssl
+ entries now say their own name at the trace, as nifm and account already do, so the last line before the jump
+ names the family the game was in.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_ssl.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 25e0dbf..7fa366b 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -66,10 +66,10 @@ typedef struct {
+ // A context is a session of the local ssl service, so on Horizon Create works with no network and only a connection needs one; DRAGON QUEST BUILDERS 2 ends its startup when Create fails (main+0x861260).
+ // Not cut: Context / Connection construction and destruction, Context::GetContextId (only read and write game objects).
+ #define SSF(m, cname, ...) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, __VA_ARGS__)
+-HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { return RES_OK; }
+-HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { return RES_OK; }
+-HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "a context object: the service session is the host's own state", Result, h_ssl_CtxCreate, void *self, int v) { (void)v; dm_ssl_context_create(self); return RES_OK; }
+-HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create", Result, h_ssl_CtxDestroy, void *self) { dm_ssl_context_destroy(self); return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { dm_nd_trace_result("ssl::_ZN2nn3ssl10InitializeEv", -1); return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { dm_nd_trace_result("ssl::_ZN2nn3ssl8FinalizeEv", -1); return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "a context object: the service session is the host's own state", Result, h_ssl_CtxCreate, void *self, int v) { dm_nd_trace_result("ssl::_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", -1); (void)v; dm_ssl_context_create(self); return RES_OK; }
++HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create", Result, h_ssl_CtxDestroy, void *self) { dm_nd_trace_result("ssl::_ZN2nn3ssl7Context7DestroyEv", -1); dm_ssl_context_destroy(self); return RES_OK; }
+ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
+ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
+@@ -114,11 +114,11 @@ SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr
+ }
+ SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) { (void)self; (void)b; (void)n; if (o) *o = 0; return RES_FAIL; }
+ SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) { (void)self; (void)o; (void)i; (void)t; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "the TLS stream over the game's own socket (DM_NEXTENDO=1); -1 while the switch is off", int, h_ssl_CnRead, void *self, char *b, unsigned n) {
++HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "the TLS stream over the game's own socket (DM_NEXTENDO=1); -1 while the switch is off", int, h_ssl_CnRead, void *self, char *b, unsigned n) { dm_nd_trace_result("ssl::_ZN2nn3ssl10Connection4ReadEPcj", -1);
+     if (!dm_nd_enabled()) return -1;
+     return dm_ssl_read_call(self, b, n);
+ }
+-HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "the TLS stream over the game's own socket (DM_NEXTENDO=1); -1 while the switch is off", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) {
++HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "the TLS stream over the game's own socket (DM_NEXTENDO=1); -1 while the switch is off", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) { dm_nd_trace_result("ssl::_ZN2nn3ssl10Connection5WriteEPKcj", -1);
+     if (!dm_nd_enabled()) return -1;
+     return dm_ssl_write_call(self, b, n);
+ }
+@@ -140,9 +140,9 @@ SSC("nnsslContextDestroy", h_nssl_CtxDestroy) SSC("nnsslContextGetContextId", h_
+ // http/1.1 for NEX). Failing them, as the cut table did, gives a game a reason to give up before the
+ // handshake, which is the one place we cannot see.
+ HLE_FORCE("nnsslConnectionSetHostName", "the host takes the name from the socket and the redirect map; accepted and ignored",
+-          Result, h_ssl_SetHostReal, void) { dm_nd_trace_result("ssl::SetHostName(ignored)", RES_OK); return RES_OK; }
++          Result, h_ssl_SetHostReal, void) { dm_nd_trace_result("ssl::nnsslConnectionSetHostName", -1); dm_nd_trace_result("ssl::SetHostName(ignored)", RES_OK); return RES_OK; }
+ HLE_FORCE("nnsslConnectionSetNextAlpnProto", "accepted and ignored: the host offers h2 on NPLN hosts and http/1.1 on NEX",
+-          Result, h_ssl_SetAlpnReal, void) { dm_nd_trace_result("ssl::SetNextAlpnProto(ignored)", RES_OK); return RES_OK; }
++          Result, h_ssl_SetAlpnReal, void) { dm_nd_trace_result("ssl::nnsslConnectionSetNextAlpnProto", -1); dm_nd_trace_result("ssl::SetNextAlpnProto(ignored)", RES_OK); return RES_OK; }
+ 
+ // ---------------------------------------------------------------- the IO the handshake runs on
+ 
