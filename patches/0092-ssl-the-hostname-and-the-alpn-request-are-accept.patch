@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 09:55:02 +0000
+Subject: [PATCH] ssl: the hostname and the ALPN request are accepted, because
+ the host decides both
+
+Upstream-Status: fork-only
+Reason: nnsslConnectionSetHostName and SetNextAlpnProto sat in the cut table, which answers RES_FAIL. Both are
+ calls a game makes before the handshake, and a failure there is the one place the host cannot see what
+ went wrong: the game simply does not connect. Neither needs to be honoured - the hostname comes from the
+ socket the game opened plus the redirect map, and the protocol is chosen per host (h2 for NPLN,
+ http/1.1 for NEX) - so they are accepted, ignored, and traced, which keeps a game moving into the part
+ of the exchange that leaves a log.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_ssl.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index f1c7577..25e0dbf 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -128,12 +128,22 @@ SSC("nnsslConnectionCreate", h_nssl_Create) SSC("nnsslConnectionDestroy", h_nssl
+ SSC("nnsslConnectionDoHandshakeWithCertBuffer", h_nssl_Handshake) SSC("nnsslConnectionGetConnectionId", h_nssl_GetId)
+ SSC("nnsslConnectionGetNextAlpnProto", h_nssl_GetAlpn) SSC("nnsslConnectionGetVerifyCertError", h_nssl_VerifyErr)
+ SSC("nnsslConnectionPeek", h_nssl_Peek) SSC("nnsslConnectionPending", h_nssl_Pending) SSC("nnsslConnectionRead", h_nssl_Read)
+-SSC("nnsslConnectionSetHostName", h_nssl_SetHost) SSC("nnsslConnectionSetIoMode", h_nssl_SetIo)
+-SSC("nnsslConnectionSetNextAlpnProto", h_nssl_SetAlpn) SSC("nnsslConnectionSetOption", h_nssl_SetOpt)
++SSC("nnsslConnectionSetIoMode", h_nssl_SetIo)
++SSC("nnsslConnectionSetOption", h_nssl_SetOpt)
+ SSC("nnsslConnectionSetSessionCacheMode", h_nssl_SetCache) SSC("nnsslConnectionSetSocketDescriptor", h_nssl_SetSock)
+ SSC("nnsslConnectionSetVerifyOption", h_nssl_SetVerify) SSC("nnsslConnectionWrite", h_nssl_Write)
+ SSC("nnsslContextDestroy", h_nssl_CtxDestroy) SSC("nnsslContextGetContextId", h_nssl_CtxGetId)
+ 
++// The game names a host and asks for ALPN protocols; the host decides both. Accepting the calls and
++// ignoring them is deliberate: the hostname already comes from the socket the game opened and from the
++// redirect map (dm_nd_last_host), and the protocol is chosen per host in the handshake (h2 for NPLN,
++// http/1.1 for NEX). Failing them, as the cut table did, gives a game a reason to give up before the
++// handshake, which is the one place we cannot see.
++HLE_FORCE("nnsslConnectionSetHostName", "the host takes the name from the socket and the redirect map; accepted and ignored",
++          Result, h_ssl_SetHostReal, void) { dm_nd_trace_result("ssl::SetHostName(ignored)", RES_OK); return RES_OK; }
++HLE_FORCE("nnsslConnectionSetNextAlpnProto", "accepted and ignored: the host offers h2 on NPLN hosts and http/1.1 on NEX",
++          Result, h_ssl_SetAlpnReal, void) { dm_nd_trace_result("ssl::SetNextAlpnProto(ignored)", RES_OK); return RES_OK; }
++
+ // ---------------------------------------------------------------- the IO the handshake runs on
+ 
+ static OSStatus dm_ssl_io_read(SSLConnectionRef ref, void *data, size_t *len) {
