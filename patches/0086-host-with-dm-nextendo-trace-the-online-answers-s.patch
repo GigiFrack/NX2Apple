@@ -5,10 +5,10 @@ Subject: [PATCH] host: with DM_NEXTENDO_TRACE the online answers say what they
  were
 
 Upstream-Status: fork-only
-Reason: A game that refuses to go online gives no reason: it asks a handful of local questions, gets a "no" or a failure
- from one of them, and goes back to its menu in the same frame. That looks identical to a switch that never arrived, and
- each guess costs a rebuild. With DM_NEXTENDO_TRACE=1 every online-facing answer prints its result in the order the game
- asked, which names the gate. Off by default and silent otherwise.
+Reason: A game that refuses to go online gives no reason: it asks a handful of local questions, gets a no or a failure
+ from one of them, and goes back to its menu in the same frame. That looks identical to a switch that never arrived,
+ and each guess costs a rebuild. With DM_NEXTENDO_TRACE=1 every online-facing answer prints its result in the order
+ the game asked, which names the gate. Off by default and silent otherwise.
 Issue: https://github.com/GigiFrack/NX2Apple (fork)
 
 ---

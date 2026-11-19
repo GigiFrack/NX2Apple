@@ -3,6 +3,9 @@ From: hermes <hermes@local>
 Date: Wed, 18 Nov 2026 21:56:24 +0000
 Subject: [PATCH] host: the Nintendo namespace goes to Nextendo, and the game's
  TLS accepts their certificates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Upstream-Status: fork-only
 Reason: Without a redirect the game asks the real DNS for `*.nintendo.net` and reaches Nintendo, which refuses it: the
@@ -14,14 +17,13 @@ Reason: Without a redirect the game asks the real DNS for `*.nintendo.net` and r
  over a WebSocket and a server allowed to pick h2 never upgrades. Off with DM_NEXTENDO unset; the built-in table can be
  turned off alone with DM_NEXTENDO_BUILTIN_HOSTS=0.
 Issue: https://github.com/GigiFrack/NX2Apple (fork)
-
 ---
  dm/host/hle_nextendo.c         | 93 ++++++++++++++++++++++++++++++++++
  dm/host/hle_nextendo.h         |  3 ++
- dm/host/hle_ssl.c              | 23 ++++++++-
+ dm/host/hle_ssl.c              | 25 ++++++++-
  dm/host/tests/t_nextendo_gai.c |  1 +
  dm/host/tests/t_nextendo_map.c |  1 +
- 5 files changed, 119 insertions(+), 2 deletions(-)
+ 5 files changed, 121 insertions(+), 2 deletions(-)
 
 diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
 index 2ebb61d..b501033 100644
@@ -163,18 +165,18 @@ index ec5b7e2..25db0e4 100644
  int dm_nd_rule_count(void);
  
 diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
-index 955f5dc..bcf9f3f 100644
+index 955f5dc..bd0c0c3 100644
 --- a/dm/host/hle_ssl.c
 +++ b/dm/host/hle_ssl.c
 @@ -11,6 +11,7 @@
  #include "hle.h"
  #include "hle_net.h"
  #include "hle_nextendo.h"
-+#include <CoreFoundation/CoreFoundation.h>   // CFData/CFArray for SSLSetALPNProtocols
++#include <CoreFoundation/CoreFoundation.h>   // CFString/CFArray for SSLSetALPNProtocols
  #include "hle_ssl.h"
  
  // The guest's MSG_DONTWAIT, as hle_net.c's SK_MSG_DONTWAIT defines it for the socket service.
-@@ -150,10 +151,28 @@ static int dm_ssl_open(dm_ssl_conn *c) {
+@@ -150,10 +151,30 @@ static int dm_ssl_open(dm_ssl_conn *c) {
      if (!c->st) return -1;
      SSLSetIOFuncs(c->st, dm_ssl_io_read, dm_ssl_io_write);
      SSLSetConnection(c->st, c);
@@ -193,8 +195,10 @@ index 955f5dc..bcf9f3f 100644
 +        SSLSetSessionOption(c->st, kSSLSessionOptionBreakOnServerAuth, true);
 +    // ALPN http/1.1 only: NEX carries PRUDP over a WebSocket, which needs the HTTP/1.1 upgrade, and a
 +    // server that may pick h2 would never upgrade (the NPLN hosts want h2 and are a later step).
++    // The array SecureTransport wants holds CFStrings, not CFData: given data it messages the element
++    // with CFStringGetCString and the process aborts with an NSInvalidArgumentException.
 +    if (dm_nd_enabled()) {
-+        CFDataRef proto = CFDataCreate(NULL, (const UInt8 *)"http/1.1", 8);
++        CFStringRef proto = CFStringCreateWithCString(NULL, "http/1.1", kCFStringEncodingUTF8);
 +        if (proto) {
 +            const void *one[] = {proto};
 +            CFArrayRef list = CFArrayCreate(NULL, one, 1, &kCFTypeArrayCallBacks);

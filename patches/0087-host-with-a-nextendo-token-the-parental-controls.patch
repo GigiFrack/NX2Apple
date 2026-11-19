@@ -5,10 +5,10 @@ Subject: [PATCH] host: with a Nextendo token the parental controls allow
  talking to other players
 
 Upstream-Status: fork-only
-Reason: The host answers "may this game talk to other players?" with a flat no, which is right when there is no network.
+Reason: The host answers may-this-game-talk-to-other-players with a flat no, which is right when there is no network.
  With DM_NEXTENDO=1 every network question already says yes (nifm, the network service account), so the parental-controls
- answer is the one left saying no, and a game that reads it goes straight back to its menu with no error and no log. Ryujinx,
- which plays these games online, keeps parental restrictions off; with a Nextendo token this answers the same way.
+ answer is the one left saying no, and a game that reads it goes straight back to its menu with no error and no log.
+ Ryujinx, which plays these games online, keeps parental restrictions off; with a Nextendo token this answers the same way.
 Issue: https://github.com/GigiFrack/NX2Apple (fork)
 
 ---

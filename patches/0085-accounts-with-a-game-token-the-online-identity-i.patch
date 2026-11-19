@@ -5,11 +5,8 @@ Subject: [PATCH] accounts: with a game token the online identity is ready
  without walking the dauth chain
 
 Upstream-Status: fork-only
-Reason: The three calls a game makes to ask "is a network service account ready?" answered from the dauth chain, which
- needs a dauth server it can reach; with a Nextendo game token in the environment the identity is already known and
- nothing has to be walked. Without this the game aborted itself with nn::diag Result 0x2a2 (a generic failure) about
- forty seconds in, before it resolved a single hostname. Only when DM_NEXTENDO_NEX_TOKEN is set; otherwise the chain's
- answers are unchanged.
+Reason: With a game token the identity is already there: the token proves the pid, so the dauth chain does not have to be
+ walked to have a network service account. Without a token the old offline path answers exactly as before.
 Issue: https://github.com/GigiFrack/NX2Apple (fork)
 
 ---
