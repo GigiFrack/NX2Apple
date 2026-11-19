@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 13:31:55 +0000
+Subject: [PATCH] host: the patch pages are made private and writable, then
+ code again
+
+Upstream-Status: fork-only
+Reason: The loader maps a module read-only and file-backed, which is right, so the applier's memcpy into main's text
+ faulted: the guard matched, the coordinate was right, and the write crashed the preload thread with SIGBUS.
+ The pages the patch touches are made private and writable with VM_PROT_COPY (which keeps the write off the
+ bundle), written, then put back to read-and-execute with the instruction cache invalidated. Where the pages
+ refuse, the patch says so and leaves the image alone instead of dying.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index 0f90f17..d40cd42 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -5,6 +5,31 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#if defined(__APPLE__)
++#include <mach/mach.h>
++#include <libkern/OSCacheControl.h>
++// The loader maps a module read-only (and file-backed), which is right: a game's own code should not be
++// writable. A patch therefore has to make just those pages private and writable for the write and put them
++// back to code afterwards. VM_PROT_COPY is what keeps this off the file: without it the write would either
++// be refused or reach the bundle.
++static int dm_page_writable(void *addr, size_t len) {
++    vm_address_t page = (vm_address_t)((uintptr_t)addr & ~(uintptr_t)(vm_page_size - 1));
++    vm_size_t size = (vm_address_t)((uintptr_t)addr + len) - page;
++    return vm_protect(mach_task_self(), page, size, FALSE,
++                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS;
++}
++static void dm_page_code_again(void *addr, size_t len) {
++    vm_address_t page = (vm_address_t)((uintptr_t)addr & ~(uintptr_t)(vm_page_size - 1));
++    vm_size_t size = (vm_address_t)((uintptr_t)addr + len) - page;
++    vm_protect(mach_task_self(), page, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
++    sys_icache_invalidate(addr, len);
++}
++#else
++// The host tests patch a buffer they own, so the pages are already writable.
++static int dm_page_writable(void *addr, size_t len) { (void)addr; (void)len; return 1; }
++static void dm_page_code_again(void *addr, size_t len) { (void)addr; (void)len; }
++#endif
++
+ typedef struct {
+     char title[17];      // 16 hex digits, as the catalog writes them
+     char build[33];      // 32 hex digits (the NSO build id)
+@@ -181,7 +206,13 @@ int dm_npln_apply(uint64_t title_id) {
+                 row->build, (unsigned long long)row->offset);
+             continue;
+         }
++        if (!dm_page_writable(at, row->patched_len)) {
++            LOG("[npln] patch for %s at 0x%llx: the image refuses to be written, left alone",
++                row->build, (unsigned long long)row->offset);
++            continue;
++        }
+         memcpy(at, row->patched, row->patched_len);
++        dm_page_code_again(at, row->patched_len);
+         written++;
+         LOG("[npln] patched %s at 0x%llx (%zu bytes)", row->build, (unsigned long long)row->offset, row->patched_len);
+     }
