@@ -90,3 +90,4 @@
 0092-ssl-the-hostname-and-the-alpn-request-are-accept.patch
 0093-host-the-patch-catalog-is-found-in-documents-wit.patch
 0094-host-the-catalog-patch-runs-once-the-modules-are.patch
+0095-host-the-build-id-is-compared-without-case-becau.patch

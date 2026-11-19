@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 12:31:25 +0000
+Subject: [PATCH] host: the build id is compared without case, because the
+ catalog shouts and the loader whispers
+
+Upstream-Status: fork-only
+Reason: The catalog writes the build id in upper case and 64 characters long; the loader hands back the first 16
+ bytes in lower case. The applier compared them byte for byte, so the build that the catalog was written for
+ was reported as one Nextendo had not prepared - a correct refusal for the wrong reason, and the game's gate
+ stayed shut. The first 32 characters are compared without case now, and the test runs the loader's form
+ against the catalog's.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c           | 17 ++++++++++++++++-
+ dm/host/tests/t_npln_patch.c |  3 ++-
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index 58f8108..58d7f32 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -91,6 +91,21 @@ static uint8_t *dm_npln_target(dm_npln_row *row, uint8_t *base, uint64_t size) {
+     return NULL;
+ }
+ 
++// The catalog writes the build id in upper case and 64 characters long; the loader hands back the first
++// 16 bytes in lower case. Comparing the two byte for byte refuses a build that is the same one, so the
++// first 32 characters are compared without case.
++static int dm_npln_same_build(const char *catalog, const char *running) {
++    if (!catalog || !running) return 0;
++    for (int i = 0; i < 32; i++) {
++        char a = catalog[i], b = running[i];
++        if (!a || !b) return 0;
++        if (a >= 'A' && a <= 'Z') a += 32;
++        if (b >= 'A' && b <= 'Z') b += 32;
++        if (a != b) return 0;
++    }
++    return 1;
++}
++
+ int dm_npln_apply(uint64_t title_id) {
+     if (!g_nrows) return 0;
+     char title[24];
+@@ -105,7 +120,7 @@ int dm_npln_apply(uint64_t title_id) {
+     for (int i = 0; i < g_nrows; i++) {
+         dm_npln_row *row = &g_rows[i];
+         if (strcmp(row->title, title)) continue;
+-        if (build && *build && strcmp(row->build, build)) continue;   // another build: this is what the guard protects
++        if (build && *build && !dm_npln_same_build(row->build, build)) continue;   // another build: what the guard protects
+         known_build = 1;
+         uint8_t *at = dm_npln_target(row, main_mod->base, main_mod->image_size);
+         if (!at) {
+diff --git a/dm/host/tests/t_npln_patch.c b/dm/host/tests/t_npln_patch.c
+index 65e331b..5b5b1f3 100644
+--- a/dm/host/tests/t_npln_patch.c
++++ b/dm/host/tests/t_npln_patch.c
+@@ -30,7 +30,8 @@ int main(void) {
+     snprintf(g_main.name, sizeof g_main.name, "main");
+     g_main.base = g_image;
+     g_main.image_size = sizeof g_image;
+-    snprintf(g_main.build_id, sizeof g_main.build_id, "D70CE1726C979E45ED4200E9C2B23B2A");
++    // The loader hands back the lower-case, 32-character form; the catalog writes it upper case and longer.
++    snprintf(g_main.build_id, sizeof g_main.build_id, "d70ce1726c979e45ed4200e9c2b23b2a");
+     g_mod = &g_main; g_nmod = 1;
+ 
+     if (dm_npln_apply_file(path, 0x0100965017338000ULL) != 1) return fail("1 guard written");
