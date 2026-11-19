@@ -92,3 +92,4 @@
 0094-host-the-catalog-patch-runs-once-the-modules-are.patch
 0095-host-the-build-id-is-compared-without-case-becau.patch
 0096-host-the-image-origin-is-read-off-the-nso-magic.patch
+0097-host-the-catalog-s-version-row-says-which-versio.patch

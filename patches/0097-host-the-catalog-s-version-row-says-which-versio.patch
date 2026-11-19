@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 12:49:58 +0000
+Subject: [PATCH] host: the catalog's version row says which version the
+ servers accept, in the log
+
+Upstream-Status: fork-only
+Reason: The catalog carries two answers, not one: which bytes open a title's own gate, and which version of the
+ title the servers accept at all. The applier used the first and ignored the second, so a game running a
+ version Nextendo has not prepared fails at the server with nothing in the log to say why - the same silent
+ shape as every other failure in this integration. The version row is read now and its answer is printed
+ once, next to the patch decision.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index 299b08f..bedbf31 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -18,6 +18,13 @@ typedef struct {
+ static dm_npln_row *g_rows;
+ static int g_nrows;
+ 
++// The version rows ("V"): which version of a title the servers accept, and with which protocol. Kept
++// beside the patches because they answer the other half of the same question - the right bytes on the
++// wrong version is still a game the servers refuse, and it looks exactly like a network failure.
++typedef struct { char title[17]; char version[24]; char protocol[12]; int enabled; } dm_npln_version;
++static dm_npln_version *g_versions;
++static int g_nversions;
++
+ static int hexval(int c) {
+     if (c >= '0' && c <= '9') return c - '0';
+     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+@@ -50,6 +57,21 @@ int dm_npln_load(const char *path) {
+     while (fgets(line, sizeof line, f)) {
+         // P<TAB>title<TAB>version<TAB>build<TAB>module<TAB>offset<TAB>original<TAB>patched
+         char kind, title[24], version[24], build[80], module[24], off[24], orig[64], patched[64];
++        if (line[0] == 'V' && line[1] == '\t') {
++            char kind, title[24], version[24], protocol[12], enabled[8];
++            if (sscanf(line, "%c\t%23s\t%23s\t%11s\t%7s", &kind, title, version, protocol, enabled) == 5) {
++                dm_npln_version *grown = realloc(g_versions, (size_t)(g_nversions + 1) * sizeof *grown);
++                if (grown) {
++                    g_versions = grown;
++                    dm_npln_version *v = &g_versions[g_nversions++];
++                    snprintf(v->title, sizeof v->title, "%s", title);
++                    snprintf(v->version, sizeof v->version, "%s", version);
++                    snprintf(v->protocol, sizeof v->protocol, "%s", protocol);
++                    v->enabled = enabled[0] == '1';
++                }
++            }
++            continue;
++        }
+         if (line[0] != 'P' || line[1] != '\t') continue;
+         if (sscanf(line, "%c\t%23s\t%23s\t%79s\t%23s\t%23s\t%63s\t%63s",
+                    &kind, title, version, build, module, off, orig, patched) != 8) continue;
+@@ -131,6 +153,20 @@ int dm_npln_apply(uint64_t title_id) {
+         !memcmp(main_mod->base, "NSO0", 4) ? "starts at the NSO header" :
+         (!memcmp(main_mod->base - 0x100, "NSO0", 4) ? "starts after the NSO header" : "no NSO0 magic found"));
+ 
++    // What the servers accept for this title, before any patch: a version that is not the required one is
++    // refused online no matter what the code says, and a player deserves to read that instead of guessing.
++    const char *running = getenv("DM_NEXTENDO_GAME_VERSION");
++    for (int i = 0; i < g_nversions; i++) {
++        if (strcmp(g_versions[i].title, title)) continue;
++        if (!g_versions[i].enabled)
++            LOG("[npln] %s is not enabled on Nextendo right now: online play will be refused", title);
++        if (running && *running && strcmp(running, g_versions[i].version))
++            LOG("[npln] %s needs version %s (%s); this is %s: the servers refuse it",
++                title, g_versions[i].version, g_versions[i].protocol, running);
++        else if (running && *running)
++            LOG("[npln] %s version %s (%s) is the one Nextendo prepared", title, running, g_versions[i].protocol);
++        break;
++    }
+     int written = 0, known_build = 0;
+     for (int i = 0; i < g_nrows; i++) {
+         dm_npln_row *row = &g_rows[i];
