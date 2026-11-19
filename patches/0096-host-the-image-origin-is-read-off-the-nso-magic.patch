@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 12:45:02 +0000
+Subject: [PATCH] host: the image origin is read off the NSO magic instead of
+ guessed
+
+Upstream-Status: fork-only
+Reason: The catalog counts offsets with the NSO header included - the reference client keeps one buffer whose
+ decompressed sections sit at their file offsets - but the host's mapping may start at that header or after
+ it, and guessing between the two made a guard that should match report a mismatch. The image says where it
+ begins: an NSO starts with NSO0, and the log now records which case was found, so a future mismatch can be
+ read from the log instead of costing a rebuild. Reading before the base happens only when the loader put
+ the patch area there.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c | 35 +++++++++++++++++++++++++----------
+ 1 file changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index 58d7f32..299b08f 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -77,18 +77,30 @@ int dm_npln_load(const char *path) {
+     return g_nrows;
+ }
+ 
+-// Where the row's bytes are in this image: the catalog counts the NSO header in, and whether the host's
+-// image starts at that header or after it is the loader's business, not the catalog's. The guard answers
+-// that by itself: the only offset that matches is the one the patch was made for.
++// Where the row's bytes are in this image. The catalog counts the NSO header in (the reference client keeps
++// one buffer with the header and the decompressed sections at their file offsets), but whether the host's
++// mapping starts at that header or after it is the loader's business. So the image origin is read off the
++// image itself: an NSO begins with "NSO0", and finding it tells us which of the two the base is.
+ static uint8_t *dm_npln_target(dm_npln_row *row, uint8_t *base, uint64_t size) {
+-    static const int guesses[2] = {0, 0x100};
+-    for (int i = 0; i < 2; i++) {
+-        uint64_t off = row->offset - (uint64_t)guesses[i];
+-        if (off + row->original_len > size) continue;
+-        if (base[off] == 0 && row->original[0] != 0 && off == 0) continue;
+-        if (!memcmp(base + off, row->original, row->original_len)) return base + off;
++    const uint64_t header = 0x100;
++    int includes_header = base && size > 4 && !memcmp(base, "NSO0", 4);
++    // Reading before the base is only safe when the loader put the patch area there (a negative patch_off).
++    int room_before = 0;
++    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { room_before = g_mod[i].patch_off <= -(int64_t)header; break; }
++    int starts_after = base && room_before && !memcmp(base - header, "NSO0", 4);
++    uint64_t off;
++    if (includes_header) off = row->offset;
++    else if (starts_after) off = row->offset - header;
++    else {
++        // Neither says "NSO0": keep the old pair as the fallback rather than refusing outright.
++        uint64_t a = row->offset, b = row->offset - header;
++        if (a + row->original_len <= size && !memcmp(base + a, row->original, row->original_len)) return base + a;
++        if (b + row->original_len <= size && !memcmp(base + b, row->original, row->original_len)) return base + b;
++        return NULL;
+     }
+-    return NULL;
++    if (off + row->original_len > size) return NULL;
++    if (memcmp(base + off, row->original, row->original_len)) return NULL;
++    return base + off;
+ }
+ 
+ // The catalog writes the build id in upper case and 64 characters long; the loader hands back the first
+@@ -115,6 +127,9 @@ int dm_npln_apply(uint64_t title_id) {
+     for (int i = 0; i < g_nmod; i++)
+         if (!strcmp(g_mod[i].name, "main")) { main_mod = &g_mod[i]; break; }
+     if (!main_mod || !main_mod->base) return 0;
++    LOG("[npln] main image at %p, size 0x%llx, %s", (void *)main_mod->base, (unsigned long long)main_mod->image_size,
++        !memcmp(main_mod->base, "NSO0", 4) ? "starts at the NSO header" :
++        (!memcmp(main_mod->base - 0x100, "NSO0", 4) ? "starts after the NSO header" : "no NSO0 magic found"));
+ 
+     int written = 0, known_build = 0;
+     for (int i = 0; i < g_nrows; i++) {
