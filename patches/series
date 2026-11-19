@@ -100,3 +100,4 @@
 0102-tools-the-catalog-signature-is-checked-in-plain.patch
 0103-tools-one-main-the-one-that-knows-apply.patch
 0104-tools-when-the-guard-is-absent-say-what-the-fold.patch
+0105-tools-the-guard-is-looked-for-with-and-without-t.patch

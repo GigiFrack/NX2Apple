@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 14:11:46 +0000
+Subject: [PATCH] tools: the guard is looked for with and without the NSO
+ header
+
+Upstream-Status: fork-only
+Reason: The catalog's offset counts the NSO header in, but the modules a build actually keeps are rewritten and often
+ header-less (main.patched.bin is 2196 bytes shorter than the mapped size), so the guard sat 0x100 earlier and the
+ search called a folder with the right file empty. Both positions are tried, in the file and in the scan, and the
+ line names the one that matched.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/tools/npln_catalog.py | 28 ++++++++++++++++++++--------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/dm/tools/npln_catalog.py b/dm/tools/npln_catalog.py
+index 60ff8ca..a50212c 100644
+--- a/dm/tools/npln_catalog.py
++++ b/dm/tools/npln_catalog.py
+@@ -25,6 +25,8 @@ from __future__ import annotations
+ 
+ import base64
+ 
++HEADER = 0x100   # the catalog counts the NSO header in; a rewritten module may not have it
++
+ import npln_ed25519   # the signature check, in plain Python: no openssl on a build PC
+ import json
+ import os
+@@ -88,15 +90,19 @@ def apply_file(path, title, patches):
+                 if not p.get("enabled") or p["title_id"] != title or p.get("module", "main") != "main":
+                     continue
+                 for guard in p.get("guards") or []:
+-                    at = int(guard["offset"])
+                     original = bytes.fromhex(guard["original_hex"])
+-                    if size <= at + len(original):
+-                        continue
+-                    with open(candidate, "rb") as f:
+-                        f.seek(at)
+-                        if f.read(len(original)) != original:
++                    hit = None
++                    for cand in (int(guard["offset"]), int(guard["offset"]) - HEADER):
++                        if cand < 0 or size <= cand + len(original):
+                             continue
+-                    print("  found it: %s" % candidate)
++                        with open(candidate, "rb") as f:
++                            f.seek(cand)
++                            if f.read(len(original)) == original:
++                                hit = cand
++                                break
++                    if hit is None:
++                        continue
++                    print("  found it: %s (guard at 0x%x)" % (candidate, hit))
+                     return apply_file(candidate, title, patches)
+         # Nothing matched. Say what is there instead of a bare no: the module is the file that is big enough to
+         # hold the offset at all, so list those with the four bytes found there. A different hex is a different
+@@ -127,9 +133,15 @@ def apply_file(path, title, patches):
+         for guard in p.get("guards") or []:
+             if p.get("module", "main") != "main":
+                 continue
+-            at = int(guard["offset"])
+             original = bytes.fromhex(guard["original_hex"])
+             patched = bytes.fromhex(guard["patched_hex"])
++            at = None
++            for cand in (int(guard["offset"]), int(guard["offset"]) - HEADER):
++                if cand >= 0 and bytes(data[cand:cand + len(original)]) == original:
++                    at = cand
++                    break
++            if at is None:
++                at = int(guard["offset"])
+             here = bytes(data[at:at + len(original)])
+             if here != original:
+                 print("  " + p.get("build_id", "")[:32] + " at 0x%x: guard is %s, expected %s - not this build, left alone"
