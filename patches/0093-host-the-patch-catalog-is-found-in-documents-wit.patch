@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 09:57:52 +0000
+Subject: [PATCH] host: the patch catalog is found in Documents without a path
+ in the env file
+
+Upstream-Status: fork-only
+Reason: The catalog file the player drops in Documents had to be named by an absolute path, which carries the
+ app's data container id: an id that changes on a reinstall, and one more thing to get wrong by hand. The
+ shell always sets DM_SAVE to <Documents>/games/<title>/save, so the catalog is looked for beside that,
+ one directory up, and DM_NPLN_PATCHES stays as an override.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/main.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/main.c b/dm/host/main.c
+index c123e10..ab1407a 100644
+--- a/dm/host/main.c
++++ b/dm/host/main.c
+@@ -122,8 +122,18 @@ static void host_preload(int argc, char **argv) {
+             dm_nd_reload();
+             {   // The game's own online gate, if the catalog covers this build: the guard bytes decide, so a
+                 // game version Nextendo has not prepared is left alone instead of being corrupted.
+-                const char *npln = getenv("DM_NPLN_PATCHES"), *app = getenv("DM_NEXTENDO_APP_ID");
+-                if (npln && *npln && app && *app) {
++                const char *app = getenv("DM_NEXTENDO_APP_ID");
++                static char derived[1024];
++                const char *npln = getenv("DM_NPLN_PATCHES");
++                if ((!npln || !*npln)) {
++                    // No path given: the catalog is a file the player drops in Documents, and DM_SAVE is the one
++                    // path the shell always sets (<Documents>/games/<title>/save). Cutting at /games/ keeps the
++                    // catalog out of reach of the container id, which changes on a reinstall.
++                    const char *save = getenv("DM_SAVE"), *at = save ? strstr(save, "/games/") : NULL;
++                    if (at && *at) snprintf(derived, sizeof derived, "%.*s/npln_patches.tsv", (int)(at - save), save);
++                    if (at && *at) npln = derived;
++                }
++                if (app && *app) {
+                     int dm_npln_apply_file(const char *, uint64_t);
+                     (void)dm_npln_apply_file(npln, strtoull(app, NULL, 16));
+                 }
