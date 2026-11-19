@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 15:19:18 +0000
+Subject: [PATCH] host: no proxy is an answer, not a failure
+
+Upstream-Status: fork-only
+Reason: A console on a plain network answers "no proxy" and a game accepts it; the host answered with a failure, which the
+ game reports as nifm's 0x2A2 in the library applet and then bounces out of online. With DM_NEXTENDO on the setting
+ is now zeroed and returned as success; offline it still fails, unchanged.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 1791666..4200cd0 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -51,7 +51,16 @@ HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "offlin
+     if (a) *a = 0;
+     return RES_FAIL;
+ }
+-HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting", Result, h_nifm_GetProxy, void *p) { dm_nd_trace_result("nifm::22GetCurrentProxySetting", -1); (void)p; dm_nd_trace_result("nifm::GetCurrentProxySetting(fail)", RES_FAIL); return RES_FAIL; }
++HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting; DM_NEXTENDO=1: a disabled proxy setting, which is an answer and not an error", Result, h_nifm_GetProxy, void *p) {
++    dm_nd_trace_result("nifm::22GetCurrentProxySetting", -1);
++    if (!dm_nd_enabled()) { dm_nd_trace_result("nifm::GetCurrentProxySetting(fail)", RES_FAIL); return RES_FAIL; }
++    // "No proxy" is what a console on a plain network reports, and a game treats the *failure* as a broken
++    // network (0x2A2, module 162, shown in the library applet). The structure starts with its enabled flag,
++    // and zero is a complete and truthful setting here: no proxy, no address, no credentials.
++    if (p) memset(p, 0, 0x100);
++    dm_nd_trace_result("nifm::GetCurrentProxySetting(none)", RES_OK);
++    return RES_OK;
++}
+ HLE_FORCE("nnsslInitialize", "connects to the ssl service; the network library's global init needs it to succeed, offline creates no session (cut)", Result, h_ssl_Initialize, void) { return RES_OK; }
+ HLE_FORCE("nnsslFinalize", "pairs with nnsslInitialize (cut)", Result, h_ssl_Finalize, void) { return RES_OK; }
+ 

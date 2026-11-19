@@ -103,3 +103,4 @@
 0105-tools-the-guard-is-looked-for-with-and-without-t.patch
 0106-host-every-nifm-and-account-call-says-its-name-a.patch
 0107-host-the-network-service-account-answers-success.patch
+0108-host-no-proxy-is-an-answer-not-a-failure.patch
