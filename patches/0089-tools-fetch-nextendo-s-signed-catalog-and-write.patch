@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 09:40:41 +0000
+Subject: [PATCH] tools: fetch Nextendo's signed catalog and write the patches
+ and versions the host needs
+
+Upstream-Status: fork-only
+Reason: Which version of a title Nextendo accepts is not guesswork and not a wiki page: it is a signed document
+ (service-catalog/v1/game-catalog), and the patches that open a game's own checks are another
+ (npln-patches), each carrying the bytes that must be there first. A client that patches a build it was
+ not meant for corrupts a game; a client that runs a version the servers refuse looks exactly like a
+ network failure. This tool verifies both signatures with the keys the reference clients ship and writes
+ one TSV, so the host never does HTTPS in C and never guesses a version.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/tools/npln_catalog.py | 107 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+ create mode 100644 dm/tools/npln_catalog.py
+
+diff --git a/dm/tools/npln_catalog.py b/dm/tools/npln_catalog.py
+new file mode 100644
+index 0000000..a77354b
+--- /dev/null
++++ b/dm/tools/npln_catalog.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++"""Fetch Nextendo's signed service catalog and write the game patches a portable build needs.
++
++Two documents matter to a client that did not write the games:
++
++  game-catalog      which version of each title Nextendo accepts ("exact" policy: neither older
++                    nor newer), and which protocol it speaks (nex or npln)
++  npln-patches      the IPS patches that open a game's own checks, with a guard per patch: the
++                    bytes that must be there before ours are written, so a patch is never applied
++                    to a build it was not made for
++
++Both are signed envelopes: {"key_id": ..., "payload": <base64>, "signature": <base64>} over the raw
++payload bytes. This tool verifies them with the public keys the reference clients ship (Citron's
++web_service/game_catalog.cpp and npln_patch_manifest.cpp, Ryujinx's NplnPatchCatalog.cs), because a
++catalog that is not signed by those keys is not a catalog to patch a game with.
++
++Output: a TSV the host loader reads instead of doing HTTPS in C:
++
++  P<tab>title_id<tab>game_version<tab>build_id<tab>module<tab>offset<tab>original_hex<tab>patched_hex
++  V<tab>title_id<tab>required_version<tab>protocol<tab>enabled
++
++Offsets are counted with the NSO header included (0x100 bytes), as the catalog states.
++"""
++from __future__ import annotations
++
++import base64
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import urllib.request
++
++BASE = "https://nextendo.network/service-catalog/v1"
++USER_AGENT = "NX2Apple/1.5 (Nextendo client)"
++
++# Raw Ed25519 public keys (32 bytes), as the reference clients carry them.
++KEYS = {
++    "npln-patches-key-1": "LAI+Pi+GZtj3p4DpNM5ORBraw1cbZCVSMFgUmAVWNeA=",
++    "catalog-key-1": "xI+atR6VesrCH89ZDZD4t3WQLcYOFEhk5F0HLMzgWk4=",
++}
++SPKI_ED25519 = bytes.fromhex("302a300506032b6570032100")
++
++
++def fetch(document: str) -> dict:
++    req = urllib.request.Request(f"{BASE}/{document}", headers={"User-Agent": USER_AGENT})
++    with urllib.request.urlopen(req, timeout=20) as r:
++        return json.loads(r.read())
++
++
++def b64(text: str) -> bytes:
++    text += "=" * (-len(text) % 4)
++    try:
++        return base64.urlsafe_b64decode(text)
++    except Exception:
++        return base64.b64decode(text)
++
++
++def verify(envelope: dict, key_id: str) -> bytes:
++    """Return the payload if its signature is good, raise otherwise."""
++    if envelope.get("key_id") != key_id:
++        raise SystemExit(f"catalog signed by {envelope.get('key_id')}, expected {key_id}")
++    payload, signature = b64(envelope["payload"]), b64(envelope["signature"])
++    with tempfile.TemporaryDirectory() as d:
++        der, pem, msg, sig = (os.path.join(d, n) for n in ("k.der", "k.pem", "m.bin", "s.bin"))
++        open(der, "wb").write(SPKI_ED25519 + base64.b64decode(KEYS[key_id]))
++        subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", der, "-pubin", "-out", pem],
++                       check=True, capture_output=True)
++        open(msg, "wb").write(payload)
++        open(sig, "wb").write(signature)
++        r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", pem, "-rawin",
++                            "-in", msg, "-sigfile", sig], capture_output=True, text=True)
++        if r.returncode != 0:
++            raise SystemExit(f"{key_id}: signature does not verify: {r.stdout}{r.stderr}".strip())
++    return payload
++
++
++def main() -> int:
++    out = sys.argv[1] if len(sys.argv) > 1 else "npln_patches.tsv"
++    games = json.loads(verify(fetch("game-catalog"), "catalog-key-1"))
++    patches = json.loads(verify(fetch("npln-patches"), "npln-patches-key-1"))
++
++    lines = []
++    for entry in games.get("games") or games.get("titles") or []:
++        for title in entry.get("title_ids") or []:
++            versions = entry.get("versions") or {}
++            accepted = versions.get("accepted") or ([versions["required"]] if versions.get("required") else [])
++            for version in accepted:
++                lines.append("\t".join(("V", title, version, entry.get("protocol", ""),
++                                        "1" if entry.get("enabled") else "0")))
++    for p in patches["patches"]:
++        if not p.get("enabled"):
++            continue
++        for guard in p.get("guards") or []:
++            lines.append("\t".join(("P", p["title_id"], p.get("game_version", ""),
++                                    p.get("build_id", ""), p.get("module", "main"),
++                                    str(guard["offset"]), guard["original_hex"], guard["patched_hex"])))
++    with open(out, "w") as f:
++        f.write("\n".join(lines) + "\n")
++    print(f"{out}: {sum(l.startswith('V') for l in lines)} versions, "
++          f"{sum(l.startswith('P') for l in lines)} patch guards "
++          f"(revisions game {games.get('revision')}, patches {patches.get('revision')})")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
