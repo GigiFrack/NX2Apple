@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 13:19:00 +0000
+Subject: [PATCH] host: the patch applier reads the loader's size, not the
+ patch-area-only field
+
+Upstream-Status: fork-only
+Reason: The applier bounded its search by struct module::image_size, which the loader fills only when the patch area
+ sits before the base; main's sits after it, so the limit was zero and every candidate was rejected before
+ a byte was read - the guard reported a mismatch it never checked for. The loader's own size is the bound,
+ and image_size still wins where it is filled.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index bedbf31..0f90f17 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -149,7 +149,9 @@ int dm_npln_apply(uint64_t title_id) {
+     for (int i = 0; i < g_nmod; i++)
+         if (!strcmp(g_mod[i].name, "main")) { main_mod = &g_mod[i]; break; }
+     if (!main_mod || !main_mod->base) return 0;
+-    LOG("[npln] main image at %p, size 0x%llx, %s", (void *)main_mod->base, (unsigned long long)main_mod->image_size,
++    // image_size is only filled when the patch area sits before the base; otherwise it is the loader's size.
++    const uint64_t image = main_mod->image_size ? main_mod->image_size : main_mod->size;
++    LOG("[npln] main image at %p, size 0x%llx, %s", (void *)main_mod->base, (unsigned long long)image,
+         !memcmp(main_mod->base, "NSO0", 4) ? "starts at the NSO header" :
+         (!memcmp(main_mod->base - 0x100, "NSO0", 4) ? "starts after the NSO header" : "no NSO0 magic found"));
+ 
+@@ -173,7 +175,7 @@ int dm_npln_apply(uint64_t title_id) {
+         if (strcmp(row->title, title)) continue;
+         if (build && *build && !dm_npln_same_build(row->build, build)) continue;   // another build: what the guard protects
+         known_build = 1;
+-        uint8_t *at = dm_npln_target(row, main_mod->base, main_mod->image_size);
++        uint8_t *at = dm_npln_target(row, main_mod->base, image);
+         if (!at) {
+             LOG("[npln] patch for %s at 0x%llx does not match this image (guard bytes differ): left alone",
+                 row->build, (unsigned long long)row->offset);
