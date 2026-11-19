@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 09:47:54 +0000
+Subject: [PATCH] ssl: the NPLN hosts get h2, NEX keeps the http/1.1 upgrade
+
+Upstream-Status: fork-only
+Reason: ALPN was forced to http/1.1 for every host, which is right for NEX (PRUDP over WebSocket needs the
+ HTTP/1.1 upgrade) and wrong for NPLN, whose front end is gRPC and mandates HTTP/2. The reference client
+ scopes the exception by host, on purpose by substring: the NPLN session transport is a second gRPC
+ endpoint whose SNI is gs.nintendo.net, with no npln in the name. Measured there: with http/1.1 the
+ handshake completes and then nothing moves, the front end answers 404 and the game rebuilds the
+ connection every ~3 s. Super Mario Party Jamboree is an NPLN title, so this is the difference between
+ reaching the hall and standing still.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_ssl.c | 32 +++++++++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index bd0c0c3..f1c7577 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -14,6 +14,25 @@
+ #include <CoreFoundation/CoreFoundation.h>   // CFString/CFArray for SSLSetALPNProtocols
+ #include "hle_ssl.h"
+ 
++// The ALPN name to offer for a host: h2 for the NPLN front end and its session transport, http/1.1 for
++// everything else (NEX). Case-insensitive substring, as the reference client matches on purpose.
++static const char *dm_nd_alpn_for(const char *host) {
++    if (!host || !*host) return "http/1.1";
++    for (const char *p = host; *p; p++) {
++        for (const char *w = "npln"; *w; w++) {
++            int i = 0;
++            while (w[i] && p[i] && (p[i] | 32) == w[i]) i++;
++            if (!w[i]) return "h2";
++        }
++        for (const char *w = "gs.nintendo.net"; *w; w++) {
++            int i = 0;
++            while (w[i] && p[i] && (p[i] | 32) == w[i]) i++;
++            if (!w[i]) return "h2";
++        }
++    }
++    return "http/1.1";
++}
++
+ // The guest's MSG_DONTWAIT, as hle_net.c's SK_MSG_DONTWAIT defines it for the socket service.
+ #define DM_SK_MSG_DONTWAIT 0x80
+ 
+@@ -162,12 +181,15 @@ static int dm_ssl_open(dm_ssl_conn *c) {
+     // (SslManagedSocketConnection.cs) and so does this, for redirected names only.
+     if (!c->verify || (dm_nd_enabled() && sni && *sni))
+         SSLSetSessionOption(c->st, kSSLSessionOptionBreakOnServerAuth, true);
+-    // ALPN http/1.1 only: NEX carries PRUDP over a WebSocket, which needs the HTTP/1.1 upgrade, and a
+-    // server that may pick h2 would never upgrade (the NPLN hosts want h2 and are a later step).
+-    // The array SecureTransport wants holds CFStrings, not CFData: given data it messages the element
+-    // with CFStringGetCString and the process aborts with an NSInvalidArgumentException.
++    // ALPN: http/1.1 by default, because NEX carries PRUDP over a WebSocket and a server that may pick h2
++    // would never upgrade. The NPLN front end is the opposite: it is gRPC, which mandates HTTP/2, and without
++    // h2 it reads our HTTP/1.1 request and answers 404 (the reference client measured exactly that, and the
++    // NPLN session transport is a second gRPC endpoint whose SNI is gs.nintendo.net, with no "npln" in it).
++    // So the choice is made per host, the same two names the reference client special-cases.
+     if (dm_nd_enabled()) {
+-        CFStringRef proto = CFStringCreateWithCString(NULL, "http/1.1", kCFStringEncodingUTF8);
++        // The array SecureTransport wants holds CFStrings, not CFData: given data it messages the element
++        // with CFStringGetCString and the process aborts with an NSInvalidArgumentException.
++        CFStringRef proto = CFStringCreateWithCString(NULL, dm_nd_alpn_for(sni), kCFStringEncodingUTF8);
+         if (proto) {
+             const void *one[] = {proto};
+             CFArrayRef list = CFArrayCreate(NULL, one, 1, &kCFTypeArrayCallBacks);

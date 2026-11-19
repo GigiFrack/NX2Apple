@@ -85,3 +85,4 @@
 0087-host-with-a-nextendo-token-the-parental-controls.patch
 0088-host-dm-hlecount-writes-the-table-while-the-game.patch
 0089-tools-fetch-nextendo-s-signed-catalog-and-write.patch
+0090-ssl-the-npln-hosts-get-h2-nex-keeps-the-http-1-1.patch
