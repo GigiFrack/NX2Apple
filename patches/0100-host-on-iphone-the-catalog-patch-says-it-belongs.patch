@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 13:52:05 +0000
+Subject: [PATCH] host: on iPhone the catalog patch says it belongs in the
+ built binary
+
+Upstream-Status: fork-only
+Reason: A runtime write into main's code is not possible on iPhone: the app's pages are signed, so the kernel accepts the
+ write and kills the process with CODESIGNING / Invalid Page the moment the game executes that page again (seen in
+ an .ips at main+0xad1ae0, the same page the patch had touched). The engine's own writable alias is built only off
+ iPhone for exactly this reason. On iPhone the applier now says the patch belongs in the built binary instead of
+ writing, so the run is unchanged and nothing crashes.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index d40cd42..8682339 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -206,6 +206,14 @@ int dm_npln_apply(uint64_t title_id) {
+                 row->build, (unsigned long long)row->offset);
+             continue;
+         }
++#if TARGET_OS_IPHONE
++        // On iPhone the app's pages are signed: a write is accepted and then the process is killed the moment the
++        // game executes that page again (CODESIGNING / "Invalid Page"). The engine's own writable alias is built
++        // only off iPhone for the same reason. The catalog patch therefore belongs in the binary before signing.
++        LOG("[npln] patch for %s at 0x%llx belongs in the built binary: on iPhone the code pages are signed",
++            row->build, (unsigned long long)row->offset);
++        continue;
++#else
+         if (!dm_page_writable(at, row->patched_len)) {
+             LOG("[npln] patch for %s at 0x%llx: the image refuses to be written, left alone",
+                 row->build, (unsigned long long)row->offset);
+@@ -214,6 +222,7 @@ int dm_npln_apply(uint64_t title_id) {
+         memcpy(at, row->patched, row->patched_len);
+         dm_page_code_again(at, row->patched_len);
+         written++;
++#endif
+         LOG("[npln] patched %s at 0x%llx (%zu bytes)", row->build, (unsigned long long)row->offset, row->patched_len);
+     }
+     if (!known_build && g_nrows)
