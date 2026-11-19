@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 13:59:23 +0000
+Subject: [PATCH] tools: the catalog signature is checked in plain Python, no
+ openssl on the build PC
+
+Upstream-Status: fork-only
+Reason: The catalog tool shelled out to openssl to check the two Ed25519 envelopes, so it could not run on the Windows build
+ PC at all (WinError 2). The check is now RFC 8032 arithmetic in plain Python, in its own module: a signature made
+ by openssl verifies, a tampered message does not, and the real catalog documents still produce the same 69
+ versions and 61 guards.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/tools/npln_catalog.py | 20 +++--------
+ dm/tools/npln_ed25519.py | 74 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 15 deletions(-)
+ create mode 100644 dm/tools/npln_ed25519.py
+
+diff --git a/dm/tools/npln_catalog.py b/dm/tools/npln_catalog.py
+index 4c58caa..d316825 100644
+--- a/dm/tools/npln_catalog.py
++++ b/dm/tools/npln_catalog.py
+@@ -24,6 +24,8 @@ Offsets are counted with the NSO header included (0x100 bytes), as the catalog s
+ from __future__ import annotations
+ 
+ import base64
++
++import npln_ed25519   # the signature check, in plain Python: no openssl on a build PC
+ import json
+ import os
+ import subprocess
+@@ -59,24 +61,12 @@ def b64(text: str) -> bytes:
+ def verify(envelope: dict, key_id: str) -> bytes:
+     """Return the payload if its signature is good, raise otherwise."""
+     if envelope.get("key_id") != key_id:
+-        raise SystemExit(f"catalog signed by {envelope.get('key_id')}, expected {key_id}")
++        raise SystemExit("catalog signed by %s, expected %s" % (envelope.get("key_id"), key_id))
+     payload, signature = b64(envelope["payload"]), b64(envelope["signature"])
+-    with tempfile.TemporaryDirectory() as d:
+-        der, pem, msg, sig = (os.path.join(d, n) for n in ("k.der", "k.pem", "m.bin", "s.bin"))
+-        open(der, "wb").write(SPKI_ED25519 + base64.b64decode(KEYS[key_id]))
+-        subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", der, "-pubin", "-out", pem],
+-                       check=True, capture_output=True)
+-        open(msg, "wb").write(payload)
+-        open(sig, "wb").write(signature)
+-        r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", pem, "-rawin",
+-                            "-in", msg, "-sigfile", sig], capture_output=True, text=True)
+-        if r.returncode != 0:
+-            raise SystemExit(f"{key_id}: signature does not verify: {r.stdout}{r.stderr}".strip())
++    if not npln_ed25519.verify(base64.b64decode(KEYS[key_id]), payload, signature):
++        raise SystemExit(key_id + ": signature does not verify")
+     return payload
+ 
+-HEADER = 0x100   # the catalog counts the NSO header in, and so does the file: in the file the byte is at its offset
+-
+-
+ def apply_file(path, title, patches):
+     # Write the catalog's patches into a main NSO on disk, before it is signed or built into an app. On iPhone
+     # there is no runtime version of this: the app's code pages are signed, so a write there is accepted and the
+diff --git a/dm/tools/npln_ed25519.py b/dm/tools/npln_ed25519.py
+new file mode 100644
+index 0000000..17f370e
+--- /dev/null
++++ b/dm/tools/npln_ed25519.py
+@@ -0,0 +1,74 @@
++
++"""Ed25519 verification for the catalog envelopes, in plain Python (no openssl).
++
++The signatures are detached Ed25519 over the raw payload, made by the keys the reference clients ship. The
++arithmetic is RFC 8032's: points in extended coordinates, the curve's own d, the order of the base point.
++"""
++import hashlib
++
++P = 2 ** 255 - 19
++D = -121665 * pow(121666, P - 2, P) % P
++I = pow(2, (P - 1) // 4, P)
++L = 2 ** 252 + 27742317777372353535851937790883648493
++BX = 15112221349535400772501151409588531511454012693041857206046113283949847762202
++BY = 46316835694926478169428394003475163141307993866256225615783033603165251855960
++B = (BX, BY, 1, BX * BY % P)
++
++
++def _add(a, b):
++    x1, y1, z1, t1 = a
++    x2, y2, z2, t2 = b
++    A = (y1 - x1) * (y2 - x2) % P
++    Bv = (y1 + x1) * (y2 + x2) % P
++    C = t1 * 2 * D * t2 % P
++    Dv = z1 * 2 * z2 % P
++    E, F, G, H = Bv - A, Dv - C, Dv + C, Bv + A
++    return (E * F % P, G * H % P, F * G % P, E * H % P)
++
++
++def _mul(s, pt):
++    q = (0, 1, 1, 0)
++    while s:
++        if s & 1:
++            q = _add(q, pt)
++        pt = _add(pt, pt)
++        s >>= 1
++    return q
++
++
++def _norm(pt):
++    x, y, z, _ = pt
++    zi = pow(z, P - 2, P)
++    return (x * zi % P, y * zi % P)
++
++
++def _decode(data):
++    if len(data) != 32:
++        return None
++    y = int.from_bytes(data, "little") & ((1 << 255) - 1)
++    sign = data[31] >> 7
++    if y >= P:
++        return None
++    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
++    x = pow(x2, (P + 3) // 8, P)
++    if (x * x - x2) % P:
++        x = x * I % P
++    if (x * x - x2) % P:
++        return None
++    if (x & 1) != sign:
++        x = P - x
++    return (x, y, 1, x * y % P)
++
++
++def verify(public, message, signature):
++    if len(public) != 32 or len(signature) != 64:
++        return False
++    a = _decode(public)
++    r = _decode(signature[:32])
++    if a is None or r is None:
++        return False
++    s = int.from_bytes(signature[32:], "little")
++    if s >= L:
++        return False
++    h = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little") % L
++    return _norm(_mul(s, B)) == _norm(_add(r, _mul(h, a)))
