@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Thu, 19 Nov 2026 14:06:35 +0000
+Subject: [PATCH] tools: when the guard is absent, say what the folder holds
+ instead
+
+Upstream-Status: fork-only
+Reason: A folder that holds no patchable module answered with a bare no, which says nothing about why: the romfs alone,
+ another build, or the wrong folder. The search now reports every file large enough to hold the guard's offset
+ together with the four bytes found there, so a different build is named by its bytes and a folder without a
+ program says so.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/tools/npln_catalog.py | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/npln_catalog.py b/dm/tools/npln_catalog.py
+index 6b58824..60ff8ca 100644
+--- a/dm/tools/npln_catalog.py
++++ b/dm/tools/npln_catalog.py
+@@ -98,7 +98,26 @@ def apply_file(path, title, patches):
+                             continue
+                     print("  found it: %s" % candidate)
+                     return apply_file(candidate, title, patches)
+-        print("  no file in %s carries the guard of this title: is the game extracted?" % path)
++        # Nothing matched. Say what is there instead of a bare no: the module is the file that is big enough to
++        # hold the offset at all, so list those with the four bytes found there. A different hex is a different
++        # build; nothing at all means the folder holds the romfs and the program lives elsewhere.
++        print("  no file in %s carries the guard of this title" % path)
++        at = max((int(g["offset"]) for p in patches["patches"] if p.get("enabled") and p["title_id"] == title
++                  for g in (p.get("guards") or [])), default=0)
++        seen = 0
++        for candidate in targets:
++            try:
++                size = os.path.getsize(candidate)
++            except OSError:
++                continue
++            if at and size > at + 4:
++                with open(candidate, "rb") as f:
++                    f.seek(at)
++                    here = f.read(4).hex()
++                print("    %12d bytes  at 0x%x: %s  %s" % (size, at, here, candidate))
++                seen += 1
++        if not seen:
++            print("    no file is large enough to hold offset 0x%x: this folder has no program in it" % at)
+         return 0
+     data = bytearray(open(path, "rb").read())
+     written = 0

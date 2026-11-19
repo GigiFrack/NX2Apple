@@ -99,3 +99,4 @@
 0101-tools-the-catalog-patch-goes-into-the-binary-whe.patch
 0102-tools-the-catalog-signature-is-checked-in-plain.patch
 0103-tools-one-main-the-one-that-knows-apply.patch
+0104-tools-when-the-guard-is-absent-say-what-the-fold.patch
