@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 09:35:03 +0000
+Subject: [PATCH] host: the id token is answered once, for both the length and
+ the copy
+
+Upstream-Status: fork-only
+Reason: LoadNetworkServiceAccountIdTokenCache takes (n, buf, sz): the caller asks once with buf null for the
+ length and then with a buffer of that length. The length query skipped the token builder and fell through
+ to the dauth chain, which has no token to give when the identity comes from a game token, so it answered
+ RES_FAIL with *n = 0. The game read "zero bytes" as "this account cannot go online" and raised its own
+ 0x2A2 network error before any name was resolved (no [gai] line in the log at all). The token is now built
+ once and kept, so the length and the copy describe the same bytes, and a size query answers RES_OK.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_account.c | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/dm/host/hle_account.c b/dm/host/hle_account.c
+index a313437..4f87a25 100644
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -95,19 +95,38 @@ HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccou
+     if (id) *(uint64_t *)id = v;
+     return RES_OK;
+ }
++// The id_token handed to a game, built once and kept: the caller asks twice (with `buf` null for the
++// length, then with a buffer of that length) and both answers must describe the same bytes. The
++// builder signs a fresh JWT on every call, so asking it twice would hand the game a length that
++// belongs to a token it never sees.
++static char g_idtok[8192];
++static size_t g_idtok_len;
++static int g_idtok_tried;
++
++static size_t id_token(void) {
++    if (!g_idtok_tried) { g_idtok_len = dm_idtoken_for_game(g_idtok, sizeof g_idtok); g_idtok_tried = 1; }
++    return g_idtok_len;
++}
++
+ HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "the application auth token (DM_NEXTENDO=1); cut otherwise", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) { dm_nd_trace_result("account::37LoadNetworkServiceAccountIdTokenCache", -1);
+     (void)h;
+     if (!dm_nd_enabled()) { if (n) *n = 0; return RES_FAIL; }
+     // This is the call a game makes to get the id_token it forwards as its NEX login
+-    // (`LoadIdTokenCache` in the reference client). With a game token in the environment the answer
+-    // is the signed BAAS JWT, whose `nnex` claim is what the server accepts; the dauth chain below
+-    // answered the older, tokenless path.
+-    if (buf && sz) {
+-        size_t got = dm_idtoken_for_game(buf, (size_t)sz);
+-        if (got) { if (n) *n = got; return RES_OK; }
++    // (`LoadIdTokenCache` in the reference client). The length query used to fall through to the
++    // dauth chain, which has no token to give and answered RES_FAIL with 0: the game took "zero
++    // bytes" for "no online account" and gave up with 0x2A2 before it ever resolved a name.
++    size_t len = id_token();
++    if (len) {
++        if (n) *n = (uint64_t)len;
++        if (!buf || !sz) { dm_nd_trace_result("account::LoadIdTokenCache(size)", RES_OK); return RES_OK; }
++        if (sz < len) { dm_nd_trace_result("account::LoadIdTokenCache(too small)", RES_FAIL); return RES_FAIL; }
++        memcpy(buf, g_idtok, len);
++        dm_nd_trace_result("account::LoadIdTokenCache(jwt)", RES_OK);
++        return RES_OK;
+     }
++    // No game token in the environment: the dauth chain's answer, as before.
+     uint64_t size = sz;
+-    if (dm_acc_nsa_token(buf, &size)) { if (n) *n = size; return RES_FAIL; }
++    if (dm_acc_nsa_token(buf, &size)) { if (n) *n = size; dm_nd_trace_result("account::LoadIdTokenCache(chain)", RES_FAIL); return RES_FAIL; }
+     if (n) *n = size;
+     return RES_OK;
+ }
