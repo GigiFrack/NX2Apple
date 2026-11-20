@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 16:02:41 +0000
+Subject: [PATCH] host: the built-in CA store answers with the certificate a
+ title asks for
+
+An empty store is not something a title walks past: Super Mario Party Jamboree asks for
+NintendoCAG3 (CaCertificateId 1) as soon as it has a name for the NPLN front end, and an
+empty answer is err::ShowError 0x270141 with not one nnsocketSocket in the trace - it gives
+up before it opens a connection.
+
+The store now holds one certificate for that id, in the layout the SDK walks: the entry, the
+terminating entry (id All), then the DER data, every der_offset counted from the start of the
+buffer, and the whole thing 4-byte aligned as the service does.
+
+The DER is Nintendo's own certificate and we neither have it nor can ship it, so there are two
+sources, in this order: <game data>/certs/1.der, which is where a user can drop what came out of
+their console CertStore title (0100000000000800), and a stand-in generated here. The peer is
+never validated against either - the handshake runs on SecureTransport, with verification
+skipped for the redirected hosts - so the list is what makes a title start, not what decides
+whether the connection is good.
+
+Both spellings of the entry (BuiltInCertificateInfo and SDK 17 BuiltInCertificateInfoBase)
+fill the store from the same code, and t_ssl_certs pins the layout, the terminator, the unknown
+id, the file that wins and the offline failure.
+
+Upstream-Status: fork-only
+Reason: The console keeps its CA store in the CertStore system title (0100000000000800), which this host does not
+ have and cannot ship, and an empty answer is not something a title walks past: Super Mario Party Jamboree asks
+ for NintendoCAG3 (CaCertificateId 1) the moment it has a name for the NPLN front end, and reports
+ err::ShowError 0x270141 without opening a single socket. The store now answers with one certificate, in the
+ layout the SDK walks: the entry, the terminating entry (id All), then the DER data, every offset counted from
+ the start of the buffer. The DER comes from <game data>/certs/1.der when the user dropped their own console's
+ there, and from a built-in stand-in otherwise. Nothing validates a peer against this list - the handshake is
+ SecureTransport's, with verification skipped for the redirected hosts - so the list is what lets a title start,
+ not what decides whether the connection is good.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_offline.c       |  22 ++--
+ dm/host/hle_ssl.c           |  41 ++++---
+ dm/host/hle_ssl_ca.h        | 219 ++++++++++++++++++++++++++++++++++++
+ dm/host/tests/Makefile      |   6 +
+ dm/host/tests/t_ssl_certs.c | 138 +++++++++++++++++++++++
+ 5 files changed, 395 insertions(+), 31 deletions(-)
+ create mode 100644 dm/host/hle_ssl_ca.h
+ create mode 100644 dm/host/tests/t_ssl_certs.c
+
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 3733d97..b4f0c6c 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -5,6 +5,7 @@
+ #include "hle_net.h"
+ #include "hle_nextendo.h"
+ #include "hle_ssl.h"
++#include "hle_ssl_ca.h"     // the built-in CA store, shared with hle_ssl.c
+ 
+ static _Alignas(16) uint8_t g_ev_ldn[0x100];
+ 
+@@ -125,16 +126,19 @@ HLE_FORCE("_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferP
+ HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "a client certificate the game brings: needed only where the server asks for one", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)a; (void)b; (void)x; (void)y; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "a server CA the game brings: the system roots are what SecureTransport verifies against", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) { (void)a; (void)n; (void)f; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL (cut)", Result, h_ssl_ImpCrl, void *self, uint64_t *id, const char *a, unsigned n) { (void)self; (void)a; (void)n; if (id) *id = 0; return RES_FAIL; }
+-// SDK 17's spelling of the same question (the certificate list is a base class there). Same answer: an empty
+-// store is legal, and the peer is verified by the host's TLS layer, not against this list.
+-HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "the built-in certificate store is empty (the peer is verified by the host's TLS layer)", Result, h_ssl_Certs,
+-          void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) { (void)bn; (void)ids; (void)n;
++// SDK 17's spelling of the same question (the certificate list is a base class there): the same store, filled by
++// the same code as hle_ssl.c's entry (hle_ssl_ca.h). Offline it is a failure, exactly as before.
++HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "the built-in CA store: a stand-in for NintendoCAG3, or <game data>/certs/1.der when the user dropped the real one", Result, h_ssl_Certs,
++          void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) {
+     if (!dm_nd_enabled()) { if (out) *out = NULL; return RES_FAIL; }
+-    if (buf && bn >= 0x18) { uint32_t *e = (uint32_t *)buf;
+-        e[0] = 0xffffffffu; e[1] = 0xffffffffu; memset(buf + 8, 0, 0x10); if (out) *out = (void *)buf; }
+-    else if (out) *out = NULL;
+-    { char t[96]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(SDK 17, buf=%p size=%u ids=%u) -> terminator", (void *)buf, bn, n);
+-      dm_nd_trace_result(t, 0); } return RES_OK; }
++    unsigned entries = 0; size_t der = 0; int file = 0;
++    size_t size = dm_ssl_ca_build((const unsigned *)ids, n, buf, bn, &entries, &der, &file);
++    if (out) *out = size ? (void *)buf : NULL;
++    { char t[152]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(SDK 17, buf=%p size=%u ids=%u) -> %u certificate(s), der %zu %s",
++                             (void *)buf, bn, n, entries, der, file ? "from certs/<id>.der" : "built-in");
++      dm_nd_trace_result(t, (long long)entries); }
++    return size ? RES_OK : RES_FAIL;
++}
+ 
+ // ---------- nifm / nsd: offline ----------
+ HLE_FORCE("_ZN2nn4nifm19SetLocalNetworkModeEb", "offline: the local network mode switch is ignored", void, h_nifm_LocalMode, unsigned on) { (void)on; }
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 6a39b5c..2ece45e 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -13,6 +13,7 @@
+ #include "hle_nextendo.h"
+ #include <CoreFoundation/CoreFoundation.h>   // CFString/CFArray for SSLSetALPNProtocols
+ #include "hle_ssl.h"
++#include "hle_ssl_ca.h"     // the built-in CA store both spellings of the entry answer with
+ 
+ // The ALPN name to offer for a host: h2 for the NPLN front end and its session transport, http/1.1 for
+ // everything else (NEX). Case-insensitive substring, as the reference client matches on purpose.
+@@ -73,33 +74,29 @@ HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create", Result, h_ssl_Ctx
+ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
+ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
+ // The console's built-in CA store is a system title (0100000000000800) that the host does not have and cannot
+-// ship, and an empty store is a legal answer: nothing to import. It costs the game nothing, because the peer's
+-// chain is never checked against this store - the handshake runs on SecureTransport and verification is decided
+-// there. Reporting failure instead is what stops a title before it opens the connection: Super Mario Party
+-// Jamboree asks for the store, reads the failure, and reports 0x270141 without sending a byte.
+-// An empty store still needs its terminator entry: the caller walks the list until the certificate id is -1,
+-// so handing it a zero-length buffer means it walks uninitialised memory (Super Mario Party Jamboree formats a
+-// line from that walk and dies on sig=11). 0x18 bytes, all ones in the first word so the id reads -1 whichever
+-// half the caller looks at, the sizes zero.
+-#define DM_SSL_TERM_WORD 0xffffffffu
++// ship, so the store answers with one certificate: a stand-in for NintendoCAG3, or the real one when the user
++// dropped it in <game data>/certs/1.der (hle_ssl_ca.h has the layout and why). What the store decides is
++// whether a title starts at all: Super Mario Party Jamboree asks for it as soon as it has a name for the NPLN
++// front end, and an empty answer stops it before it opens a socket (err::ShowError 0x270141, and not one
++// nnsocketSocket in the trace). The chain a game reads here is never what decides the handshake - that one
++// runs on SecureTransport, with verification skipped for the redirected hosts.
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) {
+     if (!dm_nd_enabled()) { if (o) *o = 0; return RES_FAIL; }
+-    if (o) *o = 0x18;                                // one terminator entry, no certificates
+-    { char t[96]; snprintf(t, sizeof t, "ssl::BuiltInCertificateBufSize(ids=%u first=0x%x) -> 0x18", n, n && ids ? ((const uint32_t *)ids)[0] : 0u);
+-      dm_nd_trace_result(t, 0x18); }
++    size_t size = dm_ssl_ca_size((const unsigned *)ids, n);
++    if (o) *o = (uint32_t)size;
++    { char t[112]; snprintf(t, sizeof t, "ssl::BuiltInCertificateBufSize(ids=%u first=0x%x) -> %zu", n, n && ids ? ((const uint32_t *)ids)[0] : 0u, size);
++      dm_nd_trace_result(t, (long long)size); }
+     return RES_OK;
+ }
+ SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) {
+-    if (!dm_nd_enabled()) return RES_FAIL;
+-    if (b && bs >= 0x18) {
+-        uint32_t *e = (uint32_t *)b;
+-        e[0] = DM_SSL_TERM_WORD; e[1] = DM_SSL_TERM_WORD;   // id -1, status invalid: the walk stops here
+-        memset(b + 8, 0, 0x10);                             // no DER data
+-        if (o) *o = b;
+-    } else if (o) *o = NULL;
+-    { char t[96]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(buf=%p size=%u ids=%u) -> terminator", (void *)b, bs, n);
+-      dm_nd_trace_result(t, 0); }
+-    return RES_OK;
++    if (!dm_nd_enabled()) { if (o) *o = NULL; return RES_FAIL; }
++    unsigned entries = 0; size_t der = 0; int file = 0;
++    size_t size = dm_ssl_ca_build((const unsigned *)ids, n, b, bs, &entries, &der, &file);
++    if (o) *o = size ? (void *)b : NULL;
++    { char t[144]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(buf=%p size=%u ids=%u) -> %u certificate(s), der %zu %s",
++                             (void *)b, bs, n, entries, der, file ? "from certs/<id>.der" : "built-in");
++      dm_nd_trace_result(t, (long long)entries); }
++    return size ? RES_OK : RES_FAIL;
+ }
+ SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) {
+     if (!dm_nd_enabled()) return RES_FAIL;
+diff --git a/dm/host/hle_ssl_ca.h b/dm/host/hle_ssl_ca.h
+new file mode 100644
+index 0000000..4e9a740
+--- /dev/null
++++ b/dm/host/hle_ssl_ca.h
+@@ -0,0 +1,219 @@
++// The built-in CA store that nn::ssl::BuiltInManager answers with: the layout the SDK walks, and the one
++// certificate a title asks for by id.
++//
++// On the console the certificates live in the CertStore system title (0100000000000800). This host has
++// neither the title nor the right to ship it, and the peer it talks to is not the console's either: the
++// Nextendo servers answer every name with a self-signed certificate of their own (openssl s_client against
++// nex.nextendo.network says so), so no root in the world validates them. The chain a game collects here is
++// therefore never what decides the handshake - hle_ssl.c hands the connection to SecureTransport and skips
++// its verification for the redirected hosts.
++//
++// What the list does decide is whether a title starts at all. Super Mario Party Jamboree asks for
++// NintendoCAG3 (CaCertificateId 1) as soon as it has a name for the NPLN front end, and an empty answer
++// stops it before it opens a socket: err::ShowError 0x270141, and not one nnsocketSocket in the trace.
++//
++// The answer is an array of BuiltInCertificateInfo (0x18 bytes: id, status, der_size, der_offset) closed by
++// the terminator entry (id All = -1), with the DER data behind the table and every der_offset counted from
++// the start of the buffer.
++//
++// Two sources, in this order:
++//   <game data>/certs/<id>.der   a certificate the user dropped there (their own console's store, out of
++//                               0100000000000800) - it wins, so the real one can be used without a build
++//   this file                    a stand-in for NintendoCAG3, generated here and self-signed
++//
++// The stand-in carries Nintendo's subject name so that a title matching on the name still matches, but the
++// key is ours: nothing signs with it and nothing but this build trusts it.
++#pragma once
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define DM_SSL_CA_ALL      0xffffffffu   // CaCertificateId::All, the terminator's id: every certificate
++#define DM_SSL_CA_NINTENDO 1u            // CaCertificateId::NintendoCAG3, the one every title asks for
++#define DM_SSL_CA_INFO     0x18u         // sizeof(BuiltInCertificateInfo)
++#define DM_SSL_CA_TRUSTED  1u            // TrustedCertStatus::EnabledTrusted
++#define DM_SSL_CA_MAX      8192u         // the most a <id>.der may weigh
++
++static const unsigned char dm_ssl_ca_builtin[] = {
++    0x30, 0x82, 0x03, 0x4d, 0x30, 0x82, 0x02, 0x35, 0xa0, 0x03, 0x02, 0x01,
++    0x02, 0x02, 0x14, 0x3e, 0x5a, 0x93, 0x1b, 0x52, 0xb4, 0x72, 0x96, 0x42,
++    0x97, 0x02, 0xbd, 0xc5, 0x15, 0xa5, 0x41, 0x44, 0x4f, 0xf9, 0x05, 0x30,
++    0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b,
++    0x05, 0x00, 0x30, 0x2e, 0x31, 0x19, 0x30, 0x17, 0x06, 0x03, 0x55, 0x04,
++    0x03, 0x0c, 0x10, 0x4e, 0x69, 0x6e, 0x74, 0x65, 0x6e, 0x64, 0x6f, 0x20,
++    0x43, 0x41, 0x20, 0x2d, 0x20, 0x47, 0x33, 0x31, 0x11, 0x30, 0x0f, 0x06,
++    0x03, 0x55, 0x04, 0x0a, 0x0c, 0x08, 0x4e, 0x69, 0x6e, 0x74, 0x65, 0x6e,
++    0x64, 0x6f, 0x30, 0x1e, 0x17, 0x0d, 0x32, 0x36, 0x31, 0x31, 0x32, 0x30,
++    0x31, 0x35, 0x35, 0x35, 0x34, 0x34, 0x5a, 0x17, 0x0d, 0x34, 0x36, 0x31,
++    0x31, 0x31, 0x35, 0x31, 0x35, 0x35, 0x35, 0x34, 0x34, 0x5a, 0x30, 0x2e,
++    0x31, 0x19, 0x30, 0x17, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x10, 0x4e,
++    0x69, 0x6e, 0x74, 0x65, 0x6e, 0x64, 0x6f, 0x20, 0x43, 0x41, 0x20, 0x2d,
++    0x20, 0x47, 0x33, 0x31, 0x11, 0x30, 0x0f, 0x06, 0x03, 0x55, 0x04, 0x0a,
++    0x0c, 0x08, 0x4e, 0x69, 0x6e, 0x74, 0x65, 0x6e, 0x64, 0x6f, 0x30, 0x82,
++    0x01, 0x22, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d,
++    0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0f, 0x00, 0x30, 0x82,
++    0x01, 0x0a, 0x02, 0x82, 0x01, 0x01, 0x00, 0xd2, 0xb8, 0x7a, 0xfa, 0xb5,
++    0x5f, 0x93, 0xcd, 0xbb, 0xf1, 0x70, 0x97, 0xc7, 0xe1, 0x1e, 0x0e, 0x2c,
++    0x7e, 0xd9, 0x6c, 0x3e, 0x13, 0xb3, 0x90, 0xb6, 0x34, 0xe2, 0xa7, 0x97,
++    0x71, 0x2f, 0xe3, 0x7d, 0x34, 0xf8, 0xd9, 0x0f, 0xe3, 0xee, 0xdf, 0x2f,
++    0x8f, 0x85, 0xc5, 0x4a, 0x85, 0x17, 0xf8, 0xfb, 0x1b, 0x91, 0x86, 0xc0,
++    0x3f, 0xce, 0xfe, 0x44, 0x72, 0x87, 0xd8, 0x64, 0xa4, 0x6f, 0xba, 0x4d,
++    0x0a, 0xc5, 0xd8, 0xf8, 0x9d, 0xe2, 0x84, 0xfa, 0xc4, 0xac, 0x1e, 0xd9,
++    0xb5, 0x23, 0xbf, 0xdd, 0xed, 0xbe, 0xb1, 0x66, 0x94, 0xc2, 0x48, 0xa8,
++    0xcc, 0x46, 0x41, 0x36, 0xb8, 0xdd, 0x24, 0x04, 0x13, 0x04, 0xea, 0xa3,
++    0xe6, 0xec, 0xa4, 0x17, 0xf2, 0x8a, 0x11, 0xfb, 0x1d, 0x3e, 0xb5, 0x75,
++    0x3b, 0x8c, 0x08, 0x36, 0x76, 0x61, 0x28, 0xd5, 0x1b, 0xa6, 0x13, 0xa9,
++    0x49, 0xca, 0xe6, 0xc4, 0xdf, 0x73, 0xb4, 0xb3, 0xde, 0x6e, 0x7b, 0x61,
++    0xd9, 0xea, 0x72, 0x61, 0xa1, 0xdd, 0xc9, 0xb3, 0xae, 0x27, 0x8c, 0xa7,
++    0x03, 0x65, 0xd7, 0xce, 0x65, 0xf4, 0x0c, 0xb8, 0x77, 0x66, 0x6a, 0x60,
++    0x38, 0x17, 0xf2, 0x06, 0x4a, 0xbb, 0xa9, 0x2e, 0xbc, 0x41, 0xbb, 0xdf,
++    0x1e, 0xd8, 0x19, 0x54, 0x91, 0xe8, 0x37, 0x4b, 0x08, 0x72, 0x8c, 0x72,
++    0xa4, 0x01, 0x17, 0xab, 0xda, 0xe4, 0xfa, 0xf0, 0xfc, 0xc4, 0x35, 0x8f,
++    0xc9, 0xad, 0xc3, 0x1f, 0x3d, 0xb5, 0xa2, 0x1e, 0x93, 0x75, 0x9a, 0x26,
++    0xd7, 0x6a, 0x9a, 0xa1, 0x2c, 0xaa, 0xd1, 0xbd, 0x89, 0xe6, 0xc7, 0x78,
++    0x15, 0x17, 0xd4, 0xb6, 0x2e, 0xb2, 0x41, 0xa6, 0x68, 0x2c, 0xcd, 0xd8,
++    0x3e, 0xc0, 0x85, 0x1e, 0xd2, 0x28, 0x51, 0x0c, 0x19, 0x9d, 0x00, 0xdf,
++    0x02, 0xbc, 0x36, 0xa1, 0x97, 0xe1, 0x22, 0x0c, 0xdb, 0x85, 0x7b, 0x02,
++    0x03, 0x01, 0x00, 0x01, 0xa3, 0x63, 0x30, 0x61, 0x30, 0x1f, 0x06, 0x03,
++    0x55, 0x1d, 0x23, 0x04, 0x18, 0x30, 0x16, 0x80, 0x14, 0xb3, 0xe3, 0xe8,
++    0xd6, 0xa2, 0x2c, 0x1d, 0xc0, 0x85, 0xea, 0x38, 0xb8, 0x28, 0x12, 0x33,
++    0xf8, 0x06, 0x76, 0x1b, 0xd3, 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13,
++    0x01, 0x01, 0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0xff, 0x30, 0x0e,
++    0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01, 0xff, 0x04, 0x04, 0x03, 0x02,
++    0x01, 0x06, 0x30, 0x1d, 0x06, 0x03, 0x55, 0x1d, 0x0e, 0x04, 0x16, 0x04,
++    0x14, 0xb3, 0xe3, 0xe8, 0xd6, 0xa2, 0x2c, 0x1d, 0xc0, 0x85, 0xea, 0x38,
++    0xb8, 0x28, 0x12, 0x33, 0xf8, 0x06, 0x76, 0x1b, 0xd3, 0x30, 0x0d, 0x06,
++    0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00,
++    0x03, 0x82, 0x01, 0x01, 0x00, 0x7a, 0xf4, 0xc9, 0x46, 0xdc, 0xd5, 0x47,
++    0xb7, 0xe7, 0xc6, 0xb7, 0xf5, 0xb6, 0x48, 0x2f, 0x55, 0xd2, 0xe4, 0xea,
++    0xf5, 0xcf, 0x22, 0xf7, 0x3d, 0xc4, 0xd6, 0x25, 0x8b, 0x4f, 0xee, 0xd5,
++    0x42, 0x86, 0x1e, 0x33, 0x6c, 0xcc, 0x88, 0xd7, 0x4d, 0x73, 0xa4, 0x2a,
++    0xde, 0xb8, 0x4b, 0x27, 0x5b, 0xda, 0x82, 0x44, 0x4b, 0x74, 0xa6, 0x09,
++    0xa7, 0xdd, 0xf0, 0x1f, 0xf7, 0x38, 0x11, 0xeb, 0xf3, 0xc1, 0xd0, 0xf1,
++    0x4b, 0x7e, 0xbf, 0x43, 0x52, 0x0b, 0xd7, 0xe6, 0xc4, 0xf6, 0x53, 0x8f,
++    0x26, 0xdc, 0xa9, 0x73, 0x6c, 0xb3, 0x91, 0xac, 0x83, 0x41, 0x88, 0x61,
++    0x77, 0x1c, 0x7c, 0x5f, 0xa1, 0x99, 0x1a, 0x88, 0x42, 0xf4, 0x58, 0x63,
++    0x9b, 0x60, 0xd1, 0x7b, 0xaa, 0xe3, 0x58, 0xd9, 0x95, 0x91, 0x2d, 0x4b,
++    0xb1, 0xca, 0x92, 0x51, 0x91, 0xe0, 0x9e, 0xf0, 0xa6, 0x11, 0x68, 0xd4,
++    0x23, 0xcd, 0x6c, 0xb5, 0x97, 0xc8, 0x86, 0xaa, 0x68, 0xa8, 0xd0, 0x62,
++    0x58, 0xfe, 0xc3, 0xc9, 0x1b, 0x84, 0x08, 0x8e, 0xae, 0xd2, 0x76, 0xb8,
++    0x74, 0x87, 0x94, 0xd7, 0x4b, 0x96, 0x1e, 0x60, 0x2a, 0x8d, 0xb5, 0x80,
++    0x1b, 0xbb, 0x41, 0xcf, 0x23, 0x83, 0x22, 0xec, 0x64, 0xf3, 0x9e, 0xb0,
++    0xa8, 0x03, 0xfe, 0x64, 0xbe, 0x85, 0xe3, 0xf4, 0x24, 0x37, 0xb8, 0x86,
++    0xb3, 0x08, 0x57, 0xb5, 0xe5, 0x8c, 0xa0, 0x1a, 0x11, 0x08, 0x5b, 0x9b,
++    0xa0, 0x3f, 0xe3, 0x91, 0x76, 0xce, 0x8e, 0xa8, 0x23, 0xcc, 0xc2, 0x59,
++    0xfe, 0x9f, 0xc2, 0x99, 0x1a, 0x45, 0xe8, 0x7c, 0x79, 0x38, 0x8d, 0xa3,
++    0x07, 0xb5, 0x32, 0xfa, 0x0e, 0x64, 0x31, 0xef, 0xf1, 0x45, 0xae, 0x43,
++    0xdd, 0x4d, 0x8c, 0x15, 0x34, 0x19, 0xeb, 0x3f, 0xde, 0xca, 0xa4, 0xbe,
++    0x5d, 0x14, 0x14, 0xa8, 0x93, 0x0c, 0xf2, 0x95, 0x07,
++};
++
++// <game data>/certs/<id>.der. The folder is the one the shell handed the game: DM_ROMFS points at
++// romfs.img inside it, DM_SAVE at its save folder.
++static int dm_ssl_ca_path(unsigned id, char *out, size_t cap) {
++    const char *base = getenv("DM_ROMFS");
++    if (!base || !*base) base = getenv("DM_SAVE");
++    if (!base || !*base) return 0;
++    const char *slash = strrchr(base, '/');
++    if (!slash) return 0;
++    int n = snprintf(out, cap, "%.*s/certs/%u.der", (int)(slash - base), base, id);
++    return n > 0 && (size_t)n < cap;
++}
++
++// The size of the file for this id, 0 when there is none (or it is bigger than any certificate).
++static size_t dm_ssl_ca_file_len(unsigned id) {
++    char path[1024];
++    if (!dm_ssl_ca_path(id, path, sizeof path)) return 0;
++    FILE *f = fopen(path, "rb");
++    if (!f) return 0;
++    long n = -1;
++    if (fseek(f, 0, SEEK_END) == 0) n = ftell(f);
++    fclose(f);
++    return n > 0 && (unsigned long)n <= DM_SSL_CA_MAX ? (size_t)n : 0;
++}
++
++// How many bytes of DER this id has: the dropped file first, the built-in one for NintendoCAG3, else none.
++static size_t dm_ssl_ca_len(unsigned id) {
++    size_t n = dm_ssl_ca_file_len(id);
++    if (n) return n;
++    return id == DM_SSL_CA_NINTENDO ? sizeof dm_ssl_ca_builtin : 0;
++}
++
++// Copies that DER out; `from_file` says which source answered (for the trace).
++static size_t dm_ssl_ca_copy(unsigned id, unsigned char *out, size_t cap, int *from_file) {
++    size_t n = dm_ssl_ca_file_len(id);
++    if (n && n <= cap) {
++        char path[1024];
++        if (dm_ssl_ca_path(id, path, sizeof path)) {
++            FILE *f = fopen(path, "rb");
++            if (f) {
++                size_t got = fread(out, 1, n, f);
++                fclose(f);
++                if (got == n) { if (from_file) *from_file = 1; return n; }
++            }
++        }
++    }
++    if (id == DM_SSL_CA_NINTENDO && sizeof dm_ssl_ca_builtin <= cap) {
++        memcpy(out, dm_ssl_ca_builtin, sizeof dm_ssl_ca_builtin);
++        if (from_file) *from_file = 0;
++        return sizeof dm_ssl_ca_builtin;
++    }
++    return 0;
++}
++
++// How many bytes the store for these ids needs: one entry per certificate this host can answer for, the
++// terminator, and the DER data behind the table, each 4-byte aligned.
++static size_t dm_ssl_ca_size(const unsigned *ids, unsigned n) {
++    size_t total = DM_SSL_CA_INFO;                              // the terminator entry alone, at worst
++    for (unsigned i = 0; i < n; i++) {
++        size_t len = dm_ssl_ca_len(ids[i] == DM_SSL_CA_ALL ? DM_SSL_CA_NINTENDO : ids[i]);
++        if (!len) continue;
++        total += DM_SSL_CA_INFO + ((len + 3u) & ~(size_t)3u);
++    }
++    return total;
++}
++
++// Writes that store and returns its size (0 when the buffer is too small, or nothing could be written).
++// `entries` reports how many certificates went in, `from_file` whether the first one came from a file.
++static size_t dm_ssl_ca_build(const unsigned *ids, unsigned n, unsigned char *buf, size_t cap,
++                              unsigned *entries, size_t *der_size, int *from_file) {
++    size_t need = dm_ssl_ca_size(ids, n);
++    if (entries) *entries = 0;
++    if (der_size) *der_size = 0;
++    if (from_file) *from_file = 0;
++    if (!buf || cap < need) return 0;
++
++    unsigned k = 0;
++    for (unsigned i = 0; i < n; i++) if (dm_ssl_ca_len(ids[i] == DM_SSL_CA_ALL ? DM_SSL_CA_NINTENDO : ids[i])) k++;
++
++    size_t at = (size_t)(k + 1) * DM_SSL_CA_INFO;               // the DER data starts behind the table
++    unsigned j = 0;
++    for (unsigned i = 0; i < n; i++) {
++        unsigned id = ids[i] == DM_SSL_CA_ALL ? DM_SSL_CA_NINTENDO : ids[i];
++        size_t len = dm_ssl_ca_len(id);
++        if (!len) continue;
++        uint32_t *slot = (uint32_t *)(void *)(buf + (size_t)j * DM_SSL_CA_INFO);
++        slot[0] = id;
++        slot[1] = DM_SSL_CA_TRUSTED;
++        uint64_t size = (uint64_t)len, off = (uint64_t)at;
++        memcpy(slot + 2, &size, 8);                            // der_size
++        memcpy(slot + 4, &off, 8);                             // der_offset
++        int file = 0;
++        if (dm_ssl_ca_copy(id, buf + at, cap - at, &file) != len) return 0;
++        if (!j) { if (der_size) *der_size = len; if (from_file) *from_file = file; }
++        at += (len + 3u) & ~(size_t)3u;
++        j++;
++    }
++
++    // The terminator: id All (all ones, so the id reads -1 whichever half a caller looks at), status
++    // invalid, no data. The caller walks the table until it sees it.
++    uint32_t *t = (uint32_t *)(void *)(buf + (size_t)k * DM_SSL_CA_INFO);
++    t[0] = DM_SSL_CA_ALL;
++    t[1] = 0;
++    t[2] = t[3] = t[4] = t[5] = 0;
++
++    if (entries) *entries = j;
++    return need;
++}
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index e3af4bd..9262cd3 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -249,6 +249,12 @@ $(B)/t_dauth_local: t_dauth_local.c ../hle_dauth.c ../hle_dauth.h ../hle_nextend
+ # so they are not in `run`.
+ $(B)/t_ssl_local: t_ssl_local.c ../hle_net.c ../hle_ssl.c ../hle_ssl.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ssl_local.c -framework Security -framework CoreFoundation
++# The built-in CA store: the layout a title walks, and the one certificate it asks for by id (no network).
++$(B)/t_ssl_certs: t_ssl_certs.c ../hle_net.c ../hle_ssl.c ../hle_ssl.h ../hle_ssl_ca.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ssl_certs.c -framework Security -framework CoreFoundation
++.PHONY: ssl-certs
++ssl-certs: $(B)/t_ssl_certs
++	$(B)/t_ssl_certs
+ # The Nextendo hostname map and resolver are plain C with no game profile: these tests build without GAME.
+ $(B)/t_nextendo_map: t_nextendo_map.c ../hle_nextendo.c ../hle_nextendo.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. -o $@ t_nextendo_map.c
+diff --git a/dm/host/tests/t_ssl_certs.c b/dm/host/tests/t_ssl_certs.c
+new file mode 100644
+index 0000000..754d34d
+--- /dev/null
++++ b/dm/host/tests/t_ssl_certs.c
+@@ -0,0 +1,138 @@
++// The built-in CA store: the layout a title walks (the entries, the terminator after them, the DER data behind
++// the table) and the one certificate every title so far asks for by id - NintendoCAG3, CaCertificateId 1.
++//
++// Super Mario Party Jamboree stops on an empty store: it asks for id 1 as soon as it has a name for the NPLN
++// front end, and an empty answer is err::ShowError 0x270141 with not one nnsocketSocket in the trace. So what
++// this test pins is that the answer is never empty, that the walk ends at the terminator, and that a
++// certificate dropped in <game data>/certs/<id>.der replaces the built-in stand-in without a build.
++#include "../hle_net.c"
++#include "../hle_ssl.c"
++#include "../hle_nextendo.c"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++
++// The object map hle_ssl.c hangs its state off: the host has a real one, this test a table.
++#define TEST_OBJ_MAX 8
++static struct { const void *guest; void *host; } g_obj[TEST_OBJ_MAX];
++
++void *objmap_get(const void *guest) {
++    for (int i = 0; i < TEST_OBJ_MAX; i++) if (g_obj[i].guest == guest) return g_obj[i].host;
++    return NULL;
++}
++void objmap_put(const void *guest, void *host) {
++    for (int i = 0; i < TEST_OBJ_MAX; i++) if (!g_obj[i].guest || g_obj[i].guest == guest) {
++        g_obj[i].guest = guest; g_obj[i].host = host; return;
++    }
++    fprintf(stderr, "objmap full\n"); exit(1);
++}
++void *objmap_del(const void *guest) {
++    for (int i = 0; i < TEST_OBJ_MAX; i++) if (g_obj[i].guest == guest) {
++        void *h = g_obj[i].host; g_obj[i].guest = NULL; g_obj[i].host = NULL; return h;
++    }
++    return NULL;
++}
++
++__thread _Atomic int dm_host_work;
++
++void dm_guest_sleep_ns(int64_t ns) {
++    struct timespec ts = {ns / 1000000000, ns % 1000000000};
++    nanosleep(&ts, NULL);
++}
++void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns) {
++    struct timespec now, abs;
++    clock_gettime(CLOCK_REALTIME, &now);
++    abs.tv_sec = now.tv_sec + ns / 1000000000;
++    abs.tv_nsec = now.tv_nsec + ns % 1000000000;
++    if (abs.tv_nsec >= 1000000000) { abs.tv_sec++; abs.tv_nsec -= 1000000000; }
++    pthread_cond_timedwait(c, m, &abs);
++}
++uint64_t guest_ns(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
++}
++int dm_detclock_enabled(void) { return 0; }
++
++uint8_t *dm_guest_base(void) { return NULL; }   // only die() would want it
++
++// BuiltInCertificateInfo, the 0x18 bytes the SDK walks: id, status, der_size, der_offset.
++struct info { uint32_t id, status; uint64_t size, off; };
++
++int main(void) {
++    setenv("DM_NEXTENDO", "1", 1);
++    dm_nd_reload();
++
++    static uint8_t buf[0x4000];
++    void *out = NULL;
++    uint32_t size = 0;
++
++    // ---- the question a title asks: id 1, and the answer is a certificate and its terminator
++    uint32_t id = 1;
++    assert(h_ssl_BiBufSize(&size, &id, 1) == RES_OK);
++    assert(size > 2 * 0x18);
++    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &id, 1) == RES_OK);
++    assert(out == buf);
++    struct info *e = (struct info *)(void *)buf;
++    assert(e[0].id == 1);
++    assert(e[0].status == 1);                     // TrustedCertStatus::EnabledTrusted
++    assert(e[0].size > 0);
++    assert(e[0].off == 2 * 0x18);                 // behind the table, the terminator slot included
++    assert(e[0].off + e[0].size <= size);
++    assert(buf[e[0].off] == 0x30);                // a DER SEQUENCE, not a stub
++    struct info *term = (struct info *)(void *)(buf + 0x18);
++    assert(term->id == 0xffffffffu);              // All: the walk stops here
++    assert(term->size == 0 && term->off == 0);
++    assert(size == 2 * 0x18 + ((e[0].size + 3u) & ~(uint64_t)3u));
++
++    // ---- All (-1) is the same store: the one certificate this host has
++    uint32_t all = 0xffffffffu, size_all = 0;
++    assert(h_ssl_BiBufSize(&size_all, &all, 1) == RES_OK);
++    assert(size_all == size);
++    printf("id 1 and id All: %llu-byte DER behind the table, terminator after it\n",
++           (unsigned long long)e[0].size);
++
++    // ---- an id the store does not have is legal too, and is still a list a caller can walk
++    uint32_t other = 4000;
++    assert(h_ssl_BiBufSize(&size, &other, 1) == RES_OK);
++    assert(size == 0x18);                         // the terminator alone
++    out = NULL;
++    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &other, 1) == RES_OK);
++    assert(out == buf);
++    assert(((struct info *)(void *)buf)->id == 0xffffffffu);
++    printf("an unknown id: terminator only, the walk still ends\n");
++
++    // ---- a certificate the user dropped in wins over the built-in one
++    static const uint8_t fake[] = {0x30, 0x82, 0x00, 0x10, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x55, 0x04, 0x03,
++                                   0x04, 0x00, 0x00, 0x00};   // any bytes: the store hands them through
++    char dir[] = "/tmp/dm_ssl_ca_XXXXXX";
++    assert(mkdtemp(dir) != NULL);
++    char path[512];
++    snprintf(path, sizeof path, "%s/certs", dir);
++    assert(mkdir(path, 0755) == 0);
++    snprintf(path, sizeof path, "%s/certs/1.der", dir);
++    FILE *f = fopen(path, "wb");
++    assert(f && fwrite(fake, 1, sizeof fake, f) == sizeof fake);
++    fclose(f);
++    snprintf(path, sizeof path, "%s/romfs.img", dir);
++    setenv("DM_ROMFS", path, 1);
++
++    assert(h_ssl_BiBufSize(&size, &id, 1) == RES_OK);
++    assert(size == 2 * 0x18 + ((sizeof fake + 3u) & ~(size_t)3u));
++    out = NULL;
++    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &id, 1) == RES_OK);
++    e = (struct info *)(void *)buf;
++    assert(e[0].size == sizeof fake);
++    assert(memcmp(buf + e[0].off, fake, sizeof fake) == 0);
++    printf("certs/1.der: %zu bytes from the file, the built-in one untouched\n", sizeof fake);
++
++    // ---- without the switch it is the old failure, so nothing here changes an offline title
++    unsetenv("DM_NEXTENDO");
++    out = NULL;
++    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &id, 1) == RES_FAIL);
++    assert(out == NULL);
++    printf("offline: fails, as the cut branch always did\n");
++    printf("ok\n");
++    return 0;
++}
