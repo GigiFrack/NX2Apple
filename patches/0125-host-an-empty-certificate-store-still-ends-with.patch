@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 15:02:43 +0000
+Subject: [PATCH] host: an empty certificate store still ends with its
+ terminator
+
+Upstream-Status: fork-only
+Reason: An empty store is a valid answer, but the caller walks the list until it meets the terminator entry (a
+ certificate id of -1): handing it a zero-length buffer means it walks memory nobody wrote, and Super Mario
+ Party Jamboree crashed on sig=11 in its own formatting code one call after asking. The answer is now a
+ well-formed list of one terminator: 0x18 bytes, the first word all ones so the id reads -1 whichever half
+ the caller inspects, sizes zero. No certificate is invented - the store is genuinely empty, and the peer is
+ verified by the host's TLS layer - and the trace now prints how many ids were asked for and the first one,
+ which says what the title wanted if it is not satisfied with an empty store.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_offline.c |  6 +++++-
+ dm/host/hle_ssl.c     | 22 ++++++++++++++++------
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index cb618fa..3733d97 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -130,7 +130,11 @@ HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL (cut)", Result, h_ssl_ImpC
+ HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "the built-in certificate store is empty (the peer is verified by the host's TLS layer)", Result, h_ssl_Certs,
+           void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) { (void)bn; (void)ids; (void)n;
+     if (!dm_nd_enabled()) { if (out) *out = NULL; return RES_FAIL; }
+-    if (out) *out = (void *)buf; dm_nd_trace_result("ssl::BuiltInCertificates(SDK 17, none)", 0); return RES_OK; }
++    if (buf && bn >= 0x18) { uint32_t *e = (uint32_t *)buf;
++        e[0] = 0xffffffffu; e[1] = 0xffffffffu; memset(buf + 8, 0, 0x10); if (out) *out = (void *)buf; }
++    else if (out) *out = NULL;
++    { char t[96]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(SDK 17, buf=%p size=%u ids=%u) -> terminator", (void *)buf, bn, n);
++      dm_nd_trace_result(t, 0); } return RES_OK; }
+ 
+ // ---------- nifm / nsd: offline ----------
+ HLE_FORCE("_ZN2nn4nifm19SetLocalNetworkModeEb", "offline: the local network mode switch is ignored", void, h_nifm_LocalMode, unsigned on) { (void)on; }
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 41818fe..6a39b5c 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -77,18 +77,28 @@ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t i
+ // chain is never checked against this store - the handshake runs on SecureTransport and verification is decided
+ // there. Reporting failure instead is what stops a title before it opens the connection: Super Mario Party
+ // Jamboree asks for the store, reads the failure, and reports 0x270141 without sending a byte.
++// An empty store still needs its terminator entry: the caller walks the list until the certificate id is -1,
++// so handing it a zero-length buffer means it walks uninitialised memory (Super Mario Party Jamboree formats a
++// line from that walk and dies on sig=11). 0x18 bytes, all ones in the first word so the id reads -1 whichever
++// half the caller looks at, the sizes zero.
++#define DM_SSL_TERM_WORD 0xffffffffu
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) {
+-    (void)ids; (void)n;
+     if (!dm_nd_enabled()) { if (o) *o = 0; return RES_FAIL; }
+-    if (o) *o = 0;                                   // an empty store needs no bytes
+-    dm_nd_trace_result("ssl::BuiltInCertificateBufSize(empty)", 0);
++    if (o) *o = 0x18;                                // one terminator entry, no certificates
++    { char t[96]; snprintf(t, sizeof t, "ssl::BuiltInCertificateBufSize(ids=%u first=0x%x) -> 0x18", n, n && ids ? ((const uint32_t *)ids)[0] : 0u);
++      dm_nd_trace_result(t, 0x18); }
+     return RES_OK;
+ }
+ SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) {
+-    (void)ids; (void)n;
+     if (!dm_nd_enabled()) return RES_FAIL;
+-    if (o) *o = b;                                   // the caller's buffer, holding no entry
+-    dm_nd_trace_result("ssl::BuiltInCertificates(none)", 0);
++    if (b && bs >= 0x18) {
++        uint32_t *e = (uint32_t *)b;
++        e[0] = DM_SSL_TERM_WORD; e[1] = DM_SSL_TERM_WORD;   // id -1, status invalid: the walk stops here
++        memset(b + 8, 0, 0x10);                             // no DER data
++        if (o) *o = b;
++    } else if (o) *o = NULL;
++    { char t[96]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(buf=%p size=%u ids=%u) -> terminator", (void *)b, bs, n);
++      dm_nd_trace_result(t, 0); }
+     return RES_OK;
+ }
+ SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) {
