@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 09:45:37 +0000
+Subject: [PATCH] host: the baas id token carries the audience and the device
+ dictionary nnAccount checks
+
+Upstream-Status: fork-only
+Reason: The id_token a game forwards as its NEX login was not what nnAccount accepts. Two differences from the
+ reference client (Citron-Nextendo's BuildIdToken, acc.cpp): the audience was "ted9e2f05d286f7b8" where it
+ is "ed9e2f05d286f7b8" (a character picked up from the tail of the issuer URL, which sits beside it), and the
+ "nintendo" claim dictionary was missing altogether - {"dt":"NX Prod 1","pc":"HAC","di":...,"sn":...,
+ "ist":false}. nnAccount checks its own schema before it hands the token on, so a correctly signed token
+ without that dictionary is refused locally, with no network traffic at all. The application id is now added
+ only for the titles the server routes by it (the NSO Classics and the two that share a tenant), as the
+ reference does, instead of whenever one is known.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/dmidtoken.c       | 36 +++++++++++++++++++++++++++++++-----
+ dm/host/tests/t_idtoken.c | 26 +++++++++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/dm/host/dmidtoken.c b/dm/host/dmidtoken.c
+index 03efa1d..ff23be9 100644
+--- a/dm/host/dmidtoken.c
++++ b/dm/host/dmidtoken.c
+@@ -2,6 +2,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <strings.h>   // strcasecmp, for the application ids
+ #include <time.h>
+ 
+ #if defined(__APPLE__)
+@@ -78,6 +79,25 @@ static int add_pair(char *buf, size_t cap, int *w, const char *key, const char *
+     return 1;
+ }
+ 
++// A handful of titles are routed by application id inside the token: the NSO Classics and two that
++// share another title's tenant (Citron's IsClassicsApplication). Every other game's token carries
++// none, because adding one to a game the server does not expect it from changes its routing.
++static int routes_by_app_id(const char *app_id) {
++    static const char *const ids[] = {
++        "0100D870045B6000",   // NES
++        "01008D300C50C000",   // SNES
++        "0100C62011050000",   // Game Boy
++        "010012F017576000",   // Game Boy Advance
++        "0100C9A00ECE6000",   // Nintendo 64
++        "0100B3C014BDA000",   // Mega Drive / Genesis
++        "0100A3D008C5C000",
++        "0100559011740000",
++    };
++    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++)
++        if (!strcasecmp(app_id, ids[i])) return 1;
++    return 0;
++}
++
+ size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *version,
+                         const char *app_id, dm_sign_fn sign) {
+     if (!out || cap < 2 || !nnex || !*nnex || !sign) return 0;
+@@ -87,7 +107,7 @@ size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *ver
+     static const char JKU[] =
+         "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates";
+     static const char ISSUER[] = "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
+-    static const char AUDIENCE[] = "ted9e2f05d286f7b8";
++    static const char AUDIENCE[] = "ed9e2f05d286f7b8";   // Citron's BaasAudience
+ 
+     uint8_t r_sub[16], r_dev[16], r_acc[16];
+     random_bytes(r_sub, sizeof r_sub);
+@@ -104,16 +124,22 @@ size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *ver
+     snprintf(iat, sizeof iat, "%lld", (long long)now);
+     snprintf(exp, sizeof exp, "%lld", (long long)(now + DM_IDTOKEN_TTL_SECONDS));
+ 
+-    char body[1200];
++    char body[1600];
++    // `nintendo` is the device dictionary nnAccount checks against its own schema before it hands
++    // the token on: without it a correctly signed token is refused locally, with no network traffic
++    // at all (Citron: "without it, nnAccount's local schema check rejects an otherwise well-formed,
++    // correctly-signed token"). The nested `di` is the same device id as the top-level one.
+     int w = snprintf(body, sizeof body,
+                      "{\"jku\":\"%s\",\"jti\":\"%s\",\"di\":\"%s\",\"sn\":\"XAW10000000000\","
+-                     "\"bs:did\":\"%s\",\"hm\":true,\"nnex\":\"%s\"",
+-                     JKU, jti, di, did, nnex);
++                     "\"bs:did\":\"%s\",\"hm\":true,\"nnex\":\"%s\",\"nintendo\":{\"dt\":\"NX Prod 1\","
++                     "\"pc\":\"HAC\",\"di\":\"%s\",\"sn\":\"XAW10000000000\",\"ist\":false}",
++                     JKU, jti, di, did, nnex, di);
+     if (w < 0 || (size_t)w >= sizeof body) return 0;
+     // Only the titles that route by application id carry it: the NSO classics and two that share
+     // another title's tenant. Every other game's token stays byte-identical in shape.
+-    if (app_id && *app_id && !add_pair(body, sizeof body, &w, "app_id", app_id)) return 0;
++    if (app_id && *app_id && routes_by_app_id(app_id) && !add_pair(body, sizeof body, &w, "app_id", app_id)) return 0;
+     if (version && *version && !add_pair(body, sizeof body, &w, "tv", version)) return 0;
++    if (!add_pair(body, sizeof body, &w, "typ", "id_token")) return 0;
+     if (!add_pair(body, sizeof body, &w, "iss", ISSUER)) return 0;
+     if (!add_pair(body, sizeof body, &w, "aud", AUDIENCE)) return 0;
+     if (!add_pair(body, sizeof body, &w, "sub", sub)) return 0;
+diff --git a/dm/host/tests/t_idtoken.c b/dm/host/tests/t_idtoken.c
+index e5e78f6..4dc8b1b 100644
+--- a/dm/host/tests/t_idtoken.c
++++ b/dm/host/tests/t_idtoken.c
+@@ -86,10 +86,28 @@ int main(void) {
+     json[o] = 0;
+     assert(strstr(json, "\"nnex\":\"nx2.abc.def\""));
+     assert(strstr(json, "\"iss\":\"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com\""));
+-    assert(strstr(json, "\"aud\":\"ted9e2f05d286f7b8\""));
++    // The audience is Citron's BaasAudience, character for character (ed9e…, no leading t: the URL
++    // it sits next to ends in "2aa" and an extra character crept in from there once already).
++    assert(strstr(json, "\"aud\":\"ed9e2f05d286f7b8\""));
+     assert(strstr(json, "\"tv\":\"2.4.0\""));
+     assert(strstr(json, "\"sn\":\"XAW10000000000\""));
+     assert(strstr(json, "\"hm\":true"));
++    // nnAccount checks its own schema before handing the token on, and that schema wants the device
++    // dictionary: without it a correctly signed token is refused locally, before any network call.
++    assert(strstr(json, "\"nintendo\":{\"dt\":\"NX Prod 1\",\"pc\":\"HAC\""));
++    assert(strstr(json, "\"ist\":false"));
++    // ... and its `di` is the same device id as the top-level one.
++    {
++        const char *di = strstr(json, "\"di\":\"");
++        assert(di);
++        char dev[40];
++        size_t k = 0;
++        for (const char *p = di + 6; *p && *p != '"' && k + 1 < sizeof dev; p++) dev[k++] = *p;
++        dev[k] = 0;
++        char want[160];
++        snprintf(want, sizeof want, "\"nintendo\":{\"dt\":\"NX Prod 1\",\"pc\":\"HAC\",\"di\":\"%s\"", dev);
++        assert(strstr(json, want));
++    }
+     assert(strstr(json, "\"jku\":\"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates\""));
+     assert(strstr(json, "\"app_id\"") == NULL);          // only for the titles that need it
+     // exp - iat is the three hours the reference client uses.
+@@ -111,6 +129,12 @@ int main(void) {
+     char with_app[1024];
+     decode_payload(out, with_app, sizeof with_app);
+     assert(strstr(with_app, "\"app_id\":\"0100D870045B6000\""));
++    // A game the server does not route by application id gets none, even when the caller passes one:
++    // the id in the token changes routing, so it is not a field to fill in whenever it is known.
++    assert(dm_idtoken_build(out, sizeof out, "nx2.abc.def", "2.3.0", "0100965017338000", fake_sign) > 0);
++    char jamboree[1024];
++    decode_payload(out, jamboree, sizeof jamboree);
++    assert(strstr(jamboree, "\"app_id\"") == NULL);
+ 
+     // No version, no `tv` claim (the field is optional in the reference).
+     assert(dm_idtoken_build(out, sizeof out, "nx2.abc.def", NULL, NULL, fake_sign) > 0);
