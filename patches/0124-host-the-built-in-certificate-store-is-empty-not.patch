@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 14:33:00 +0000
+Subject: [PATCH] host: the built-in certificate store is empty, not a failure
+
+Upstream-Status: fork-only
+Reason: The built-in CA store is a console system title (0100000000000800) the host does not have and cannot ship,
+ and an empty store is a legal answer for the question being asked. It costs a title nothing: the peer's chain
+ is never checked against this list, because dm_ssl_* runs the handshake on SecureTransport and decides
+ verification there. Reporting failure instead keeps a title from ever opening the connection - Super Mario
+ Party Jamboree asks for the store right after resolving its NPLN tenant, reads the failure, and reports
+ 0x270141 without sending a byte. Both spellings answer: the SDK 17 one (BuiltInCertificateInfoBase) and the
+ older one, so a title built against either proceeds. A title that genuinely wants a certificate to import
+ will find the list empty rather than see the service fail, which is the difference between 'no CA' and 'SSL
+ is broken' in its own error handling.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_offline.c |  8 ++++++--
+ dm/host/hle_ssl.c     | 21 +++++++++++++++++++--
+ 2 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index ff034b6..cb618fa 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -125,8 +125,12 @@ HLE_FORCE("_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferP
+ HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "a client certificate the game brings: needed only where the server asks for one", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)a; (void)b; (void)x; (void)y; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "a server CA the game brings: the system roots are what SecureTransport verifies against", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) { (void)a; (void)n; (void)f; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL (cut)", Result, h_ssl_ImpCrl, void *self, uint64_t *id, const char *a, unsigned n) { (void)self; (void)a; (void)n; if (id) *id = 0; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "SSL (cut)", Result, h_ssl_Certs,
+-          void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) { (void)buf; (void)bn; (void)ids; (void)n; if (out) *out = NULL; return RES_FAIL; }
++// SDK 17's spelling of the same question (the certificate list is a base class there). Same answer: an empty
++// store is legal, and the peer is verified by the host's TLS layer, not against this list.
++HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "the built-in certificate store is empty (the peer is verified by the host's TLS layer)", Result, h_ssl_Certs,
++          void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) { (void)bn; (void)ids; (void)n;
++    if (!dm_nd_enabled()) { if (out) *out = NULL; return RES_FAIL; }
++    if (out) *out = (void *)buf; dm_nd_trace_result("ssl::BuiltInCertificates(SDK 17, none)", 0); return RES_OK; }
+ 
+ // ---------- nifm / nsd: offline ----------
+ HLE_FORCE("_ZN2nn4nifm19SetLocalNetworkModeEb", "offline: the local network mode switch is ignored", void, h_nifm_LocalMode, unsigned on) { (void)on; }
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 3e8d8f9..41818fe 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -72,8 +72,25 @@ HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "a context object: the
+ HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create", Result, h_ssl_CtxDestroy, void *self) { dm_nd_trace_result("ssl::_ZN2nn3ssl7Context7DestroyEv", -1); dm_ssl_context_destroy(self); return RES_OK; }
+ SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
+ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
+-SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
+-SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) { (void)o; (void)b; (void)bs; (void)ids; (void)n; return RES_FAIL; }
++// The console's built-in CA store is a system title (0100000000000800) that the host does not have and cannot
++// ship, and an empty store is a legal answer: nothing to import. It costs the game nothing, because the peer's
++// chain is never checked against this store - the handshake runs on SecureTransport and verification is decided
++// there. Reporting failure instead is what stops a title before it opens the connection: Super Mario Party
++// Jamboree asks for the store, reads the failure, and reports 0x270141 without sending a byte.
++SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) {
++    (void)ids; (void)n;
++    if (!dm_nd_enabled()) { if (o) *o = 0; return RES_FAIL; }
++    if (o) *o = 0;                                   // an empty store needs no bytes
++    dm_nd_trace_result("ssl::BuiltInCertificateBufSize(empty)", 0);
++    return RES_OK;
++}
++SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) {
++    (void)ids; (void)n;
++    if (!dm_nd_enabled()) return RES_FAIL;
++    if (o) *o = b;                                   // the caller's buffer, holding no entry
++    dm_nd_trace_result("ssl::BuiltInCertificates(none)", 0);
++    return RES_OK;
++}
+ SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) {
+     if (!dm_nd_enabled()) return RES_FAIL;
+     dm_ssl_connection_create(self, ctx); return RES_OK;
