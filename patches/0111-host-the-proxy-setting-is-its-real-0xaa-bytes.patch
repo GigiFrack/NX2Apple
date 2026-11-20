@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 07:55:06 +0000
+Subject: [PATCH] host: the proxy setting is its real 0xAA bytes
+
+Upstream-Status: fork-only
+Reason: nn::nifm::ProxySetting is 0xAA bytes: enabled(1), padding(1), port(2), server(0x64), then the
+ authentication block of 0x41 and one byte of padding (Citron asserts the size at nifm.cpp:114, Ryujinx
+ declares StructLayout Size=0xaa). The handler zeroed 0x100, so it wrote 86 bytes past the game's own
+ buffer, onto the stack of the thread that asked - the NPLN worker - and blanked a pointer saved there.
+ The log ends at "GetCurrentProxySetting(none) -> 0" and the crash report says pc=0, SIGKILL,
+ KERN_PROTECTION_FAILURE at 0x0, faulting thread the nn.npln one: the next indirect call went to zero.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 4200cd0..35a40df 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -57,7 +57,11 @@ HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline:
+     // "No proxy" is what a console on a plain network reports, and a game treats the *failure* as a broken
+     // network (0x2A2, module 162, shown in the library applet). The structure starts with its enabled flag,
+     // and zero is a complete and truthful setting here: no proxy, no address, no credentials.
+-    if (p) memset(p, 0, 0x100);
++    // nn::nifm::ProxySetting is 0xAA bytes (Citron's static_assert, Ryujinx's StructLayout Size=0xaa):
++    // enabled(1) pad(1) port(2) server(0x64) auth{enabled(1) user(0x20) pass(0x20)} pad(1).
++    // Zeroing more than that ran off the game's buffer onto the NPLN worker's stack and blanked a
++    // saved pointer: the next call jumped to zero (pc=0, KERN_PROTECTION_FAILURE at 0x0).
++    if (p) memset(p, 0, 0xAA);
+     dm_nd_trace_result("nifm::GetCurrentProxySetting(none)", RES_OK);
+     return RES_OK;
+ }

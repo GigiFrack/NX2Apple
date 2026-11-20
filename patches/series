@@ -106,3 +106,4 @@
 0108-host-no-proxy-is-an-answer-not-a-failure.patch
 0109-host-a-log-line-reaches-the-pipe-before-the-next.patch
 0110-host-the-ssl-entries-say-their-names-too.patch
+0111-host-the-proxy-setting-is-its-real-0xaa-bytes.patch
