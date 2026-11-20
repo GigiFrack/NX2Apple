@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 13:20:10 +0000
+Subject: [PATCH] host: the entry trace reads the implementation, which the
+ table now carries
+
+Upstream-Status: fork-only
+Reason: The trace added a round earlier could not work: hle.h registered the stub (cname_bs) in the table, while a call
+ carries the implementation's address in x16, so the lookup never matched and the instrument printed nothing -
+ which reads the same as an instrument that is never called. The table now carries both (fn for the loader's
+ binding, impl for the entry), so a take-over names itself the first time the game calls it. A target that is
+ not in the table now says so with its address instead of returning in silence: a mute diagnostic costs a
+ whole device round trip to discover.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/.codegraph/.gitignore |  5 +++++
+ dm/host/hle.h                 |  7 ++++---
+ dm/host/hle_bigstack.c        | 12 +++++++++---
+ dm/host/hle_offline.c         |  2 +-
+ 4 files changed, 19 insertions(+), 7 deletions(-)
+ create mode 100644 dm/host/.codegraph/.gitignore
+
+diff --git a/dm/host/.codegraph/.gitignore b/dm/host/.codegraph/.gitignore
+new file mode 100644
+index 0000000..d20c0fe
+--- /dev/null
++++ b/dm/host/.codegraph/.gitignore
+@@ -0,0 +1,5 @@
++# CodeGraph data files — local to each machine, not for committing.
++# Ignore everything in .codegraph/ except this file itself, so transient
++# files (the database, daemon.pid, sockets, logs) never show up in git.
++*
++!.gitignore
+diff --git a/dm/host/hle.h b/dm/host/hle.h
+index 9a3c3fa..407c1b4 100644
+--- a/dm/host/hle.h
++++ b/dm/host/hle.h
+@@ -42,7 +42,8 @@ extern __thread uint64_t dm_clock_reads;   // the calling thread's guest reads o
+ // and the first 64 bytes of stack arguments are carried over, so at most 16 parameters (8 in registers, 8 stack slots; a struct passed by value counts as the registers it takes);
+ // not for variadic functions. Each take-over moved here one by one after it crashed on a small stack (the file system on Super Mario 3D World's save thread, add-on content,
+ // AudioOut, the controller applet on Drag x Drive, Mario Kart 8 Deluxe's offline page) before this became the default (memory.md, Host calls on small guest stacks)
+-typedef struct { const char *name; void *fn; const char *why; const char *to; } hle_force_ent;   // to: a guest alias (HLE_FORCE_ALIAS below), fn NULL
++// fn: what the loader binds the mangled symbol to (the stub, or the function itself for a DIRECT entry); impl: the implementation the stub jumps to, which is what a call's x16 holds and what the entry trace reads
++typedef struct { const char *name; void *fn; const char *why; const char *to; void *impl; } hle_force_ent;   // to: a guest alias (HLE_FORCE_ALIAS below), fn NULL, impl NULL
+ #define HLE_NARG(...) HLE_NARG_(__VA_ARGS__, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+ #define HLE_NARG_(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, n, ...) n
+ #define HLE_STR(x) HLE_STR_(x)
+@@ -59,14 +60,14 @@ const hle_force_ent *dm_force_table(unsigned *count);
+             "    adrp x16, _" #cname "@PAGE\n    add x16, x16, _" #cname "@PAGEOFF\n"              \
+             ".if " HLE_STR(HLE_NARG(__VA_ARGS__)) " > 8\n    mov x17, #(((" HLE_STR(HLE_NARG(__VA_ARGS__)) " - 8) * 8 + 15) & ~15)\n" \
+             "    b _dm_bigstack_enter_n\n.else\n    b _dm_bigstack_enter\n.endif\n");           \
+-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why}; \
++    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why, 0, (void *)(uintptr_t)cname}; \
+     static ret cname(__VA_ARGS__)
+ // Same as above, but the implementation runs on the caller's stack. Only for a take-over that runs the game's own code (an NRO's init and fini, a JIT plugin): that code's stack
+ // use is the game's, sized for the thread's own stack (which can be larger than the 512 KB host stack), and it may switch stacks itself (a coroutine), which would reuse the
+ // host stack the take-over is on. A short call into the SDK (fs::IsMounted, the audio renderer's command generation) is no reason. Say why beside it
+ #define HLE_FORCE_DIRECT(mangled, why, ret, cname, ...)                                            \
+     static ret cname(__VA_ARGS__);                                                                \
+-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
++    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why, 0, (void *)cname}; \
+     static ret cname(__VA_ARGS__)
+ // A guest alias: every reference to mangled binds to the loaded modules' own definition of target instead, as if the module had imported target. No host code runs and no
+ // signature is restated, so the alias holds for every SDK that defines both. For a hardware class whose constructor the host takes over to build the SDK's software class in the
+diff --git a/dm/host/hle_bigstack.c b/dm/host/hle_bigstack.c
+index 2e21a09..65eec2c 100644
+--- a/dm/host/hle_bigstack.c
++++ b/dm/host/hle_bigstack.c
+@@ -19,7 +19,7 @@
+ #include "dm.h"
+ // The forced take-over table's shape, restated rather than pulled in with hle.h: this unit is the one the
+ // macro's stubs jump to, and hle.h's macros have no business being expanded here.
+-typedef struct { const char *name; const void *fn; const char *why; const char *alias; } hle_force_ent;
++typedef struct { const char *name; const void *fn; const char *why; const char *alias; const void *impl; } hle_force_ent;
+ const hle_force_ent *dm_force_table(unsigned *count);
+ 
+ int dm_guest_as_contains(uintptr_t a);   // hle_svc.c
+@@ -110,13 +110,19 @@ static void hle_trace_note(uintptr_t sp) {
+         if (*slot == 0) {
+             *slot = impl;
+             for (unsigned i = 0; i < n; i++)
+-                if ((uintptr_t)tab[i].fn == impl) {
++                if ((uintptr_t)tab[i].impl == impl) {   // the stub carries the implementation's address in x16, not its own
+                     if (printed == 0) fprintf(stderr, "[dm] hle trace: first calls, in order\n");
+                     printed++;
+                     fprintf(stderr, "[dm] hle: %s\n", tab[i].name);
+                     return;
+                 }
+-            return;                                    // not a taken-over entry (a direct call)
++            // Every call that reaches this entry came from a stub, so its implementation is in the table;
++            // if it is not, say so with the address rather than staying silent (a mute instrument reads
++            // exactly like an instrument nobody called).
++            static int unknown;
++            if (unknown++ < 20)
++                fprintf(stderr, "[dm] hle: 0x%llx is not in the take-over table\n", (unsigned long long)impl);
++            return;
+         }
+     }
+ }
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 3fc3d16..ff034b6 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -15,7 +15,7 @@ HLE_FORCE("_ZN2nn5prepo10PlayReport4SaveEv", "telemetry report save; nothing is
+ // own default context has: GetCompletionEvent makes a signaled event (sdk+0x5a9298), GetResult answers 0 and the destructor does nothing, so only this call is taken over. Naked because x8 is the
+ // hidden result pointer, 8 bytes on the caller's stack, which no C return type can name
+ __attribute__((naked)) static void h_prepo_Send(void) { __asm__("str xzr, [x8]\n    ret"); }
+-__attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_h_prepo_Send = {"_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", (void *)h_prepo_Send, "telemetry report send; nothing is sent, a default context completes at once with success"};
++__attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_h_prepo_Send = {"_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", (void *)h_prepo_Send, "telemetry report send; nothing is sent, a default context completes at once with success", 0, (void *)(uintptr_t)h_prepo_Send};
+ HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects to the prepo service (through sm), the host has no service process; no-op (Engage calls it explicitly)", Result, h_prepo_Init, void) { return RES_OK; }
+ // Add the session ID / connection status to a report: on hardware these first connect to the prepo service for the session (Super Mario 3D World + Bowser's Fury calls them entering the save select); the host adds nothing and reports success
+ HLE_FORCE("_ZN2nn5prepo12AddSessionIdEPNS0_10PlayReportEPKc", "telemetry session ID: no service connection, nothing added, reports success", Result, h_prepo_AddSess, void *rep, const char *key) { (void)rep; (void)key; return RES_OK; }
