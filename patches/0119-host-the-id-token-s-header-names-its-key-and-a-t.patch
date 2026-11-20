@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 12:21:24 +0000
+Subject: [PATCH] host: the id token's header names its key, and a trace shows
+ the token
+
+Upstream-Status: fork-only
+Reason: Two changes to the token a game is handed. The header now carries `jku` beside alg, kid and typ, exactly as
+ the reference client builds it (Citron's BuildIdToken), because a verifier that looks for the key location in
+ the header finds nothing otherwise; a verifier that reads the claims is unaffected. And the header and claims
+ are printed once at trace level: when a game refuses a token, the only answerable question is what it was
+ given, and neither a signature nor a base64 blob can be read off a log. The header is now encoded by its
+ length rather than its buffer size (it is built at run time), which the test covers along with the three
+ fields it must contain.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/dmidtoken.c       | 15 ++++++++++++---
+ dm/host/tests/t_idtoken.c | 20 ++++++++++++++++++++
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/dmidtoken.c b/dm/host/dmidtoken.c
+index ff23be9..0d84221 100644
+--- a/dm/host/dmidtoken.c
++++ b/dm/host/dmidtoken.c
+@@ -1,6 +1,7 @@
+ #include "dmidtoken.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>          // getenv, for the trace below
+ #include <string.h>
+ #include <strings.h>   // strcasecmp, for the application ids
+ #include <time.h>
+@@ -102,10 +103,14 @@ size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *ver
+                         const char *app_id, dm_sign_fn sign) {
+     if (!out || cap < 2 || !nnex || !*nnex || !sign) return 0;
+ 
+-    static const char HEADER[] =
+-        "{\"alg\":\"RS256\",\"typ\":\"id_token\",\"kid\":\"nextendo-baas-key-1\"}";
+     static const char JKU[] =
+         "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates";
++    // The reference client carries `jku` in the header as well as in the payload (Citron builds the
++    // header as alg, kid, typ, jku): a verifier that reads the key location from the header needs it
++    // there, and one that reads the payload is unaffected.
++    static char HEADER[256];
++    snprintf(HEADER, sizeof HEADER,
++             "{\"alg\":\"RS256\",\"kid\":\"nextendo-baas-key-1\",\"typ\":\"id_token\",\"jku\":\"%s\"}", JKU);
+     static const char ISSUER[] = "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
+     static const char AUDIENCE[] = "ed9e2f05d286f7b8";   // Citron's BaasAudience
+ 
+@@ -150,8 +155,12 @@ size_t dm_idtoken_build(char *out, size_t cap, const char *nnex, const char *ver
+     body[w] = 0;
+ 
+     char h64[256], p64[sizeof body * 2];
+-    if (!dm_idtoken_b64url(HEADER, sizeof HEADER - 1, h64, sizeof h64)) return 0;
++    if (!dm_idtoken_b64url(HEADER, strlen(HEADER), h64, sizeof h64)) return 0;
+     if (!dm_idtoken_b64url(body, (size_t)w, p64, sizeof p64)) return 0;
++    // One line at trace level with both readable halves: when a game refuses a token, the only useful
++    // question is what exactly it was given, and a signature is not readable.
++    if (getenv("DM_NEXTENDO_TRACE") && getenv("DM_NEXTENDO_TRACE")[0] == '1')
++        fprintf(stderr, "[dm] nextendo: id_token header %s\n[dm] nextendo: id_token claims %s\n", h64, p64);
+ 
+     char msg[sizeof h64 + sizeof p64];
+     int mlen = snprintf(msg, sizeof msg, "%s.%s", h64, p64);
+diff --git a/dm/host/tests/t_idtoken.c b/dm/host/tests/t_idtoken.c
+index 4dc8b1b..5cfe334 100644
+--- a/dm/host/tests/t_idtoken.c
++++ b/dm/host/tests/t_idtoken.c
+@@ -69,6 +69,26 @@ int main(void) {
+     memcpy(payload, d1 + 1, (size_t)(d2 - d1 - 1)); payload[d2 - d1 - 1] = 0;
+     check_b64url(head);
+     check_b64url(payload);
++    {
++        // The header is base64url too, and it carries the key location: the reference client puts
++        // `jku` there as well as in the claims, and a verifier may read it from either place.
++        static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
++        char header[512];
++        size_t o = 0;
++        unsigned acc = 0;
++        int bits = 0;
++        for (const char *p = head; *p && o + 1 < sizeof header; p++) {
++            const char *q = strchr(A, *p);
++            assert(q);
++            acc = acc << 6 | (unsigned)(q - A);
++            bits += 6;
++            if (bits >= 8) { bits -= 8; header[o++] = (char)((acc >> bits) & 0xFF); }
++        }
++        header[o] = 0;
++        assert(strstr(header, "\"alg\":\"RS256\""));
++        assert(strstr(header, "\"kid\":\"nextendo-baas-key-1\""));
++        assert(strstr(header, "\"jku\":\"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates\""));
++    }
+     check_b64url(d2 + 1);
+ 
+     // Decoded payload: the claims a game and the server read.
