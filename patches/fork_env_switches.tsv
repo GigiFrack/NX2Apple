@@ -59,3 +59,4 @@ DM_TOUCH_LAYOUT	player	The player's per-layout touch-control arrangement, encode
 DM_TOUCH_SIZE	player	iOS touch-control size: small, medium (default) or large. Controls move toward medium when the requested size does not fit
 DM_TOUCH_STICK	player	iOS left touch-stick position: corner (default), higher or inward
 DM_UI_HOLD	test	When set, keeps the controller mapping test window open for 60 seconds after its UI screenshot for manual inspection
+DM_HLE_TRACE	diagnostic	`1` names each forced take-over the first time the game calls it, in the order the game asks for them (600 names, then it stops), which answers "what is it waiting for" on a title that stops before it touches the network; no code is generated, so unlike `DM_HLECOUNT` it works on iPhone. Off by default.
