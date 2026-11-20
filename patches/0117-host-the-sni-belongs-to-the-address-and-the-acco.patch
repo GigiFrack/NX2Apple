@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 10:02:15 +0000
+Subject: [PATCH] host: the sni belongs to the address, and the account hosts
+ are baas
+
+Upstream-Status: fork-only
+Reason: Two rules of the redirect layer that the reference client applies and this host did not. First, the SNI:
+ a game that opens TLS to a bare address sends no hostname, and Nextendo's router picks the service from the
+ SNI, so it must be the name that resolved to *that* address - the map kept a single global "last name", and
+ with two services open at once (NPLN and gs.nintendo.net) the second handshake could carry the first one's
+ name. Every resolution now records address -> name and the TLS layer asks for the peer's own (through
+ dm_nd_tcp_name, the guest equivalent of getpeername), falling back to the old last-name answer. Second,
+ accounts.nintendo.com and api.accounts.nintendo.com are the BAAS application host by the time the server
+ sees them; the address is the same, so only the name has to follow - dm_nd_sni_for rewrites those two and
+ leaves every other host alone. The map test covers both: two names, two addresses, each remembering its own,
+ and the rewrite (including that gs.nintendo.net is untouched).
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.h              |  3 +++
+ dm/host/hle_nextendo.c         | 41 +++++++++++++++++++++++++++++++++-
+ dm/host/hle_nextendo.h         |  6 +++++
+ dm/host/hle_ssl.c              | 20 ++++++++++++++---
+ dm/host/tests/t_nextendo_map.c | 20 +++++++++++++++++
+ 5 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/dm/host/hle_net.h b/dm/host/hle_net.h
+index 2a29d39..84c7282 100644
+--- a/dm/host/hle_net.h
++++ b/dm/host/hle_net.h
+@@ -17,3 +17,6 @@ long dm_sk_write(int fd, const void *data, unsigned long size);
+ int dm_sk_poll(void *fds, uint64_t count, int milliseconds);
+ int dm_sk_select(int nfds, uint64_t *read, uint64_t *write, uint64_t *except, const int64_t *timeout);
+ int dm_sk_errno(void);
++
++//: The guest sockaddr of a Nextendo stream socket (the real one behind it): `peer` picks the far end.
++int dm_nd_tcp_name(int fd, void *a, unsigned *n, int peer);
+diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
+index 0369bce..8718a4d 100644
+--- a/dm/host/hle_nextendo.c
++++ b/dm/host/hle_nextendo.c
+@@ -197,10 +197,46 @@ void dm_nd_trace_result(const char *what, long long value) {
+ // (`SslManagedSocketConnection.cs` reconstructs it the same way).
+ static char g_nd_last[ND_NAME_MAX];
+ 
++// The name each address was last resolved from. A game that dials a bare address sends no hostname,
++// and Nextendo's router reads the SNI to pick the service: the answer has to be the name that belongs
++// to *that* address, not simply the last one asked for - two services can be open at once (NPLN and
++// gs.nintendo.net), and the second handshake would otherwise carry the first one's name.
++typedef struct { uint32_t addr; char name[ND_NAME_MAX]; } nd_addr_name;
++static nd_addr_name g_nd_by_addr[16];
++static int g_nd_by_addr_next;
++
++static void nd_remember_addr(uint32_t addr, const char *host) {
++    if (!addr || !host) return;
++    for (int i = 0; i < 16; i++)
++        if (g_nd_by_addr[i].addr == addr) { snprintf(g_nd_by_addr[i].name, ND_NAME_MAX, "%s", host); return; }
++    nd_addr_name *slot = &g_nd_by_addr[g_nd_by_addr_next];
++    g_nd_by_addr_next = (g_nd_by_addr_next + 1) % 16;
++    slot->addr = addr;
++    snprintf(slot->name, ND_NAME_MAX, "%s", host);
++}
++
+ const char *dm_nd_last_host(void) {
+     return g_nd_last[0] ? g_nd_last : NULL;
+ }
+ 
++const char *dm_nd_host_for_addr(uint32_t addr) {
++    if (!addr) return NULL;
++    for (int i = 0; i < 16; i++)
++        if (g_nd_by_addr[i].addr == addr && g_nd_by_addr[i].name[0]) return g_nd_by_addr[i].name;
++    return NULL;
++}
++
++// The two account hosts are the BAAS application host before anything else happens: the reference
++// client rewrites them before DNS, so the server sees the BAAS name and not the account one. A game
++// that dials accounts.nintendo.com by address depends on the SNI saying so.
++const char *dm_nd_sni_for(const char *host) {
++    static const char BAAS[] = "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
++    if (!host) return NULL;
++    if (!strcasecmp(host, "accounts.nintendo.com") || !strcasecmp(host, "api.accounts.nintendo.com"))
++        return BAAS;
++    return host;
++}
++
+ int dm_nd_lookup(const char *host, uint32_t *addrs, int max) {
+     if (!host || !addrs || max < 1 || !dm_nd_enabled()) return 0;
+     if (!g_nd_loaded) dm_nd_reload();
+@@ -217,7 +253,10 @@ int dm_nd_lookup(const char *host, uint32_t *addrs, int max) {
+         uint32_t ip = 0;
+         if (nd_builtin_lookup(host, &ip)) addrs[found++] = ip;
+     }
+-    if (found) snprintf(g_nd_last, sizeof g_nd_last, "%s", host);
++    if (found) {
++        snprintf(g_nd_last, sizeof g_nd_last, "%s", host);
++        for (int i = 0; i < found; i++) nd_remember_addr(addrs[i], host);
++    }
+     return found;
+ }
+ 
+diff --git a/dm/host/hle_nextendo.h b/dm/host/hle_nextendo.h
+index bb20310..6bbd4bf 100644
+--- a/dm/host/hle_nextendo.h
++++ b/dm/host/hle_nextendo.h
+@@ -21,6 +21,12 @@ void dm_nd_trace_result(const char *what, long long value);
+ //: The last hostname this map resolved, for the SNI of a connection the game opened by address.
+ const char *dm_nd_last_host(void);
+ 
++//: The name an address was last resolved from (NULL when this map never named it).
++const char *dm_nd_host_for_addr(uint32_t addr);
++
++//: The name to put in the TLS SNI: the account hosts become the BAAS host, everything else as given.
++const char *dm_nd_sni_for(const char *host);
++
+ //: How many rules the current map holds; 0 when the switch is off or nothing was given.
+ int dm_nd_rule_count(void);
+ 
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 7fa366b..3e8d8f9 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -180,9 +180,23 @@ static int dm_ssl_open(dm_ssl_conn *c) {
+     if (!c->st) return -1;
+     SSLSetIOFuncs(c->st, dm_ssl_io_read, dm_ssl_io_write);
+     SSLSetConnection(c->st, c);
+-    // SNI: the name the game set, else the last one the Nextendo map resolved. A game that dials an
+-    // address sends none, and Nextendo's router picks the service from that name.
+-    const char *sni = c->host[0] ? c->host : (dm_nd_enabled() ? dm_nd_last_host() : NULL);
++    // SNI: the name the game set; failing that the name that resolved to the address this socket is
++    // connected to; the last name the map answered only as a last resort. A game that dials a bare
++    // address sends no hostname and Nextendo's router picks the service from the SNI, so the answer has
++    // to belong to this connection: two services can be open at once (NPLN and gs.nintendo.net), and
++    // the second handshake used to carry whatever name had been asked for most recently.
++    const char *sni = c->host[0] ? c->host : NULL;
++    if (!sni && dm_nd_enabled()) {
++        uint32_t peer = 0;
++        unsigned n = 0;
++        unsigned char sa[16];
++        if (c->fd >= 0 && dm_nd_tcp_name(c->fd, sa, &n, 1) == 0 && n >= 8) memcpy(&peer, sa + 4, 4);
++        sni = dm_nd_host_for_addr(peer);
++        if (!sni) sni = dm_nd_last_host();
++    }
++    // The account hosts are the BAAS application host by the time the server sees them (the reference
++    // client rewrites them before DNS; here the address is the same and only the name has to follow).
++    if (sni) sni = dm_nd_sni_for(sni);
+     if (sni && *sni) SSLSetPeerDomainName(c->st, sni, strlen(sni));
+     // iOS has no "verify on/off" switch: verification is the default, and asking for none means
+     // breaking the handshake after the server's certificate so the host can carry on regardless.
+diff --git a/dm/host/tests/t_nextendo_map.c b/dm/host/tests/t_nextendo_map.c
+index cc902e3..4c52ee1 100644
+--- a/dm/host/tests/t_nextendo_map.c
++++ b/dm/host/tests/t_nextendo_map.c
+@@ -39,6 +39,26 @@ int main(void) {
+     expect(dm_nd_lookup("ndas.srv.nintendo.net", got, 4) == 0, "the bare suffix is not a wildcard match");
+     expect(dm_nd_lookup("nncs1-lp1.n.n.srv.nintendo.net", got, 4) == 1, "second rule's name mapped");
+     expect(dm_nd_lookup("example.com", got, 4) == 0, "a name nobody listed is not mapped");
++    // The name that belongs to an address, not the last one asked for: two services are open at the
++    // same time and the TLS layer has to send the right SNI for the socket it is shaking hands on.
++    {
++        uint32_t a[4] = {0}, b[4] = {0};
++        expect(dm_nd_lookup("g2b309e01-0000000000000000.srv.nintendo.net", a, 4) == 1, "first name mapped");
++        expect(dm_nd_lookup("nncs1-lp1.n.n.srv.nintendo.net", b, 4) == 1, "second name mapped");
++        expect(a[0] != b[0], "the two names are different addresses");
++        const char *for_a = dm_nd_host_for_addr(a[0]);
++        const char *for_b = dm_nd_host_for_addr(b[0]);
++        expect(for_a && strcmp(for_a, "g2b309e01-0000000000000000.srv.nintendo.net") == 0,
++               "the address remembers its own name");
++        expect(for_b && strcmp(for_b, "nncs1-lp1.n.n.srv.nintendo.net") == 0, "and so does the other one");
++        expect(dm_nd_host_for_addr(0x7f000001u) == NULL, "an address never resolved has no name");
++    }
++    // The two account hosts reach the server as the BAAS application host.
++    expect(strcmp(dm_nd_sni_for("accounts.nintendo.com"), "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com") == 0,
++           "accounts.nintendo.com carries the BAAS name");
++    expect(strcmp(dm_nd_sni_for("api.accounts.nintendo.com"), "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com") == 0,
++           "so does the api host");
++    expect(strcmp(dm_nd_sni_for("gs.nintendo.net"), "gs.nintendo.net") == 0, "anything else is left alone");
+     expect(dm_nd_lookup("*.example.org", got, 4) == 0, "a bad address never becomes a rule");
+ 
+     setenv("DM_NEXTENDO", "0", 1);
