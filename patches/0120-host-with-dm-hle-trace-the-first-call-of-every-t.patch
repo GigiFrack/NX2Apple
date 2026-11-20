@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 12:45:59 +0000
+Subject: [PATCH] host: with dm_hle_trace the first call of every take-over
+ names itself
+
+Upstream-Status: fork-only
+Reason: Knowing what a title asks for, in order, is what answers "what is it waiting for" - and on iPhone the
+ existing instrument for it (DM_HLECOUNT) is unavailable by construction, because it writes stubs at run time
+ and signed pages cannot execute code written at run time. This one generates nothing: the trampoline every
+ take-over already jumps through holds the implementation's address in its frame (x16), and the loader already
+ reads the whole table out of __DATA,swforce, so with DM_HLE_TRACE=1 a small open-addressed set names each
+ entry the first time it is called (600 names, then it stops). No per-function registration, no generated
+ code, and the same output on the phone as in a host test.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle.h          |  3 +++
+ dm/host/hle_bigstack.c | 43 ++++++++++++++++++++++++++++++++++++++++++
+ dm/host/loader.c       |  4 +++-
+ 3 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle.h b/dm/host/hle.h
+index 40583e2..9a3c3fa 100644
+--- a/dm/host/hle.h
++++ b/dm/host/hle.h
+@@ -48,6 +48,9 @@ typedef struct { const char *name; void *fn; const char *why; const char *to; }
+ #define HLE_STR(x) HLE_STR_(x)
+ #define HLE_STR_(x) #x
+ // Past 8 parameters the stub enters at dm_bigstack_enter_n with x17 = the bytes of stack arguments the caller passes: 8 per parameter past the eighth, rounded up to 16 (hle_bigstack.c copies them to the host stack)
++//: The forced take-over table (hle_bigstack.c's entry trace looks a call's target up in it).
++const hle_force_ent *dm_force_table(unsigned *count);
++
+ #define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
+     _Static_assert(HLE_NARG(__VA_ARGS__) <= 16, #cname ": more parameters than the big-stack entry carries over (hle.h)"); \
+     static ret cname(__VA_ARGS__) __attribute__((used));                                          \
+diff --git a/dm/host/hle_bigstack.c b/dm/host/hle_bigstack.c
+index f2ae97b..2e21a09 100644
+--- a/dm/host/hle_bigstack.c
++++ b/dm/host/hle_bigstack.c
+@@ -17,6 +17,10 @@
+ #include <sys/mman.h>
+ #define DM_LOG_IMPL   // dm_log is defined here, not by dm.h's weak definition
+ #include "dm.h"
++// The forced take-over table's shape, restated rather than pulled in with hle.h: this unit is the one the
++// macro's stubs jump to, and hle.h's macros have no business being expanded here.
++typedef struct { const char *name; const void *fn; const char *why; const char *alias; } hle_force_ent;
++const hle_force_ent *dm_force_table(unsigned *count);
+ 
+ int dm_guest_as_contains(uintptr_t a);   // hle_svc.c
+ 
+@@ -79,7 +83,46 @@ static void bs_init(void) { if (pthread_key_create(&g_bs_key, bs_free)) die("big
+ 
+ // sp inside the guest address block -> the top of this thread's host stack (16-byte aligned); otherwise 0 (no switch)
+ uintptr_t dm_bigstack_top(uintptr_t sp);
++// The entry trace: with DM_HLE_TRACE=1 the first time a take-over is called, its name is printed. Reading
++// it off the frame the trampoline built (x16 sits at +0x48) and the table the loader read out of
++// __DATA,swforce, so no code is generated and nothing has to be registered per function - which is what
++// made DM_HLECOUNT unavailable on iPhone. What a game asks for, in order, is the only thing that answers
++// "what is it waiting for" when a title stops before it touches the network.
++static void hle_trace_note(uintptr_t sp) {
++    static int on = -1;                       // -1 = not read yet
++    if (on < 0) { const char *e = getenv("DM_HLE_TRACE"); on = e && e[0] == '1'; }
++    if (!on) return;
++    unsigned n = 0;
++    const hle_force_ent *tab = dm_force_table(&n);
++    if (!tab || !n) return;
++    uintptr_t impl = ((const uintptr_t *)sp)[9];      // x16: the implementation the stub jumped to
++    if (!impl) return;
++    // A small open-addressed set of what has been named already: the entry runs for every call, so the
++    // test has to be two probes, not a scan of the table.
++    enum { SLOTS = 4096, CAP = 600 };
++    static uintptr_t seen[SLOTS];
++    static int printed;
++    if (printed >= CAP) return;
++    uintptr_t h = (impl >> 2) * 2654435761u;
++    for (int probe = 0; probe < 16; probe++) {
++        uintptr_t *slot = &seen[(h + (uintptr_t)probe) & (SLOTS - 1)];
++        if (*slot == impl) return;                     // already named
++        if (*slot == 0) {
++            *slot = impl;
++            for (unsigned i = 0; i < n; i++)
++                if ((uintptr_t)tab[i].fn == impl) {
++                    if (printed == 0) fprintf(stderr, "[dm] hle trace: first calls, in order\n");
++                    printed++;
++                    fprintf(stderr, "[dm] hle: %s\n", tab[i].name);
++                    return;
++                }
++            return;                                    // not a taken-over entry (a direct call)
++        }
++    }
++}
++
+ uintptr_t dm_bigstack_top(uintptr_t sp) {
++    hle_trace_note(sp);
+     if (!dm_guest_as_contains(sp)) return 0;
+     pthread_once(&g_bs_once, bs_init);
+     uint8_t *top = pthread_getspecific(g_bs_key);
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 3a6afe6..12f45cb 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -216,7 +216,9 @@ static uint64_t resolve_sym(module_t *m, const char *name) {
+ }
+ 
+ // Forced take-over table (hle.h HLE_FORCE, the __DATA,swforce section): a hit overrides the definition inside the module
+-static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
++static const hle_force_ent *g_force; static unsigned g_nforce;
++//: Read-only view of the table, for the entry trace in hle_bigstack.c (it names the take-over a call landed in).
++const hle_force_ent *dm_force_table(unsigned *count) { if (count) *count = g_nforce; return g_force; } static unsigned *g_force_hits;
+ static unsigned *g_fidx, g_fmask;   // name hash over the table: force_lookup runs for every named relocation, and each lookup used to strcmp its way through all 722 entries (the swhle table's scan is hashed the same way, hle.c)
+ static void force_init(void) {
+     unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(DM_HOST_IMAGE, "__DATA", "swforce", &sz);
