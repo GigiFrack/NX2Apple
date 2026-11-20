@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 13:41:51 +0000
+Subject: [PATCH] host: dm_hle_imports names what the modules import
+
+Upstream-Status: fork-only
+Reason: The take-over table can only name what the host already answers: a symbol nobody took over appears
+ nowhere, and its mangled form had to be guessed - which is how a plausible entry gets written that the
+ loader then rejects, aborting the load. This logs the other direction: every name a relocation asks for,
+ with the exact spelling the module imports. A value that is not exactly 1 is a substring filter, so a
+ whole family (account, npln, nn::ssl) costs one line in env.txt, and dedup is by name (the same symbol
+ is asked for once per relocation, and there are hundreds of thousands). Off by default; nothing is
+ printed, allocated or hashed when it is unset.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/loader.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 12f45cb..d55188c 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -236,7 +236,28 @@ static void force_init(void) {
+             for (unsigned j = sym_hash(g_force[i].to) & g_fmask; g_fidx[j]; j = (j + 1) & g_fmask)
+                 if (!strcmp(g_force[g_fidx[j] - 1].name, g_force[i].to)) die("forced alias %s: its target %s is itself taken over", g_force[i].name, g_force[i].to);
+ }
++// DM_HLE_IMPORTS names the symbols the modules import. Every relocation asks for a name here, so the
++// log lists what the game needs instead of only what the host already answers (the take-over table can
++// only name what exists: a symbol nobody took over appears nowhere, and guessing its mangled form is how
++// a plausible-looking entry gets added that the loader then rejects). A value that is not exactly 1 is a
++// substring filter, so a whole family - account, npln, nn::ssl - costs one line in env.txt; 1 prints all.
++static void import_note(const char *name) {
++    static const char *filter; static int on = -1;
++    if (on < 0) { filter = getenv("DM_HLE_IMPORTS"); on = filter && *filter; }
++    if (!on) return;
++    if (!(filter[0] == '1' && filter[1] == 0) && !strstr(name, filter)) return;
++    enum { SLOTS = 8192, CAP = 4000 };
++    static const char *seen[SLOTS]; static unsigned printed;
++    if (printed >= CAP) return;
++    unsigned long h = (unsigned long)((uintptr_t)name >> 4) * 2654435761u;
++    for (int probe = 0; probe < 8; probe++) {
++        const char **slot = &seen[(h + (unsigned long)probe) & (SLOTS - 1)];
++        if (*slot && !strcmp(*slot, name)) return;
++        if (!*slot) { *slot = name; printed++; LOG("import %s", name); return; }
++    }
++}
+ static void *force_lookup(const char *name) {
++    import_note(name);
+     if (!g_fmask) return NULL;
+     for (unsigned j = sym_hash(name) & g_fmask; g_fidx[j]; j = (j + 1) & g_fmask) {
+         unsigned i = g_fidx[j] - 1;
