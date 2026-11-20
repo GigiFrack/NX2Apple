@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 09:47:49 +0000
+Subject: [PATCH] host: nncs1 answers from the server, nncs2 from the nat
+ responder
+
+Upstream-Status: fork-only
+Reason: The NAT check (Pia) probes ports 10025 and 10125 of two public addresses that must differ, nncs1 and
+ nncs2-*; sending both to the same one makes the check fail silently with 2618-0201. The built-in redirect
+ sent every *.n.n.srv.nintendo.net name - nncs1 included - to the NAT responder, so the two probes went to
+ one address. nncs1 now resolves to the server and nncs2-* keeps the NAT responder, as Ryujinx-Nextendo's
+ NextendoNetworkCheck does (Nncs1 = the server address, Nncs2 = the NAT one).
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_nextendo.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
+index d62d83f..0369bce 100644
+--- a/dm/host/hle_nextendo.c
++++ b/dm/host/hle_nextendo.c
+@@ -128,6 +128,13 @@ static int nd_ends_with(const char *host, const char *suffix) {
+     return hl > sl && strcasecmp(host + hl - sl, suffix) == 0;
+ }
+ 
++//: The NAT check probes two DISTINCT public addresses and needs them to differ: `nncs1` is answered by
++//: the server itself, `nncs2-*` by the NAT responder (Ryujinx-Nextendo's NextendoNetworkCheck: Nncs1 is
++//: the server address, Nncs2 the NAT one). Sent to one address, the check fails silently (2618-0201).
++static int nd_is_nncs1(const char *host) {
++    return !strncasecmp(host, "nncs1", 5);
++}
++
+ //: The NAT responder's hosts answer from `nat.`: the three the reference client names first, plus the
+ //: `nncs2-*.n.n.srv` family for the games whose NAT check needs a second public address.
+ static int nd_is_nat_host(const char *host) {
+@@ -148,6 +155,11 @@ static int nd_is_namespace(const char *host) {
+ static int nd_builtin_lookup(const char *host, uint32_t *addr) {
+     if (!nd_builtin_enabled()) return 0;
+     nd_builtin_resolve();
++    if (nd_is_nncs1(host)) {          // first: the family test below would swallow it into `nat.`
++        if (!g_nd_nex_ip) return 0;
++        *addr = g_nd_nex_ip;
++        return 1;
++    }
+     if (nd_is_nat_host(host)) {
+         if (!g_nd_nat_ip) return 0;
+         *addr = g_nd_nat_ip;
