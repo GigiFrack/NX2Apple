@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 09:51:16 +0000
+Subject: [PATCH] host: a patched page goes back to the protection it had
+
+Upstream-Status: fork-only
+Reason: dm_page_code_again put every patched page back to read+execute, which is right for a module's code and
+ wrong for anything else: the host test patches a buffer it owns, and its next write to that page faulted.
+ macOS CI died with a segfault in t_npln_patch (exit 139) while the same test passed on the Linux box, where
+ the mach part is compiled out. The protection a page had is now read back with vm_region_64 before the page
+ is made writable and restored afterwards, so a data page stays writable and only real code ends up
+ read+execute (with the instruction cache invalidated for it).
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c | 46 ++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index 8682339..c9104f3 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -12,17 +12,59 @@
+ // writable. A patch therefore has to make just those pages private and writable for the write and put them
+ // back to code afterwards. VM_PROT_COPY is what keeps this off the file: without it the write would either
+ // be refused or reach the bundle.
++// The protection each page had before it was made writable, so it can be put back as it was: a code
++// page ends up read+execute again, but a page that was plain data (the host tests patch a buffer they
++// own) must not be left read-only and executable - the next write to it would fault.
++typedef struct { vm_address_t page; vm_prot_t prot; int used; } dm_page_prot;
++static dm_page_prot g_page_prot[16];
++
++static vm_prot_t dm_page_prot_of(vm_address_t page) {
++    vm_address_t region = page;
++    vm_size_t region_size = 0;
++    vm_region_basic_info_data_64_t info;
++    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++    mach_port_t object = MACH_PORT_NULL;
++    if (vm_region_64(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
++                     (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
++        return VM_PROT_READ | VM_PROT_EXECUTE;
++    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
++    return info.protection;
++}
++
++static void dm_page_remember(vm_address_t page, vm_prot_t prot) {
++    for (int i = 0; i < 16; i++) {
++        if (g_page_prot[i].used && g_page_prot[i].page == page) return;
++    }
++    for (int i = 0; i < 16; i++) {
++        if (!g_page_prot[i].used) { g_page_prot[i].page = page; g_page_prot[i].prot = prot; g_page_prot[i].used = 1; return; }
++    }
++}
++
++static vm_prot_t dm_page_forget(vm_address_t page) {
++    for (int i = 0; i < 16; i++) {
++        if (g_page_prot[i].used && g_page_prot[i].page == page) {
++            vm_prot_t p = g_page_prot[i].prot;
++            g_page_prot[i].used = 0;
++            return p;
++        }
++    }
++    return VM_PROT_READ | VM_PROT_EXECUTE;
++}
++
+ static int dm_page_writable(void *addr, size_t len) {
+     vm_address_t page = (vm_address_t)((uintptr_t)addr & ~(uintptr_t)(vm_page_size - 1));
+     vm_size_t size = (vm_address_t)((uintptr_t)addr + len) - page;
++    dm_page_remember(page, dm_page_prot_of(page));
+     return vm_protect(mach_task_self(), page, size, FALSE,
+                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS;
+ }
+ static void dm_page_code_again(void *addr, size_t len) {
+     vm_address_t page = (vm_address_t)((uintptr_t)addr & ~(uintptr_t)(vm_page_size - 1));
+     vm_size_t size = (vm_address_t)((uintptr_t)addr + len) - page;
+-    vm_protect(mach_task_self(), page, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+-    sys_icache_invalidate(addr, len);
++    vm_prot_t want = dm_page_forget(page);
++    // A code page goes back to read+execute; the instruction cache only matters for those.
++    if (!vm_protect(mach_task_self(), page, size, FALSE, want) && (want & VM_PROT_EXECUTE))
++        sys_icache_invalidate(addr, len);
+ }
+ #else
+ // The host tests patch a buffer they own, so the pages are already writable.
