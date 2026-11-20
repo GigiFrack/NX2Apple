@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 10:22:26 +0000
+Subject: [PATCH] host: the async id token cache answers with the token it has
+
+Upstream-Status: fork-only
+Reason: With a game token in the environment the identity is already known, and the synchronous
+ EnsureNetworkServiceAccountAvailable says so (RES_OK). The asynchronous request that fills the same cache and
+ the GetResult that reports it went to the dauth chain instead, which has no server to answer when the identity
+ comes from a token, so they returned RES_FAIL. The game received a valid id_token from LoadIdTokenCache and,
+ at the same time, a failed result for the request that was supposed to produce it: it took that for "this
+ account cannot go online" and raised its own 0x2A2 before resolving a single name. Both now answer like the
+ synchronous form, and the trace prints which path answered.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_account.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_account.c b/dm/host/hle_account.c
+index 4f87a25..aba136d 100644
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -150,13 +150,24 @@ HLE_FORCE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAc
+ HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "the async form: the chain is asked here, the event fires at once (DM_NEXTENDO=1)", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) { dm_nd_trace_result("account::44", -1);
+     (void)ctx; (void)h;
+     if (!dm_nd_enabled()) return RES_FAIL;
+-    return dm_acc_nsa_ensure() ? RES_OK : RES_FAIL;
++    // The game token is the identity already: the dauth chain is what answers when there is none, and
++    // asking it here made this answer RES_FAIL while LoadIdTokenCache handed the game a valid token -
++    // the game read the contradiction as "this account cannot go online" (0x2A2, no name ever resolved).
++    if (nd_has_token()) { dm_nd_trace_result("account::EnsureIdTokenCacheAsync(token)", RES_OK); return RES_OK; }
++    Result r = dm_acc_nsa_ensure() ? RES_OK : RES_FAIL;
++    dm_nd_trace_result("account::EnsureIdTokenCacheAsync(chain)", r);
++    return r;
+ }
+ HLE_FORCE("_ZN2nn7account12AsyncContext14GetSystemEventEPNS_2os11SystemEventE", "async completion event; fires immediately", Result, h_acc_AcGetEv, void *self, void *ev) { dm_nd_trace_result("account::12AsyncContext14GetSystem", -1); (void)self; hle_signal_system_event(ev); return RES_OK; }
+ HLE_FORCE("_ZN2nn7account12AsyncContext9GetResultEv", "async result: the chain's, when it is on; failure otherwise", Result, h_acc_AcGetRes, void *self) { dm_nd_trace_result("account::12AsyncContext9GetResult", -1);
+     (void)self;
+     if (!dm_nd_enabled()) return RES_FAIL;
+-    return dm_acc_nsa_ensure() ? RES_OK : RES_FAIL;
++    // Same answer as the request above: a token in the environment is the identity, so the result of
++    // that request is success (it used to say failure while the token itself was handed over fine).
++    if (nd_has_token()) { dm_nd_trace_result("account::AsyncContextGetResult(token)", RES_OK); return RES_OK; }
++    Result r = dm_acc_nsa_ensure() ? RES_OK : RES_FAIL;
++    dm_nd_trace_result("account::AsyncContextGetResult(chain)", r);
++    return r;
+ }
+ HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContextC1Ev", "Nintendo Account authorization, out of scope; the constructor writes no memory", void, h_acc_NaCtor, void *self) { dm_nd_trace_result("account::42NintendoAccountAuthorizationRequestContextC1", -1); (void)self; }
+ HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContextD1Ev", "Nintendo Account authorization, out of scope", void, h_acc_NaDtor, void *self) { dm_nd_trace_result("account::42NintendoAccountAuthorizationRequestContextD1", -1); (void)self; }
