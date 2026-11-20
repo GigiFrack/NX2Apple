@@ -275,6 +275,25 @@ The options are the upstream script's (`-h`). The IPA is unsigned, as on a Mac: 
 Sideloadly (Windows), AltStore, or similar, and enable the Increased Memory Limit capability if
 the tool offers it. The IPA name and the RomFS archive come out where the macOS build puts them.
 
+That command builds the game as one app. The launcher's default mode is the *shared* shell —
+`DmShell.app` with the game as a framework inside it — and it gets there in two steps: the driver
+builds the framework, then `shell_export` mirrors it into the shell cache and packs the IPA. Both
+steps are one command as well, which is what a rebuild with no one at the keyboard needs:
+
+```bat
+:: the framework into <work>/shell-framework, then the IPA; prints where it is
+python -m nspb_qt.win.build D:\Games\MarioWonder -k D:\keys\prod.keys ^
+    --title-id 0100152000022000 -p v458752 --work-dir D:\build\0100152000022000_build
+
+:: pack a framework an earlier build left, without building again
+python -m nspb_qt.win.build --skip-build --title-id 0100152000022000 ^
+    --work-dir D:\build\0100152000022000_build
+```
+
+`--shell-root` points at the shell cache when it is not the default
+(`%LOCALAPPDATA%\NS Port Builder\shell`); `--print-path-file` writes the IPA path so a script can
+read it back, and anything after `--` is handed to the driver unchanged.
+
 ## Open risks
 
 The frontend's setup has run on Windows, and one locally patched Windows build installed, launched
