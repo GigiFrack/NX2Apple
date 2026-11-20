@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Fri, 20 Nov 2026 09:55:34 +0000
+Subject: [PATCH] tests: the npln test writes its catalog where it can
+
+Upstream-Status: fork-only
+Reason: The test wrote its catalog to a relative "build/t_npln.tsv" and never checked fopen: the macOS CI runs the
+ binary from the repository root, so that path did not exist, fopen returned NULL and the fprintf after it
+ crashed the process with SIGSEGV (exit 139) before the test printed anything at all. The file now goes to
+ TMPDIR (or /tmp) under a name of its own, and a failure to open it is reported instead of dereferenced.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/tests/t_npln_patch.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/tests/t_npln_patch.c b/dm/host/tests/t_npln_patch.c
+index 5b5b1f3..2166cd3 100644
+--- a/dm/host/tests/t_npln_patch.c
++++ b/dm/host/tests/t_npln_patch.c
+@@ -2,6 +2,7 @@
+ #include "dm.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <unistd.h>   // getpid
+ 
+ module_t *g_mod;
+ int g_nmod;
+@@ -19,8 +20,13 @@ int main(void) {
+     memset(g_image, 0, sizeof g_image);
+     g_image[off] = 0xAA; g_image[off + 1] = 0xE2; g_image[off + 2] = 0x40; g_image[off + 3] = 0x39;
+ 
+-    const char *path = "build/t_npln.tsv";
++    // A path of its own: the CI runs this binary from the repo root, so a relative "build/..." is not
++    // the folder the binary sits in - fopen came back NULL there and the fprintf below walked into it.
++    char path[512];
++    const char *tmp = getenv("TMPDIR");
++    snprintf(path, sizeof path, "%s/t_npln_%d.tsv", tmp && *tmp ? tmp : "/tmp", (int)getpid());
+     FILE *f = fopen(path, "w");
++    if (!f) return fail("cannot write the catalog");
+     fprintf(f, "V\t0100965017338000\t2.3.0\tnpln\t1\n");
+     fprintf(f, "P\t0100965017338000\t2.3.0\tD70CE1726C979E45ED4200E9C2B23B2A258FDC18000000000000000000000000"
+                "\tmain\t128\tAAE24039\t2A008052\n");
