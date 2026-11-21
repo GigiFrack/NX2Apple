@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 10:28:09 +0000
+Subject: [PATCH] tests: the certificate store test builds where mkdtemp is not
+ declared
+
+The CI runner's libc does not declare mkdtemp under the flags the tests use, so t_ssl_certs did
+not compile there at all - and the build step hid make's exit code behind `| tee`, so a missing
+binary only showed up three steps later. The scratch folder is now TMPDIR + the pid, which needs
+nothing beyond getpid.
+
+Upstream-Status: fork-only
+Reason: The CI runner's libc does not declare mkdtemp under the flags the tests are built with, so t_ssl_certs did
+ not compile there at all: the build step's `| tee` hid make's exit code and the failure surfaced three steps
+ later as a missing binary. The scratch folder is now TMPDIR + the pid, which needs nothing beyond getpid.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/tests/t_ssl_certs.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/tests/t_ssl_certs.c b/dm/host/tests/t_ssl_certs.c
+index 56384f7..bda1efa 100644
+--- a/dm/host/tests/t_ssl_certs.c
++++ b/dm/host/tests/t_ssl_certs.c
+@@ -15,6 +15,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ // SDK 17's class, the one the game dereferences: id, status, der_size, der data.
+ struct info_base { uint32_t id, status; uint64_t size; const void *der; };
+@@ -80,8 +81,11 @@ int main(void) {
+     // ---- a certificate the user dropped in wins over the built-in one
+     static const uint8_t fake[] = {0x30, 0x82, 0x00, 0x10, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x55, 0x04, 0x03,
+                                    0x04, 0x00, 0x00, 0x00};   // any bytes: the store hands them through
+-    char dir[] = "/tmp/dm_ssl_ca_XXXXXX";
+-    assert(mkdtemp(dir) != NULL);
++    const char *tmp = getenv("TMPDIR");
++    if (!tmp || !*tmp) tmp = "/tmp/";
++    char dir[512];
++    snprintf(dir, sizeof dir, "%sdm_ssl_ca_%ld", tmp, (long)getpid());   // mkdtemp is not declared by every libc
++    mkdir(dir, 0755);
+     char path[512];
+     snprintf(path, sizeof path, "%s/certs", dir);
+     assert(mkdir(path, 0755) == 0);
