@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 18:58:50 +0000
+Subject: [PATCH] host: a socket option read back is the socket's answer, for
+ SOL_SOCKET too
+
+The title repeated the same check one option later: it set SO_REUSEADDR (level 0xffff, option 4), read it
+back and this host answered its own fixed 0, so the socket it had just configured still looked broken.
+
+SOL_SOCKET now goes to the socket in both directions like IPPROTO_TCP already did - Horizon's numbers
+are the FreeBSD ones this stack speaks, so SO_REUSEADDR is 4 on both - and an option the host does not
+know is accepted on the way in and answered from this host's own view on the way out, which is what the
+old code did for everything. The trace prints the value a read-back answered, so the next log settles
+this class of question without a build.
+
+Upstream-Status: fork-only
+Reason: The title repeated one option later the check that 0134/0136 fixed: it set SO_REUSEADDR (level 0xffff, option
+ 4), read it back, and got this host's fixed 0, so the socket it had just configured still looked broken. SOL_SOCKET
+ goes to the socket both ways now - Horizon's numbers are the FreeBSD ones this stack speaks, SO_REUSEADDR is 4 on
+ both - with the old behaviour kept for an option the host does not know. The read-back trace prints the value, so
+ this class of question is settled by the next log instead of a build.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 20 ++++++++++++++------
+ dm/host/tests/t_net_tcp.c |  7 +++++++
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 2d579edb..6baa5707 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -347,7 +347,10 @@ int dm_nd_tcp_setopt(int fd, int level, int option, const void *value, unsigned
+         if (option == 1 && size >= sizeof(int)) { int v; memcpy(&v, value, sizeof v); e->nodelay = !!v; e->nodelay_set = 1; }
+         if (setsockopt(h, IPPROTO_TCP, option, value, size) < 0) r = sk_error(nd_errno(errno));
+     } else if (level == 0xffff) {
+-        /* SO_REUSEADDR and friends: accepted and not needed on a stream socket here */
++        // SOL_SOCKET: Horizon's numbers are the FreeBSD ones this stack speaks (SO_REUSEADDR is 4 on both), so
++        // the socket takes the option and a title that reads it back sees what it set. An option the host does
++        // not know is accepted and dropped: a stream socket here does not need it.
++        if (value && size && setsockopt(h, SOL_SOCKET, option, value, size) < 0) r = 0;
+     } else r = sk_error(42);
+     pthread_mutex_unlock(&g_nd_tcp_m);
+     return r;
+@@ -370,10 +373,12 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+         unsigned c = *size < sizeof v ? *size : (unsigned)sizeof v;
+         v = e->nodelay;
+         if (c) { memcpy(value, &v, c); *size = c; }
+-    } else if (level == 6 && *size <= 64) {
+-        // Any other IPPROTO_TCP option: the numbers are the host's own, so ask the socket.
++    } else if ((level == 0xffff || level == 6) && *size <= 64) {
++        // Horizon's SOL_SOCKET and IPPROTO_TCP numbers are the ones this stack speaks, so the socket answers
++        // first: an option the title set reads back as it set it (SO_REUSEADDR, SO_TYPE, the buffers), instead
++        // of this host's guess at what the answer should be.
+         unsigned len = *size;
+-        if (getsockopt(h, IPPROTO_TCP, option, value, &len) < 0) r = sk_error(nd_errno(errno));
++        if (getsockopt(h, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, option, value, &len) < 0) r = sk_error(nd_errno(errno));
+         else *size = len;
+     } else {
+         if (option == 0x1008) v = 1;            // SOCK_STREAM
+@@ -901,8 +906,11 @@ SKF("nnsocketGetSockName", h_nsk_GetSockName, int s, void *a, unsigned *n) { ret
+ SKF("nnsocketGetSockOpt", h_nsk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) {
+     unsigned ask = n ? *n : 0;
+     int r = dm_sk_getopt(s, l, o, v, n);
+-    { char t[128]; snprintf(t, sizeof t, "socket::GetSockOpt(fd %d level 0x%x option 0x%x) size %u -> %u", s, l, o, ask, n ? *n : 0);
+-      dm_nd_trace_result(t, r); }
++    char t[144];
++    if (!r && v && n && *n == sizeof(int)) snprintf(t, sizeof t, "socket::GetSockOpt(fd %d level 0x%x option 0x%x) size %u -> %u value %d",
++                                                    s, l, o, ask, *n, *(const int *)v);
++    else snprintf(t, sizeof t, "socket::GetSockOpt(fd %d level 0x%x option 0x%x) size %u -> %u", s, l, o, ask, n ? *n : 0);
++    dm_nd_trace_result(t, r);
+     return r;
+ }
+ SKF("nnsocketSetSockOpt", h_nsk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) {
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index db8aefbd..d1a34b83 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -94,6 +94,13 @@ int main(void) {
+     if (back != 1) fail("GetSockOpt TCP_NODELAY read back off");
+     if (back_len != sizeof back) fail("GetSockOpt TCP_NODELAY size");
+ 
++    // The same round trip for a SOL_SOCKET option: SO_REUSEADDR is 4 on both, and the socket reports it at once.
++    int reuse = 1;
++    if (dm_sk_setopt(fd, 0xffff, 4, &reuse, sizeof reuse)) fail("SetSockOpt SO_REUSEADDR");
++    back = 0; back_len = sizeof back;
++    if (dm_sk_getopt(fd, 0xffff, 4, &back, &back_len)) fail("GetSockOpt SO_REUSEADDR");
++    if (back != 1) fail("GetSockOpt SO_REUSEADDR read back off");
++
+     uint8_t sa[16] = {16, 2, (uint8_t)(g_port >> 8), (uint8_t)g_port, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+     if (dm_sk_connect(fd, sa, sizeof sa)) fail("connect");
+     if (dm_sk_sendto(fd, "hello", 5, 0, NULL, 0) != 5) fail("send");
