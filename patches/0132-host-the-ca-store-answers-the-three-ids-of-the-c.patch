@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 11:00:47 +0000
+Subject: [PATCH] host: the CA store answers the three ids of the console's own
+ chain
+
+Super Mario Party Jamboree asks for NintendoCAG3 (1), reads it, and then asks for NintendoClass2CAG3 (2)
+before it opens a socket: the store answered that one with an empty list, because only id 1 had a DER.
+
+The console's chain is three ids - 1 Nintendo CA G3, 2 Class2 CA G3, 3 Root CA G4 - and a store that
+answers one of them is a store with a hole in it at the moment the title builds its chain. The same
+stand-in answers all three now (the real ones still win when the user drops them in certs/<id>.der), and
+t_ssl_certs pins it: ids 2 and 3 give the same DER as 1, and an id outside the chain is still the
+terminator alone.
+
+Upstream-Status: fork-only
+Reason: Jamboree asks for NintendoCAG3 (1), reads it, and then asks for NintendoClass2CAG3 (2) before opening a
+ socket; the store answered the second with an empty list because only id 1 had a DER. The console's chain is
+ three ids - 1 Nintendo CA G3, 2 Class2 CA G3, 3 Root CA G4 - so a store that answers one of them has a hole in
+ it exactly when the title builds its chain. The same stand-in answers all three (a real der in certs/<id>.der
+ still wins), and t_ssl_certs pins ids 2 and 3 to the same DER and keeps an id outside the chain at the
+ terminator alone.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_ssl_ca.h        | 21 ++++++++++++++++-----
+ dm/host/tests/t_ssl_certs.c |  9 +++++++++
+ 2 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/dm/host/hle_ssl_ca.h b/dm/host/hle_ssl_ca.h
+index ac5d019..26dcf68 100644
+--- a/dm/host/hle_ssl_ca.h
++++ b/dm/host/hle_ssl_ca.h
+@@ -25,7 +25,10 @@
+ //   this file                    a stand-in for NintendoCAG3, generated here and self-signed
+ //
+ // The stand-in carries Nintendo's subject name so that a title matching on the name still matches, but the
+-// key is ours: nothing signs with it and nothing but this build trusts it.
++// key is ours: nothing signs with it and nothing but this build trusts it. The same bytes answer the three ids
++// the console's chain is made of (1 Nintendo CA G3, 2 Class2 CA G3, 3 Root CA G4): Super Mario Party Jamboree
++// asks for 1 and then for 2, a certificate at a time, and the store answers the questions it was asked before
++// anything else in the online path can have an opinion about them.
+ #pragma once
+ 
+ #include <stdint.h>
+@@ -34,7 +37,9 @@
+ #include <string.h>
+ 
+ #define DM_SSL_CA_ALL      0xffffffffu   // CaCertificateId::All, the terminator's id: every certificate
+-#define DM_SSL_CA_NINTENDO 1u            // CaCertificateId::NintendoCAG3, the one every title asks for
++#define DM_SSL_CA_NINTENDO 1u            // CaCertificateId::NintendoCAG3, the first a title asks for
++#define DM_SSL_CA_CLASS2   2u            // CaCertificateId::NintendoClass2CAG3, asked for right after it
++#define DM_SSL_CA_ROOT     3u            // CaCertificateId::NintendoRootCAG4, the rest of the console's own chain
+ #define DM_SSL_CA_INFO     0x18u         // sizeof(BuiltInCertificateInfo)
+ #define DM_SSL_CA_TRUSTED  1u            // TrustedCertStatus::EnabledTrusted
+ #define DM_SSL_CA_MAX      8192u         // the most a <id>.der may weigh
+@@ -137,11 +142,17 @@ static size_t dm_ssl_ca_file_len(unsigned id) {
+     return n > 0 && (unsigned long)n <= DM_SSL_CA_MAX ? (size_t)n : 0;
+ }
+ 
+-// How many bytes of DER this id has: the dropped file first, the built-in one for NintendoCAG3, else none.
++// True for the three ids the console's own chain is made of (Nintendo CA G3, Class2 G3, Root G4): a title asks
++// for them one at a time - Super Mario Party Jamboree asks for 1, then for 2, before it opens a socket.
++static int dm_ssl_ca_is_nintendo(unsigned id) {
++    return id == DM_SSL_CA_NINTENDO || id == DM_SSL_CA_CLASS2 || id == DM_SSL_CA_ROOT;
++}
++
++// How many bytes of DER this id has: the dropped file first, the built-in stand-in for the Nintendo ids, else none.
+ static size_t dm_ssl_ca_len(unsigned id) {
+     size_t n = dm_ssl_ca_file_len(id);
+     if (n) return n;
+-    return id == DM_SSL_CA_NINTENDO ? sizeof dm_ssl_ca_builtin : 0;
++    return dm_ssl_ca_is_nintendo(id) ? sizeof dm_ssl_ca_builtin : 0;
+ }
+ 
+ // Copies that DER out; `from_file` says which source answered (for the trace).
+@@ -158,7 +169,7 @@ static size_t dm_ssl_ca_copy(unsigned id, unsigned char *out, size_t cap, int *f
+             }
+         }
+     }
+-    if (id == DM_SSL_CA_NINTENDO && sizeof dm_ssl_ca_builtin <= cap) {
++    if (dm_ssl_ca_is_nintendo(id) && sizeof dm_ssl_ca_builtin <= cap) {
+         memcpy(out, dm_ssl_ca_builtin, sizeof dm_ssl_ca_builtin);
+         if (from_file) *from_file = 0;
+         return sizeof dm_ssl_ca_builtin;
+diff --git a/dm/host/tests/t_ssl_certs.c b/dm/host/tests/t_ssl_certs.c
+index bda1efa..8ec12e4 100644
+--- a/dm/host/tests/t_ssl_certs.c
++++ b/dm/host/tests/t_ssl_certs.c
+@@ -64,6 +64,15 @@ int main(void) {
+     uint32_t all = 0xffffffffu;
+     assert(dm_ssl_ca_size(&all, 1) == size);
+ 
++    // ---- and the other two ids the console's chain is made of answer the same stand-in
++    for (uint32_t chain = 2; chain <= 3; chain++) {
++        assert(dm_ssl_ca_size(&chain, 1) == size);
++        assert(dm_ssl_ca_build(&chain, 1, buf, sizeof buf, &entries, &der, &file, 1) == size);
++        e = (struct info_base *)(void *)buf;
++        assert(e[0].id == chain && e[0].size == 849 && ((const uint8_t *)e[0].der)[0] == 0x30);
++    }
++    printf("ids 2 and 3: the same stand-in, so the chain is never half empty\n");
++
+     // ---- an id the store does not have is legal too: the terminator alone is a list a caller can walk
+     uint32_t other = 4000;
+     assert(dm_ssl_ca_size(&other, 1) == 0x18);

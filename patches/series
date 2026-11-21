@@ -125,3 +125,5 @@
 0127-host-the-certificate-entry-carries-the-der-addre.patch
 0129-tests-the-certificate-store-test-builds-where-mk.patch
 0130-host-dm-hle-imports-takes-a-list-of-families-not.patch
+0131-host-the-socket-setup-says-what-it-answered.patch
+0132-host-the-ca-store-answers-the-three-ids-of-the-c.patch

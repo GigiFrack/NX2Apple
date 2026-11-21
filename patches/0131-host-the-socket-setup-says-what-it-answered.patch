@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 11:00:47 +0000
+Subject: [PATCH] host: the socket setup says what it answered
+
+Super Mario Party Jamboree now opens its first socket, sets an option, asks for one back and fcntl's the
+descriptor - and then shows the network error without ever calling connect() and without reading an
+errno. Nothing in the log says which of those four it disliked, and the entry trace names a take-over
+only the first time it is called, so a wrong answer is invisible.
+
+They now print their arguments and their result under DM_NEXTENDO_TRACE: Socket the family/type/protocol
+and the descriptor, SetSockOpt and GetSockOpt the level and option (and the size in and out), Fcntl the
+command, Connect its answer.
+
+And the two buffer sizes: dm_nd_tcp_getopt answered 0 for every option it did not know, SO_SNDBUF and
+SO_RCVBUF included, which is not a lenient answer but a wrong one - a title that reads a buffer of zero
+bytes has a reason to give up. They answer a real default now.
+
+Upstream-Status: fork-only
+Reason: With the CA store answered, Super Mario Party Jamboree opens its first socket, sets an option, reads one
+ back and fcntl's the descriptor - and then shows the network error without ever calling connect() and without
+ reading an errno, so no line in the log names which of the four it disliked (the entry trace names a take-over
+ only the first time). Those four print their arguments and their result under DM_NEXTENDO_TRACE now. And
+ dm_nd_tcp_getopt answered 0 for every option it did not know, SO_SNDBUF and SO_RCVBUF included: a buffer of zero
+ bytes is a wrong answer, and a title that reads one has a reason to stop. They answer a real default.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 37 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 35a40df..cee01b6 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -361,6 +361,7 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+         if (option == 0x1008) v = 1;            // SOCK_STREAM
+         else if (option == 0x1007) v = 0;       // IPPROTO_IP
+         else if (option == 0x1016) v = 6;       // IPPROTO_TCP
++        else if (option == 0x1001 || option == 0x1002) v = SK_DEFAULT_BUF;   // SO_SNDBUF / SO_RCVBUF: 0 is not an answer
+         memcpy(value, &v, sizeof v); *size = sizeof v;
+     }
+     pthread_mutex_unlock(&g_nd_tcp_m);
+@@ -792,17 +793,43 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t
+     }
+     return n;
+ }
+-SKF("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", h_sk_Socket, int a, int b, int c) { return dm_sk_socket(a, b, c); }
++// The four calls a connection is prepared with answer where they were asked from: a title that gives up before
++// connect() leaves no other trace of which of them it disliked, and the errno it reads afterwards is only an echo
++// of a refusal that was already silent. One line each, with the option and the result.
++SKF("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", h_sk_Socket, int a, int b, int c) {
++    int r = dm_sk_socket(a, b, c);
++    { char t[96]; snprintf(t, sizeof t, "socket::Socket(family %d type %d protocol %d)", a, b, c); dm_nd_trace_result(t, r); }
++    return r;
++}
+ SKF("_ZN2nn6socket4BindEiPKNS0_8SockAddrEj", h_sk_Bind, int s, const void *a, unsigned n) { return dm_sk_bind(s, a, n); }
+-SKF("_ZN2nn6socket7ConnectEiPKNS0_8SockAddrEj", h_sk_Connect, int s, const void *a, unsigned n) { return dm_sk_connect(s, a, n); }
++SKF("_ZN2nn6socket7ConnectEiPKNS0_8SockAddrEj", h_sk_Connect, int s, const void *a, unsigned n) {
++    int r = dm_sk_connect(s, a, n);
++    { char t[96]; snprintf(t, sizeof t, "socket::Connect(fd %d) %s", s, r ? "failed" : "connected"); dm_nd_trace_result(t, r); }
++    return r;
++}
+ SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) { (void)s; (void)n; return sk_fail(); }
+ SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsigned *n) { (void)s; (void)a; (void)n; return sk_fail(); }
+ SKF("_ZN2nn6socket5CloseEi", h_sk_Close, int s) { return dm_sk_close(s); }
+ SKF("_ZN2nn6socket11GetPeerNameEiPNS0_8SockAddrEPj", h_sk_GetPeerName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
+ SKF("_ZN2nn6socket11GetSockNameEiPNS0_8SockAddrEPj", h_sk_GetSockName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
+-SKF("_ZN2nn6socket10GetSockOptEiNS0_5LevelENS0_6OptionEPvPj", h_sk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) { return dm_sk_getopt(s, l, o, v, n); }
+-SKF("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", h_sk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) { return dm_sk_setopt(s, l, o, v, n); }
+-SKF("_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", h_sk_Fcntl, int s, int c, int v) { return dm_sk_fcntl(s, c, v); }
++SKF("_ZN2nn6socket10GetSockOptEiNS0_5LevelENS0_6OptionEPvPj", h_sk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) {
++    unsigned ask = n ? *n : 0;
++    int r = dm_sk_getopt(s, l, o, v, n);
++    { char t[128]; snprintf(t, sizeof t, "socket::GetSockOpt(fd %d level 0x%x option 0x%x) size %u -> %u", s, l, o, ask, n ? *n : 0);
++      dm_nd_trace_result(t, r); }
++    return r;
++}
++SKF("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", h_sk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) {
++    int r = dm_sk_setopt(s, l, o, v, n);
++    { char t[112]; snprintf(t, sizeof t, "socket::SetSockOpt(fd %d level 0x%x option 0x%x) size %u", s, l, o, n);
++      dm_nd_trace_result(t, r); }
++    return r;
++}
++SKF("_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", h_sk_Fcntl, int s, int c, int v) {
++    int r = dm_sk_fcntl(s, c, v);
++    { char t[96]; snprintf(t, sizeof t, "socket::Fcntl(fd %d cmd %d value 0x%x)", s, c, v); dm_nd_trace_result(t, r); }
++    return r;
++}
+ // SDK 21 overloads Star Fox imports: plain sockaddr, the ShutdownMethod enum, Read / Write and a name lookup without options; SetAllocator keeps nothing, as no session is created
+ SKF("_ZN2nn6socket11GetPeerNameEiP8sockaddrPj", h_sk_GetPeerName21, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
+ SKF("_ZN2nn6socket8ShutdownEiNS0_14ShutdownMethodE", h_sk_Shutdown21, int s, int how) { return dm_sk_shutdown(s, how); }
