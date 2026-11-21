@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 13:37:31 +0000
+Subject: [PATCH] host: the socket setup speaks on the C interface too
+
+The answers of 0131 never appeared in a log: Super Mario Party Jamboree calls nnsocketSocket,
+nnsocketSetSockOpt, nnsocketFcntl and nnsocketGetSockOpt - the C spelling - while the trace sat on the
+C++ ones (nn::socket::Socket and friends). Both spellings now say their arguments and their result,
+and nnsocketGetLastErrno says the code whenever there is one, so a title that stops after a call it did
+not like leaves the reason in the log instead of a bare network error.
+
+And dm_nd_tcp_getopt answered a buffer smaller than an int with success and nothing written: a title that
+asks for a one-byte option read whatever was in its buffer and had every reason to distrust the socket.
+It writes as many bytes as the caller's buffer holds.
+
+Upstream-Status: fork-only
+Reason: 0131 traced the C++ spellings (nn::socket::Socket and friends) and no line of it appeared in a log: the
+ title calls the C interface - nnsocketSocket, nnsocketSetSockOpt, nnsocketFcntl, nnsocketGetSockOpt - which are
+ separate take-overs. They answer under the same prefix now, and nnsocketGetLastErrno says the code when there is
+ one. Also dm_nd_tcp_getopt used to answer a buffer smaller than an int with success and nothing written, which
+ leaves a caller reading its own uninitialised byte and distrusting the socket: it writes what fits.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 48 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index cee01b6..ca6b68b 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -357,12 +357,15 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+         int64_t ns = option == 0x1006 ? e->rtimeo : e->stimeo;
+         int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000};
+         memcpy(value, tv, sizeof tv); *size = sizeof tv;
+-    } else if (*size >= sizeof v) {
++    } else {
+         if (option == 0x1008) v = 1;            // SOCK_STREAM
+         else if (option == 0x1007) v = 0;       // IPPROTO_IP
+         else if (option == 0x1016) v = 6;       // IPPROTO_TCP
+         else if (option == 0x1001 || option == 0x1002) v = SK_DEFAULT_BUF;   // SO_SNDBUF / SO_RCVBUF: 0 is not an answer
+-        memcpy(value, &v, sizeof v); *size = sizeof v;
++        // As many bytes as the caller's buffer holds: an option asked for in one byte gets one byte, where a
++        // buffer smaller than an int used to be answered with success and nothing written at all.
++        unsigned c = *size < sizeof v ? *size : (unsigned)sizeof v;
++        if (c) { memcpy(value, &v, c); *size = c; }
+     }
+     pthread_mutex_unlock(&g_nd_tcp_m);
+     return 0;
+@@ -857,15 +860,40 @@ HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo
+ HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution (cut): NULL", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
+ HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) { return t_skerr; }
+ // C interface
+-SKF("nnsocketSocket", h_nsk_Socket, int a, int b, int c) { return dm_sk_socket(a, b, c); }
++// The C spelling of the four a connection is prepared with: a title on this ABI calls these, not the C++ ones,
++// and the answer an entry gives is the only way to see which of them it stopped on.
++SKF("nnsocketSocket", h_nsk_Socket, int a, int b, int c) {
++    int r = dm_sk_socket(a, b, c);
++    { char t[96]; snprintf(t, sizeof t, "socket::Socket(family %d type %d protocol %d)", a, b, c); dm_nd_trace_result(t, r); }
++    return r;
++}
+ SKF("nnsocketBind", h_nsk_Bind, int s, const void *a, unsigned n) { return dm_sk_bind(s, a, n); }
+-SKF("nnsocketConnect", h_nsk_Connect, int s, const void *a, unsigned n) { return dm_sk_connect(s, a, n); }
++SKF("nnsocketConnect", h_nsk_Connect, int s, const void *a, unsigned n) {
++    int r = dm_sk_connect(s, a, n);
++    { char t[96]; snprintf(t, sizeof t, "socket::Connect(fd %d) %s", s, r ? "failed" : "connected"); dm_nd_trace_result(t, r); }
++    return r;
++}
+ SKF("nnsocketClose", h_nsk_Close, int s) { return dm_sk_close(s); }
+ SKF("nnsocketGetPeerName", h_nsk_GetPeerName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
+ SKF("nnsocketGetSockName", h_nsk_GetSockName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
+-SKF("nnsocketGetSockOpt", h_nsk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) { return dm_sk_getopt(s, l, o, v, n); }
+-SKF("nnsocketSetSockOpt", h_nsk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) { return dm_sk_setopt(s, l, o, v, n); }
+-SKF("nnsocketFcntl", h_nsk_Fcntl, int s, int c, int v) { return dm_sk_fcntl(s, c, v); }
++SKF("nnsocketGetSockOpt", h_nsk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) {
++    unsigned ask = n ? *n : 0;
++    int r = dm_sk_getopt(s, l, o, v, n);
++    { char t[128]; snprintf(t, sizeof t, "socket::GetSockOpt(fd %d level 0x%x option 0x%x) size %u -> %u", s, l, o, ask, n ? *n : 0);
++      dm_nd_trace_result(t, r); }
++    return r;
++}
++SKF("nnsocketSetSockOpt", h_nsk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) {
++    int r = dm_sk_setopt(s, l, o, v, n);
++    { char t[112]; snprintf(t, sizeof t, "socket::SetSockOpt(fd %d level 0x%x option 0x%x) size %u", s, l, o, n);
++      dm_nd_trace_result(t, r); }
++    return r;
++}
++SKF("nnsocketFcntl", h_nsk_Fcntl, int s, int c, int v) {
++    int r = dm_sk_fcntl(s, c, v);
++    { char t[96]; snprintf(t, sizeof t, "socket::Fcntl(fd %d cmd %d value 0x%x)", s, c, v); dm_nd_trace_result(t, r); }
++    return r;
++}
+ SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
+ SKF("nnsocketResolverGetOption", h_nsk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
+ SKF("nnsocketResolverSetOption", h_nsk_ResSet, const void *o) { (void)o; return sk_fail(); }
+@@ -876,7 +904,11 @@ HLE_FORCE("nnsocketRecvFrom", "local UDP (offline BSD service)", long, h_nsk_Rec
+ HLE_FORCE("nnsocketRead", "local UDP/EventFd (offline BSD service)", long, h_nsk_Read, int s, void *b, unsigned long n) { return dm_sk_read(s, b, n); }
+ HLE_FORCE("nnsocketWrite", "local UDP/EventFd (offline BSD service)", long, h_nsk_Write, int s, const void *b, unsigned long n) { return dm_sk_write(s, b, n); }
+ HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
+-HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) { return t_skerr; }
++HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) {
++    // Only when there is one: a title that reads the errno after a call that failed says which failure it saw.
++    if (t_skerr) dm_nd_trace_result("socket::GetLastErrno", t_skerr);
++    return t_skerr;
++}
+ HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_nsk_SetErrno, int e) { t_skerr = e; }
+ 
+ void dm_net_teardown(void) {
