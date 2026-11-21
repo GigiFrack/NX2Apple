@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 15:27:26 +0000
+Subject: [PATCH] host: a family this host does not serve says EAFNOSUPPORT
+
+The trace of the last log opens with socket(family 28, type 1) answered -1 and then the same title's
+IPv4 socket: 28 is AF_INET6 (Ryujinx's BsdAddressFamily.InterNetworkV6), and the NPLN clients that try
+IPv6 first take their IPv4 path only on a real EAFNOSUPPORT - Citron carries the note that anything else
+there "left the whole connection sequence unable to ever complete or definitively fail". The offline BSD
+service answered ENETDOWN for every family it did not serve, which is the wrong refusal to hand a client
+that is choosing a family.
+
+A family other than AF_INET is answered EAFNOSUPPORT now, and a datagram socket asked for an unsupported
+type or protocol EPROTONOSUPPORT, instead of one blanket ENETDOWN.
+
+Upstream-Status: fork-only
+Reason: The log opens with socket(family 28, type 1) answered -1 and then the same title's IPv4 socket: 28 is
+ AF_INET6 (Ryujinx BsdAddressFamily.InterNetworkV6), and the NPLN clients that try IPv6 first take their IPv4 path
+ only on a real EAFNOSUPPORT - Citron notes that anything else there left the whole connection sequence unable to
+ complete or to fail. The offline BSD service answered a blanket ENETDOWN for every family it did not serve, which
+ is the wrong refusal for a client that is choosing a family. Family != AF_INET now answers EAFNOSUPPORT and an
+ unsupported type/protocol on a datagram socket EPROTONOSUPPORT.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index a2ceb0a3..8bdec911 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -84,7 +84,8 @@ static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000
+ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
+ 
+ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLNVAL = 0x20,
+-       SK_EBADF = 9, SK_EAGAIN = 35, SK_EINVAL = 22, SK_EMSGSIZE = 40, SK_EOPNOTSUPP = 45, SK_EADDRINUSE = 48, SK_ENOTCONN = 57,
++       SK_EBADF = 9, SK_EAGAIN = 35, SK_EINVAL = 22, SK_EMSGSIZE = 40, SK_EPROTONOSUPPORT = 43, SK_EOPNOTSUPP = 45,
++       SK_EAFNOSUPPORT = 47, SK_EADDRINUSE = 48, SK_ENOTCONN = 57,
+        SK_NONBLOCK = 0x800, SK_MSG_PEEK = 2, SK_MSG_DONTWAIT = 0x80, SK_UDP = 2, SK_EFD = 1,
+        SK_UDP_MAX = 65507, SK_QUEUE_MAX = 1024 * 1024, SK_PACKET_MAX = 256, SK_DEFAULT_BUF = 256 * 1024 };
+ 
+@@ -427,7 +428,11 @@ static int efd_create(uint64_t v, int flags) {
+ int dm_sk_socket(int family, int type, int protocol) {
+     int tcp = dm_nd_tcp_socket(family, type, protocol);
+     if (tcp != ND_NOT) return tcp;
+-    if (family != 2 || type != 2 || (protocol && protocol != 17)) return sk_fail();
++    // Which refusal matters: the NPLN clients of several titles open an AF_INET6 socket (28) first and take
++    // their IPv4 path only on a real EAFNOSUPPORT - Citron documents that a wrong errno there leaves the whole
++    // connection sequence unable to complete or to fail, looping. This host serves IPv4, so it says so.
++    if (family != 2) return sk_error(SK_EAFNOSUPPORT);
++    if (type != 2 || (protocol && protocol != 17)) return sk_error(SK_EPROTONOSUPPORT);
+     dm_host_mutex_lock(&g_efd_m); int fd = sk_new_locked(SK_UDP); pthread_mutex_unlock(&g_efd_m); return fd;
+ }
+ int dm_sk_close(int fd) {
