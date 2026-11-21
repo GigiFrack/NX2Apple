@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 10:40:56 +0000
+Subject: [PATCH] host: dm_hle_imports takes a list of families, not one word
+
+A run costs a build, and one filter word per build wastes them: the online path asks about ssl,
+socket, npln and nsd in the same breath. The filter is now a list of substrings separated by
+commas or spaces, so `DM_HLE_IMPORTS=ssl,socket,npln,nsd` answers for all four in one log, and a
+lone word means what it always meant.
+
+t_symbols pins the matching: 1 is everything, a list matches any of its words, spaces around the
+commas are ignored, and a word longer than the name cannot match the name's tail.
+
+Upstream-Status: fork-only
+Reason: One diagnostic run costs one build, and one filter word per build wastes them: the online path asks about
+ ssl, socket, npln and nsd in the same breath. The filter is now a list of substrings separated by commas or spaces,
+ so `DM_HLE_IMPORTS=ssl,socket,npln,nsd` answers for all four in one log; a lone word still means exactly what it
+ meant, and 1 still prints everything. t_symbols pins the matching: spaces around the commas are ignored, and a word
+ longer than the name cannot match the name's tail.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/loader.c          | 20 +++++++++++++++++---
+ dm/host/tests/t_symbols.c | 11 +++++++++++
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index d55188c..bd682a1 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -239,13 +239,27 @@ static void force_init(void) {
+ // DM_HLE_IMPORTS names the symbols the modules import. Every relocation asks for a name here, so the
+ // log lists what the game needs instead of only what the host already answers (the take-over table can
+ // only name what exists: a symbol nobody took over appears nowhere, and guessing its mangled form is how
+-// a plausible-looking entry gets added that the loader then rejects). A value that is not exactly 1 is a
+-// substring filter, so a whole family - account, npln, nn::ssl - costs one line in env.txt; 1 prints all.
++// a plausible-looking entry gets added that the loader then rejects). 1 prints everything; anything else
++// is a list of substrings separated by commas or spaces, so one run answers for ssl, socket, npln and nsd
++// at once - one build instead of one per family.
++static int import_wanted(const char *filter, const char *name) {
++    if (filter[0] == '1' && filter[1] == 0) return 1;
++    for (const char *p = filter; *p; ) {
++        while (*p == ',' || *p == ' ' || *p == '\t') p++;
++        const char *word = p;
++        while (*p && *p != ',' && *p != ' ' && *p != '\t') p++;
++        size_t n = (size_t)(p - word);
++        if (!n) continue;
++        for (const char *q = name; *q; q++)
++            if (!strncmp(q, word, n)) return 1;   // strncmp stops at the name's end: a longer word cannot match
++    }
++    return 0;
++}
+ static void import_note(const char *name) {
+     static const char *filter; static int on = -1;
+     if (on < 0) { filter = getenv("DM_HLE_IMPORTS"); on = filter && *filter; }
+     if (!on) return;
+-    if (!(filter[0] == '1' && filter[1] == 0) && !strstr(name, filter)) return;
++    if (!import_wanted(filter, name)) return;
+     enum { SLOTS = 8192, CAP = 4000 };
+     static const char *seen[SLOTS]; static unsigned printed;
+     if (printed >= CAP) return;
+diff --git a/dm/host/tests/t_symbols.c b/dm/host/tests/t_symbols.c
+index ea2dfe8..3f7c12f 100644
+--- a/dm/host/tests/t_symbols.c
++++ b/dm/host/tests/t_symbols.c
+@@ -64,6 +64,17 @@ static void expect_abort(int duplicate) {
+ }
+ 
+ int main(void) {
++    // DM_HLE_IMPORTS: 1 is everything, a lone word is the old substring filter, and a list is any of its words
++    assert(import_wanted("1", "_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesE"));
++    assert(import_wanted("ssl", "_ZN2nn3ssl10InitializeEv"));
++    assert(!import_wanted("ssl", "_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE"));
++    assert(import_wanted("ssl,socket", "_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE"));
++    assert(import_wanted("ssl, socket ,npln", "_ZN2nn4npln6detailE"));
++    assert(import_wanted("  npln", "npln"));
++    assert(!import_wanted("ssl,socket", "_ZN2nn7account10InitializeEv"));
++    assert(!import_wanted("sslx", "_ZN2nn3ssl10InitializeEv"));    // a longer word cannot match a shorter name
++    assert(!import_wanted(",", "_ZN2nn3ssl10InitializeEv"));
++
+     // Empty/missing sections must still give misses after lazy initialization.
+     assert(!hle_implements("absent")); assert(!hle_implements("absent"));
+     force_init(); assert(!force_lookup("absent")); reset_sections();
