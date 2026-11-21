@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 10:24:38 +0000
+Subject: [PATCH] host: the certificate entry carries the DER address, not its
+ offset
+
+The store landed but the game died one call later: sig=11 at address 0x30, with 849 (the
+size) alive in three registers and 0x30 - the value just written as der_offset - in the
+register that got dereferenced. That is the shape of the mistake: der_offset is the
+service wire format (nn::ssl::sf::BuiltInCertificateInfo, what Ryujinx and Citron build),
+while the class the game receives from nn::ssl::BuiltInManager is BuiltInCertificateInfoBase,
+whose fourth word is a pointer to the DER. Translating one into the other is this entry's job,
+since this entry is the library's.
+
+So the builder takes the shape as a parameter: the address of the DER for SDK 17's class, the
+offset for the service's struct. The SDK 17 spelling (hle_offline.c) uses the pointer.
+
+The other spelling this branch answers (nn::ssl::BuiltInCertificateInfo, a class derived from
+that base) goes back to the terminator alone. We have measured the base, not the derived class:
+if it carries one field more, the caller's stride is wider than 0x18 and an entry written here
+would hand it DER bytes to read as the next entry. The terminator cannot be overshot by any
+stride, and it is exactly the empty answer that spelling always gave - no certificate, nothing
+to walk into, the same err 0x270141 the title showed before instead of a crash.
+
+t_ssl_certs is header-only now - the store, both shapes of the fourth word, the terminator,
+an unknown id, the file that wins, a buffer too small - so it runs anywhere without a network
+or the TLS framework.
+
+Upstream-Status: fork-only
+Reason: The store answered with one certificate, and Super Mario Party Jamboree died on sig=11 at address 0x30 -
+ the value just written as der_offset - while the size (849) sat alive in three registers. der_offset is the
+ service's wire format; the class the title receives from nn::ssl::BuiltInManager is BuiltInCertificateInfoBase,
+ whose fourth word is a pointer to the DER, and turning one into the other is the library entry's job. The
+ builder now takes the shape: the address of the DER for SDK 17's class, the offset for the service's struct.
+ The other spelling (nn::ssl::BuiltInCertificateInfo, derived from that base) goes back to the terminator alone,
+ because we have measured the base and not the derived class: a wider stride would send the caller into the DER
+ bytes. t_ssl_certs is header-only and pins both shapes.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_offline.c       |  13 +--
+ dm/host/hle_ssl.c           |  26 ++++--
+ dm/host/hle_ssl_ca.h        |  20 +++--
+ dm/host/tests/Makefile      |   7 +-
+ dm/host/tests/t_ssl_certs.c | 168 +++++++++++++++---------------------
+ 5 files changed, 113 insertions(+), 121 deletions(-)
+
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index b4f0c6c..c4076cf 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -126,16 +126,19 @@ HLE_FORCE("_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferP
+ HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "a client certificate the game brings: needed only where the server asks for one", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)a; (void)b; (void)x; (void)y; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "a server CA the game brings: the system roots are what SecureTransport verifies against", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) { (void)a; (void)n; (void)f; if (!dm_nd_enabled()) { if (id) *id = 0; return RES_FAIL; } return dm_ssl_context_import_pki(self, id) ? RES_FAIL : RES_OK; }
+ HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL (cut)", Result, h_ssl_ImpCrl, void *self, uint64_t *id, const char *a, unsigned n) { (void)self; (void)a; (void)n; if (id) *id = 0; return RES_FAIL; }
+-// SDK 17's spelling of the same question (the certificate list is a base class there): the same store, filled by
+-// the same code as hle_ssl.c's entry (hle_ssl_ca.h). Offline it is a failure, exactly as before.
++// SDK 17's spelling of the same question (the certificate list is a base class there): the same store as
++// hle_ssl_ca.h, with the DER's ADDRESS in the entry rather than its offset - that class is what the game
++// dereferences, and handing it an offset is a crash at that offset (Super Mario Party Jamboree, sig=11 at
++// 0x30 = the offset it was given). Offline it is a failure, exactly as before.
+ HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "the built-in CA store: a stand-in for NintendoCAG3, or <game data>/certs/1.der when the user dropped the real one", Result, h_ssl_Certs,
+           void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) {
+     if (!dm_nd_enabled()) { if (out) *out = NULL; return RES_FAIL; }
+     unsigned entries = 0; size_t der = 0; int file = 0;
+-    size_t size = dm_ssl_ca_build((const unsigned *)ids, n, buf, bn, &entries, &der, &file);
++    size_t size = dm_ssl_ca_build((const unsigned *)ids, n, buf, bn, &entries, &der, &file, 1);
+     if (out) *out = size ? (void *)buf : NULL;
+-    { char t[152]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(SDK 17, buf=%p size=%u ids=%u) -> %u certificate(s), der %zu %s",
+-                             (void *)buf, bn, n, entries, der, file ? "from certs/<id>.der" : "built-in");
++    { char t[176]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(SDK 17, buf=%p size=%u ids=%u) -> %u certificate(s), der %zu @%p %s",
++                             (void *)buf, bn, n, entries, der, (void *)(buf ? buf + 2 * 0x18 : NULL),
++                             file ? "from certs/<id>.der" : "built-in");
+       dm_nd_trace_result(t, (long long)entries); }
+     return size ? RES_OK : RES_FAIL;
+ }
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index 2ece45e..e954b68 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -80,6 +80,10 @@ SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t i
+ // front end, and an empty answer stops it before it opens a socket (err::ShowError 0x270141, and not one
+ // nnsocketSocket in the trace). The chain a game reads here is never what decides the handshake - that one
+ // runs on SecureTransport, with verification skipped for the redirected hosts.
++//
++// The size entry below is one function for both spellings, so it describes the store the SDK 17 spelling
++// serves; the spelling this file answers (nn::ssl::BuiltInCertificateInfo) gets the terminator and nothing
++// else, for the reason on its own comment.
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) {
+     if (!dm_nd_enabled()) { if (o) *o = 0; return RES_FAIL; }
+     size_t size = dm_ssl_ca_size((const unsigned *)ids, n);
+@@ -90,13 +94,21 @@ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertifi
+ }
+ SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) {
+     if (!dm_nd_enabled()) { if (o) *o = NULL; return RES_FAIL; }
+-    unsigned entries = 0; size_t der = 0; int file = 0;
+-    size_t size = dm_ssl_ca_build((const unsigned *)ids, n, b, bs, &entries, &der, &file);
+-    if (o) *o = size ? (void *)b : NULL;
+-    { char t[144]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(buf=%p size=%u ids=%u) -> %u certificate(s), der %zu %s",
+-                             (void *)b, bs, n, entries, der, file ? "from certs/<id>.der" : "built-in");
+-      dm_nd_trace_result(t, (long long)entries); }
+-    return size ? RES_OK : RES_FAIL;
++    (void)ids; (void)n;
++    // The store is served through the other spelling (hle_offline.c, SDK 17's BuiltInCertificateInfoBase), the
++    // one this host has measured: 0x18 bytes holding the DER's address. This name is a class derived from it,
++    // and a class with one field more makes the caller's stride wider than 0x18 - an entry here would hand it
++    // DER bytes to read as the next entry. So this spelling keeps the empty answer it always gave: one
++    // terminator, which no stride can overshoot, and a caller that reads no certificates at all.
++    if (b && bs >= 0x18) {
++        uint32_t *e = (uint32_t *)b;
++        e[0] = DM_SSL_CA_ALL; e[1] = 0; e[2] = e[3] = e[4] = e[5] = 0;
++        if (o) *o = b;
++    } else if (o) *o = NULL;
++    { char t[128]; snprintf(t, sizeof t, "ssl::BuiltInCertificates(buf=%p size=%u ids=%u) -> terminator only (class layout unmeasured)",
++                            (void *)b, bs, n);
++      dm_nd_trace_result(t, 0); }
++    return RES_OK;
+ }
+ SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) {
+     if (!dm_nd_enabled()) return RES_FAIL;
+diff --git a/dm/host/hle_ssl_ca.h b/dm/host/hle_ssl_ca.h
+index 4e9a740..ac5d019 100644
+--- a/dm/host/hle_ssl_ca.h
++++ b/dm/host/hle_ssl_ca.h
+@@ -12,9 +12,12 @@
+ // NintendoCAG3 (CaCertificateId 1) as soon as it has a name for the NPLN front end, and an empty answer
+ // stops it before it opens a socket: err::ShowError 0x270141, and not one nnsocketSocket in the trace.
+ //
+-// The answer is an array of BuiltInCertificateInfo (0x18 bytes: id, status, der_size, der_offset) closed by
+-// the terminator entry (id All = -1), with the DER data behind the table and every der_offset counted from
+-// the start of the buffer.
++// The answer is an array of BuiltInCertificateInfoBase (0x18 bytes: cert id, status, der_size, der data) closed
++// by the terminator entry (id All = -1), with the DER data behind the table. The fourth word is a POINTER, not
++// an offset: the offset is the service's wire format (nn::ssl::sf::BuiltInCertificateInfo, what Ryujinx and
++// Citron build), and it is this library entry's job to turn it into something the caller can dereference.
++// Super Mario Party Jamboree says so itself: handed a der_offset of 0x30 it died on sig=11 at address 0x30 with
++// the size (849) still live in three registers.
+ //
+ // Two sources, in this order:
+ //   <game data>/certs/<id>.der   a certificate the user dropped there (their own console's store, out of
+@@ -176,9 +179,11 @@ static size_t dm_ssl_ca_size(const unsigned *ids, unsigned n) {
+ }
+ 
+ // Writes that store and returns its size (0 when the buffer is too small, or nothing could be written).
+-// `entries` reports how many certificates went in, `from_file` whether the first one came from a file.
++// `entries` reports how many certificates went in, `from_file` whether the first one came from a file, and
++// `as_pointer` picks what the fourth word holds: the address of the DER (the library's class) or its offset
++// from the start of the buffer (the service's struct).
+ static size_t dm_ssl_ca_build(const unsigned *ids, unsigned n, unsigned char *buf, size_t cap,
+-                              unsigned *entries, size_t *der_size, int *from_file) {
++                              unsigned *entries, size_t *der_size, int *from_file, int as_pointer) {
+     size_t need = dm_ssl_ca_size(ids, n);
+     if (entries) *entries = 0;
+     if (der_size) *der_size = 0;
+@@ -197,9 +202,10 @@ static size_t dm_ssl_ca_build(const unsigned *ids, unsigned n, unsigned char *bu
+         uint32_t *slot = (uint32_t *)(void *)(buf + (size_t)j * DM_SSL_CA_INFO);
+         slot[0] = id;
+         slot[1] = DM_SSL_CA_TRUSTED;
+-        uint64_t size = (uint64_t)len, off = (uint64_t)at;
++        uint64_t size = (uint64_t)len;
++        uint64_t where = as_pointer ? (uint64_t)(uintptr_t)(buf + at) : (uint64_t)at;
+         memcpy(slot + 2, &size, 8);                            // der_size
+-        memcpy(slot + 4, &off, 8);                             // der_offset
++        memcpy(slot + 4, &where, 8);                           // der data: a pointer, or its offset
+         int file = 0;
+         if (dm_ssl_ca_copy(id, buf + at, cap - at, &file) != len) return 0;
+         if (!j) { if (der_size) *der_size = len; if (from_file) *from_file = file; }
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 9262cd3..7d52fcb 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -249,9 +249,10 @@ $(B)/t_dauth_local: t_dauth_local.c ../hle_dauth.c ../hle_dauth.h ../hle_nextend
+ # so they are not in `run`.
+ $(B)/t_ssl_local: t_ssl_local.c ../hle_net.c ../hle_ssl.c ../hle_ssl.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ssl_local.c -framework Security -framework CoreFoundation
+-# The built-in CA store: the layout a title walks, and the one certificate it asks for by id (no network).
+-$(B)/t_ssl_certs: t_ssl_certs.c ../hle_net.c ../hle_ssl.c ../hle_ssl.h ../hle_ssl_ca.h ../hle_nextendo.c ../hle_nextendo.h ../hle.h ../dm.h $(GAME_H) | $(B)
+-	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ssl_certs.c -framework Security -framework CoreFoundation
++# The built-in CA store: the layout a title walks, both shapes of its fourth word, the file that wins (no network,
++# no TLS framework: the store is header-only, the handlers that call it are wrappers).
++$(B)/t_ssl_certs: t_ssl_certs.c ../hle_ssl_ca.h | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. -o $@ t_ssl_certs.c
+ .PHONY: ssl-certs
+ ssl-certs: $(B)/t_ssl_certs
+ 	$(B)/t_ssl_certs
+diff --git a/dm/host/tests/t_ssl_certs.c b/dm/host/tests/t_ssl_certs.c
+index 754d34d..56384f7 100644
+--- a/dm/host/tests/t_ssl_certs.c
++++ b/dm/host/tests/t_ssl_certs.c
+@@ -1,108 +1,82 @@
+ // The built-in CA store: the layout a title walks (the entries, the terminator after them, the DER data behind
+-// the table) and the one certificate every title so far asks for by id - NintendoCAG3, CaCertificateId 1.
++// the table) and the two shapes of its fourth word.
+ //
+-// Super Mario Party Jamboree stops on an empty store: it asks for id 1 as soon as it has a name for the NPLN
+-// front end, and an empty answer is err::ShowError 0x270141 with not one nnsocketSocket in the trace. So what
+-// this test pins is that the answer is never empty, that the walk ends at the terminator, and that a
+-// certificate dropped in <game data>/certs/<id>.der replaces the built-in stand-in without a build.
+-#include "../hle_net.c"
+-#include "../hle_ssl.c"
+-#include "../hle_nextendo.c"
++// The store is what decides whether a title starts at all: Super Mario Party Jamboree asks for NintendoCAG3
++// (CaCertificateId 1) as soon as it has a name for the NPLN front end, and an empty answer is
++// err::ShowError 0x270141 with not one nnsocketSocket in the trace. Handing it an entry whose fourth word was
++// the service's der_offset instead of the address of the DER is a crash at that offset (sig=11 at 0x30 with the
++// size still live in three registers), so the shape is the thing this test pins.
++//
++// The store itself is header-only (hle_ssl_ca.h), which is why this test needs neither a network nor the TLS
++// framework: the two handlers that call it are a wrapper each, and the switch they read is theirs.
++#include "../hle_ssl_ca.h"
+ #include <assert.h>
++#include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/stat.h>
+ 
+-// The object map hle_ssl.c hangs its state off: the host has a real one, this test a table.
+-#define TEST_OBJ_MAX 8
+-static struct { const void *guest; void *host; } g_obj[TEST_OBJ_MAX];
+-
+-void *objmap_get(const void *guest) {
+-    for (int i = 0; i < TEST_OBJ_MAX; i++) if (g_obj[i].guest == guest) return g_obj[i].host;
+-    return NULL;
+-}
+-void objmap_put(const void *guest, void *host) {
+-    for (int i = 0; i < TEST_OBJ_MAX; i++) if (!g_obj[i].guest || g_obj[i].guest == guest) {
+-        g_obj[i].guest = guest; g_obj[i].host = host; return;
+-    }
+-    fprintf(stderr, "objmap full\n"); exit(1);
+-}
+-void *objmap_del(const void *guest) {
+-    for (int i = 0; i < TEST_OBJ_MAX; i++) if (g_obj[i].guest == guest) {
+-        void *h = g_obj[i].host; g_obj[i].guest = NULL; g_obj[i].host = NULL; return h;
+-    }
+-    return NULL;
+-}
+-
+-__thread _Atomic int dm_host_work;
+-
+-void dm_guest_sleep_ns(int64_t ns) {
+-    struct timespec ts = {ns / 1000000000, ns % 1000000000};
+-    nanosleep(&ts, NULL);
+-}
+-void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns) {
+-    struct timespec now, abs;
+-    clock_gettime(CLOCK_REALTIME, &now);
+-    abs.tv_sec = now.tv_sec + ns / 1000000000;
+-    abs.tv_nsec = now.tv_nsec + ns % 1000000000;
+-    if (abs.tv_nsec >= 1000000000) { abs.tv_sec++; abs.tv_nsec -= 1000000000; }
+-    pthread_cond_timedwait(c, m, &abs);
+-}
+-uint64_t guest_ns(void) {
+-    struct timespec ts;
+-    clock_gettime(CLOCK_MONOTONIC, &ts);
+-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+-}
+-int dm_detclock_enabled(void) { return 0; }
+-
+-uint8_t *dm_guest_base(void) { return NULL; }   // only die() would want it
+-
+-// BuiltInCertificateInfo, the 0x18 bytes the SDK walks: id, status, der_size, der_offset.
+-struct info { uint32_t id, status; uint64_t size, off; };
++// SDK 17's class, the one the game dereferences: id, status, der_size, der data.
++struct info_base { uint32_t id, status; uint64_t size; const void *der; };
++// The service's struct, which is where the offset spelling comes from: id, status, der_size, der_offset.
++struct info_wire { uint32_t id, status; uint64_t size, off; };
+ 
+ int main(void) {
+-    setenv("DM_NEXTENDO", "1", 1);
+-    dm_nd_reload();
+-
+     static uint8_t buf[0x4000];
+-    void *out = NULL;
+-    uint32_t size = 0;
++    unsigned entries = 0;
++    size_t der = 0;
++    int file = 0;
++    uint32_t id = 1;                      // CaCertificateId::NintendoCAG3
+ 
+-    // ---- the question a title asks: id 1, and the answer is a certificate and its terminator
+-    uint32_t id = 1;
+-    assert(h_ssl_BiBufSize(&size, &id, 1) == RES_OK);
++    // ---- the size the caller allocates: an entry for the certificate, the terminator, and its DER
++    size_t size = dm_ssl_ca_size(&id, 1);
+     assert(size > 2 * 0x18);
+-    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &id, 1) == RES_OK);
+-    assert(out == buf);
+-    struct info *e = (struct info *)(void *)buf;
++    assert(size == 2 * 0x18 + 852);        // 849 bytes of DER, aligned to 4
++    printf("id 1: %zu bytes for the buffer\n", size);
++
++    // ---- SDK 17's class: the DER's ADDRESS in the fourth word, the walk ending at the terminator
++    assert(dm_ssl_ca_build(&id, 1, buf, sizeof buf, &entries, &der, &file, 1) == size);
++    struct info_base *e = (struct info_base *)(void *)buf;
+     assert(e[0].id == 1);
+-    assert(e[0].status == 1);                     // TrustedCertStatus::EnabledTrusted
+-    assert(e[0].size > 0);
+-    assert(e[0].off == 2 * 0x18);                 // behind the table, the terminator slot included
+-    assert(e[0].off + e[0].size <= size);
+-    assert(buf[e[0].off] == 0x30);                // a DER SEQUENCE, not a stub
+-    struct info *term = (struct info *)(void *)(buf + 0x18);
+-    assert(term->id == 0xffffffffu);              // All: the walk stops here
+-    assert(term->size == 0 && term->off == 0);
+-    assert(size == 2 * 0x18 + ((e[0].size + 3u) & ~(uint64_t)3u));
++    assert(e[0].status == 1);                             // TrustedCertStatus::EnabledTrusted
++    assert(e[0].size == 849);
++    assert(e[0].size == der && entries == 1 && file == 0);
++    assert(e[0].der == (const void *)(buf + 2 * 0x18));   // a pointer into the caller's buffer
++    assert(((const uint8_t *)e[0].der)[0] == 0x30);       // a DER SEQUENCE, not a stub
++    assert(size == 2 * 0x18 + ((e[0].size + 3u) & ~(size_t)3u));
++    struct info_base *term = (struct info_base *)(void *)(buf + 0x18);
++    assert(term->id == 0xffffffffu);                      // All: the walk stops here
++    assert(term->size == 0 && term->der == NULL);
++    printf("sdk 17: 1 certificate, der %llu at the 0x30 word as a pointer\n", (unsigned long long)e[0].size);
++
++    // ---- the service's shape: the same store with the offset instead of the address
++    assert(dm_ssl_ca_build(&id, 1, buf, sizeof buf, &entries, &der, &file, 0) == size);
++    struct info_wire *w = (struct info_wire *)(void *)buf;
++    assert(w[0].id == 1 && w[0].size == 849);
++    assert(w[0].off == 2 * 0x18);                         // from the start of the buffer
++    assert(buf[w[0].off] == 0x30);
++    assert(((struct info_wire *)(void *)(buf + 0x18))->id == 0xffffffffu);
++    printf("service: 1 certificate, der %llu at offset %llu\n",
++           (unsigned long long)w[0].size, (unsigned long long)w[0].off);
+ 
+     // ---- All (-1) is the same store: the one certificate this host has
+-    uint32_t all = 0xffffffffu, size_all = 0;
+-    assert(h_ssl_BiBufSize(&size_all, &all, 1) == RES_OK);
+-    assert(size_all == size);
+-    printf("id 1 and id All: %llu-byte DER behind the table, terminator after it\n",
+-           (unsigned long long)e[0].size);
++    uint32_t all = 0xffffffffu;
++    assert(dm_ssl_ca_size(&all, 1) == size);
+ 
+-    // ---- an id the store does not have is legal too, and is still a list a caller can walk
++    // ---- an id the store does not have is legal too: the terminator alone is a list a caller can walk
+     uint32_t other = 4000;
+-    assert(h_ssl_BiBufSize(&size, &other, 1) == RES_OK);
+-    assert(size == 0x18);                         // the terminator alone
+-    out = NULL;
+-    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &other, 1) == RES_OK);
+-    assert(out == buf);
+-    assert(((struct info *)(void *)buf)->id == 0xffffffffu);
++    assert(dm_ssl_ca_size(&other, 1) == 0x18);
++    assert(dm_ssl_ca_build(&other, 1, buf, sizeof buf, &entries, &der, &file, 1) == 0x18);
++    assert(((struct info_base *)(void *)buf)->id == 0xffffffffu);
++    assert(entries == 0);
+     printf("an unknown id: terminator only, the walk still ends\n");
+ 
++    // ---- two ids at once: one table, the certificates we have, the terminator last
++    uint32_t two[2] = {1, 4000};
++    assert(dm_ssl_ca_build(two, 2, buf, sizeof buf, &entries, &der, &file, 1) == size);
++    assert(entries == 1);
++    assert(((struct info_base *)(void *)buf + 1)->id == 0xffffffffu);
++
+     // ---- a certificate the user dropped in wins over the built-in one
+     static const uint8_t fake[] = {0x30, 0x82, 0x00, 0x10, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x55, 0x04, 0x03,
+                                    0x04, 0x00, 0x00, 0x00};   // any bytes: the store hands them through
+@@ -118,21 +92,17 @@ int main(void) {
+     snprintf(path, sizeof path, "%s/romfs.img", dir);
+     setenv("DM_ROMFS", path, 1);
+ 
+-    assert(h_ssl_BiBufSize(&size, &id, 1) == RES_OK);
+-    assert(size == 2 * 0x18 + ((sizeof fake + 3u) & ~(size_t)3u));
+-    out = NULL;
+-    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &id, 1) == RES_OK);
+-    e = (struct info *)(void *)buf;
+-    assert(e[0].size == sizeof fake);
+-    assert(memcmp(buf + e[0].off, fake, sizeof fake) == 0);
++    size_t size_file = dm_ssl_ca_size(&id, 1);
++    assert(size_file == 2 * 0x18 + ((sizeof fake + 3u) & ~(size_t)3u));
++    assert(dm_ssl_ca_build(&id, 1, buf, sizeof buf, &entries, &der, &file, 1) == size_file);
++    e = (struct info_base *)(void *)buf;
++    assert(e[0].size == sizeof fake && file == 1);
++    assert(e[0].der == (const void *)(buf + 2 * 0x18));
++    assert(memcmp(e[0].der, fake, sizeof fake) == 0);
+     printf("certs/1.der: %zu bytes from the file, the built-in one untouched\n", sizeof fake);
+ 
+-    // ---- without the switch it is the old failure, so nothing here changes an offline title
+-    unsetenv("DM_NEXTENDO");
+-    out = NULL;
+-    assert(h_ssl_BiCerts(&out, buf, sizeof buf, &id, 1) == RES_FAIL);
+-    assert(out == NULL);
+-    printf("offline: fails, as the cut branch always did\n");
++    // ---- a buffer too small is refused, not overflowed
++    assert(dm_ssl_ca_build(&id, 1, buf, 0x20, &entries, &der, &file, 1) == 0);
+     printf("ok\n");
+     return 0;
+ }
