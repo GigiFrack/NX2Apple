@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 15:31:25 +0000
+Subject: [PATCH] host: the socket remembers the TCP_NODELAY it was given
+
+Asking the host socket what TCP_NODELAY holds is not enough: before the connection exists it answers 0
+whatever was set - the new assertion in t_net_tcp failed on macOS exactly that way - and every title that
+reads the option back does it right after setting it, before connecting.
+
+The entry keeps the value the title set, and answers from it; any other IPPROTO_TCP option still goes to
+the socket, whose numbers these are. The alternative would have answered 1 on a phone and 0 on the Mac
+that tests it, which is worse than either.
+
+Upstream-Status: fork-only
+Reason: 0134 handed the option to the host socket, and the assertion it added to t_net_tcp failed on macOS: before a
+ connection exists the host answers TCP_NODELAY 0 whatever was set. Every title that reads the option back does it
+ right after setting it, before connecting - so the entry keeps the value the title set and answers from it, while
+ any other IPPROTO_TCP option still goes to the socket whose numbers these are.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 8bdec911..2d579edb 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -120,6 +120,8 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ 
+ typedef struct {
+     int used, host, nonblock, shut_r, shut_w;
++    int nodelay_set, nodelay;      // TCP_NODELAY as the title set it: the host socket does not report it back
++                                   // until the connection exists, and a title asks right after setting it
+     int64_t rtimeo, stimeo;        // nanoseconds, 0 = no timeout
+     uint32_t local, peer; uint16_t local_port, peer_port;
+ } nd_tcp_ent;
+@@ -340,7 +342,9 @@ int dm_nd_tcp_setopt(int fd, int level, int option, const void *value, unsigned
+         if (option == 0x1006) e->rtimeo = ns; else e->stimeo = ns;
+     } else if (level == 6) {
+         // IPPROTO_TCP: the option numbers are the host's own (TCP_NODELAY is 1 on both), so the socket takes the
+-        // option itself instead of a list of the ones this host happened to think of.
++        // option itself instead of a list of the ones this host happened to think of. TCP_NODELAY is kept here
++        // too: the host does not report it back before the connection exists.
++        if (option == 1 && size >= sizeof(int)) { int v; memcpy(&v, value, sizeof v); e->nodelay = !!v; e->nodelay_set = 1; }
+         if (setsockopt(h, IPPROTO_TCP, option, value, size) < 0) r = sk_error(nd_errno(errno));
+     } else if (level == 0xffff) {
+         /* SO_REUSEADDR and friends: accepted and not needed on a stream socket here */
+@@ -360,9 +364,14 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+         int64_t ns = option == 0x1006 ? e->rtimeo : e->stimeo;
+         int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000};
+         memcpy(value, tv, sizeof tv); *size = sizeof tv;
++    } else if (level == 6 && option == 1 && e->nodelay_set) {
++        // TCP_NODELAY: what the title set on this socket. The host socket answers 0 here until the connection
++        // exists, and every title that reads the option back does it right after setting it, before connecting.
++        unsigned c = *size < sizeof v ? *size : (unsigned)sizeof v;
++        v = e->nodelay;
++        if (c) { memcpy(value, &v, c); *size = c; }
+     } else if (level == 6 && *size <= 64) {
+-        // IPPROTO_TCP: ask the socket. A title that sets an option and reads it back has to see what it set -
+-        // answering a fixed 0 turned TCP_NODELAY into "off" right after the title had turned it on.
++        // Any other IPPROTO_TCP option: the numbers are the host's own, so ask the socket.
+         unsigned len = *size;
+         if (getsockopt(h, IPPROTO_TCP, option, value, &len) < 0) r = sk_error(nd_errno(errno));
+         else *size = len;
