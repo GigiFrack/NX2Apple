@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 15:24:53 +0000
+Subject: [PATCH] host: a socket option read back is the socket's answer
+
+The answers of 0133 name the turn: Super Mario Party Jamboree opens its stream socket, sets TCP_NODELAY
+to 1 and then reads the same option back - and dm_nd_tcp_getopt answered a fixed 0 for every option it
+did not translate, so the title saw "off" right after it had turned it on and gave up without ever
+calling connect().
+
+IPPROTO_TCP options go to the socket itself now, both ways: the numbers are the host's own (TCP_NODELAY
+is 1 on both), so the socket takes what the title sets and answers what it holds, instead of a list of
+the options this host happened to think of. t_net_tcp pins the round trip: set TCP_NODELAY, read it back,
+expect 1 and the size the caller asked for.
+
+Upstream-Status: fork-only
+Reason: The 0133 traces named the turn: the title opens its stream socket, sets TCP_NODELAY to 1, reads the same
+ option back and dm_nd_tcp_getopt answered a fixed 0 - every option it did not translate came back as "off"
+ whatever the socket held. The title then showed its network error without ever calling connect(). IPPROTO_TCP
+ options now go to the socket itself both ways (the numbers are the host's own: TCP_NODELAY is 1 on both), so the
+ socket takes what the title sets and answers what it holds. t_net_tcp pins the round trip.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 16 ++++++++++++----
+ dm/host/tests/t_net_tcp.c |  9 +++++++++
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index ca6b68b..a2ceb0a 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -337,8 +337,10 @@ int dm_nd_tcp_setopt(int fd, int level, int option, const void *value, unsigned
+         int64_t tv[2]; memcpy(tv, value, sizeof tv);
+         int64_t ns = tv[0] < 0 ? 0 : tv[0] * 1000000000 + tv[1] * 1000;
+         if (option == 0x1006) e->rtimeo = ns; else e->stimeo = ns;
+-    } else if (level == 6 && option == 1 && size >= sizeof(int)) {      // IPPROTO_TCP, TCP_NODELAY
+-        int v; memcpy(&v, value, sizeof v); setsockopt(h, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
++    } else if (level == 6) {
++        // IPPROTO_TCP: the option numbers are the host's own (TCP_NODELAY is 1 on both), so the socket takes the
++        // option itself instead of a list of the ones this host happened to think of.
++        if (setsockopt(h, IPPROTO_TCP, option, value, size) < 0) r = sk_error(nd_errno(errno));
+     } else if (level == 0xffff) {
+         /* SO_REUSEADDR and friends: accepted and not needed on a stream socket here */
+     } else r = sk_error(42);
+@@ -352,11 +354,17 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+     pthread_mutex_lock(&g_nd_tcp_m);
+     nd_tcp_ent *e = nd_tcp_locked(fd);
+     if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
+-    int v = 0;
++    int h = e->host, v = 0, r = 0;
+     if (level == 0xffff && (option == 0x1006 || option == 0x1005) && *size >= 16) {
+         int64_t ns = option == 0x1006 ? e->rtimeo : e->stimeo;
+         int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000};
+         memcpy(value, tv, sizeof tv); *size = sizeof tv;
++    } else if (level == 6 && *size <= 64) {
++        // IPPROTO_TCP: ask the socket. A title that sets an option and reads it back has to see what it set -
++        // answering a fixed 0 turned TCP_NODELAY into "off" right after the title had turned it on.
++        unsigned len = *size;
++        if (getsockopt(h, IPPROTO_TCP, option, value, &len) < 0) r = sk_error(nd_errno(errno));
++        else *size = len;
+     } else {
+         if (option == 0x1008) v = 1;            // SOCK_STREAM
+         else if (option == 0x1007) v = 0;       // IPPROTO_IP
+@@ -368,7 +376,7 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+         if (c) { memcpy(value, &v, c); *size = c; }
+     }
+     pthread_mutex_unlock(&g_nd_tcp_m);
+-    return 0;
++    return r;
+ }
+ 
+ // Readiness of one stream socket, without waiting: the poll loop below samples it.
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index 1a7a904..db8aefb 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -85,6 +85,15 @@ int main(void) {
+     int fd = dm_sk_socket(2, 1, 0);                          // AF_INET, SOCK_STREAM
+     if (fd < ND_TCP_BASE) fail("a stream socket did not come from the stream table");
+ 
++    // TCP_NODELAY comes back as it was set: a title that reads an option back after setting it has to see
++    // what it set, and this answer used to be a fixed 0 whatever the socket held.
++    int nodelay = 1;
++    if (dm_sk_setopt(fd, 6, 1, &nodelay, sizeof nodelay)) fail("SetSockOpt TCP_NODELAY");
++    int back = 0; unsigned back_len = sizeof back;
++    if (dm_sk_getopt(fd, 6, 1, &back, &back_len)) fail("GetSockOpt TCP_NODELAY");
++    if (back != 1) fail("GetSockOpt TCP_NODELAY read back off");
++    if (back_len != sizeof back) fail("GetSockOpt TCP_NODELAY size");
++
+     uint8_t sa[16] = {16, 2, (uint8_t)(g_port >> 8), (uint8_t)g_port, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+     if (dm_sk_connect(fd, sa, sizeof sa)) fail("connect");
+     if (dm_sk_sendto(fd, "hello", 5, 0, NULL, 0) != 5) fail("send");
