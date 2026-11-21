@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 19:20:37 +0000
+Subject: [PATCH] host: a non-blocking connect answers the connection, not the
+ wait
+
+The NPLN client sets O_NONBLOCK and then calls connect; Horizon's service does
+the connect on the title's behalf, so what it expects back is the outcome. We
+answered EINPROGRESS, and the reference ports measured what that costs: grpc
+registers the socket for a writability poll that never dispatches, and the
+whole online flow stalls. Wait for the host to finish and answer what it
+finished with (success, or the refusal itself); only a connect still running
+after the budget is answered in progress, as before.
+
+The line the trace prints now names the destination, whether the socket was
+non-blocking and what the wait saw, so the next log settles it either way.
+
+Upstream-Status: fork-only
+Reason: The NPLN client sets O_NONBLOCK and then calls connect, and Horizon's service does the connect on the
+ title's behalf, so the answer it expects is the connection's outcome. Answering EINPROGRESS is what the reference
+ ports measured as fatal for this client: grpc registers the socket for a writability poll that never dispatches and
+ the online flow stalls there (Ryujinx Nextendo, ManagedSocket.cs). The entry now waits for the host connect to
+ finish and answers what it finished with, success or the refusal itself, and only a connect still running after the
+ budget is answered in progress. The trace names the destination, whether the socket was non-blocking and what the
+ wait saw.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 35 ++++++++++++++++++++++++++++-
+ dm/host/tests/t_net_tcp.c | 47 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 5e95c3b6..45e6bd06 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -117,6 +117,7 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ #define ND_EINPROGRESS 36
+ #define ND_ETIMEDOUT 60
+ #define ND_EMSGSIZE 40
++#define ND_CONNECT_WAIT_MS 2000   // how long a non-blocking connect may take before it is answered "in progress"
+ 
+ #define ND_OPT_MAX 8
+ typedef struct { int level, option, value, set; } nd_opt_rec;
+@@ -221,6 +222,31 @@ int dm_nd_tcp_bind(int fd, const void *a, unsigned n) {
+     return 0;
+ }
+ 
++// The NPLN client sets O_NONBLOCK and then calls connect. Horizon's service does the connect on the
++// guest's behalf, so what a title on this ABI expects back is the connection's outcome, not "in
++// progress": the reference ports measured that handing EINPROGRESS to the title's grpc leaves the
++// socket waiting for a writability poll that never dispatches, and the whole online flow stalls on it
++// (Ryujinx Nextendo, ManagedSocket.cs: "do NOT return EINPROGRESS and rely on grpc to poll ... block
++// briefly here and return SUCCESS as soon as it is writable"). So wait for the host to finish the
++// connect and answer what it finished with. ND_NOT means it has not finished inside the budget: the
++// caller then answers in progress, as it always did.
++static int nd_connect_wait(int h, int ms) {
++    struct pollfd p = {0};
++    p.fd = h; p.events = POLLOUT;
++    if (poll(&p, 1, ms) <= 0) return ND_NOT;
++    int so = 0; socklen_t sl = sizeof so;
++    if (getsockopt(h, SOL_SOCKET, SO_ERROR, &so, &sl) < 0) return ND_NOT;
++    if (so) { errno = so; return -1; }
++    return 0;
++}
++static void nd_connect_trace(int fd, uint32_t addr, uint16_t port, int nonblock, int waited, int err) {
++    char t[144];
++    snprintf(t, sizeof t, "socket::Connect(fd %d) to %u.%u.%u.%u:%u%s%s errno %d",
++             fd, addr >> 24, (addr >> 16) & 255, (addr >> 8) & 255, addr & 255, port,
++             nonblock ? " nonblocking" : "", waited ? " waited" : "", err);
++    dm_nd_trace_result(t, err ? -1 : 0);
++}
++
+ int dm_nd_tcp_connect(int fd, const void *a, unsigned n) {
+     if (!nd_tcp_range(fd)) return ND_NOT;
+     uint32_t addr = 0; uint16_t port = 0;
+@@ -233,9 +259,16 @@ int dm_nd_tcp_connect(int fd, const void *a, unsigned n) {
+     pthread_mutex_unlock(&g_nd_tcp_m);
+     struct sockaddr_in sa = {0};
+     sa.sin_family = AF_INET; sa.sin_port = htons(port); sa.sin_addr.s_addr = htonl(addr);
++    errno = 0;
+     int r = connect(h, (struct sockaddr *)&sa, sizeof sa);
++    int err = errno, waited = 0;
++    if (r < 0 && err == EINPROGRESS && nonblock) {
++        int w = nd_connect_wait(h, ND_CONNECT_WAIT_MS);
++        if (w == ND_NOT) { errno = EINPROGRESS; }        // still running: answer in progress, as before
++        else { r = w; err = w < 0 ? errno : 0; waited = 1; }
++    }
++    nd_connect_trace(fd, addr, port, nonblock, waited, err);
+     if (r < 0) {
+-        int err = errno;
+         if (err == EINPROGRESS && nonblock) return sk_error(ND_EINPROGRESS);
+         return sk_error(nd_errno(err));
+     }
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index d1a34b83..dee795bd 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -44,6 +44,30 @@ static void fail(const char *what) {
+ 
+ static int g_port;
+ 
++// A listener on a port the kernel picks, bound here so the caller knows the port before it connects,
++// and accepted in a thread: the non-blocking connect test needs a live port and a free one.
++static int idle_listen(int *port) {
++    int ls = socket(AF_INET, SOCK_STREAM, 0);
++    struct sockaddr_in a = {0};
++    a.sin_family = AF_INET;
++    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    if (bind(ls, (struct sockaddr *)&a, sizeof a) || listen(ls, 1)) { perror("idle bind/listen"); exit(1); }
++    socklen_t al = sizeof a;
++    getsockname(ls, (struct sockaddr *)&a, &al);
++    *port = ntohs(a.sin_port);
++    return ls;
++}
++static void *idle_accept(void *arg) {
++    int ls = *(int *)arg;
++    fd_set rd;
++    struct timeval tv = {5, 0};      // never let the test hang if the connect never arrives
++    FD_ZERO(&rd); FD_SET(ls, &rd);
++    int cs = select(ls + 1, &rd, NULL, NULL, &tv) > 0 ? accept(ls, NULL, NULL) : -1;
++    if (cs >= 0) close(cs);
++    close(ls);
++    return NULL;
++}
++
+ static void *echo_server(void *arg) {
+     (void)arg;
+     int ls = socket(AF_INET, SOCK_STREAM, 0);
+@@ -110,6 +134,29 @@ int main(void) {
+     dm_sk_close(fd);
+     pthread_join(th, NULL);
+ 
++    // A non-blocking connect answers the connection's outcome, not "in progress": the NPLN client sets
++    // O_NONBLOCK and the next thing it does is speak TLS on that socket, and handing it EINPROGRESS is the
++    // answer that left the online flow stalled in the reference ports (they block for the completion).
++    int live_port = 0;
++    int live_fd = idle_listen(&live_port);
++    pthread_t th2;
++    pthread_create(&th2, NULL, idle_accept, &live_fd);
++    int nb = dm_sk_socket(2, 1, 0);
++    if (nb < ND_TCP_BASE) fail("a stream socket for the non-blocking connect");
++    if (dm_sk_fcntl(nb, 4, SK_NONBLOCK)) fail("Fcntl O_NONBLOCK");
++    uint8_t live[16] = {16, 2, (uint8_t)(live_port >> 8), (uint8_t)live_port, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++    if (dm_sk_connect(nb, live, sizeof live)) fail("a non-blocking connect to a listener");
++    dm_sk_close(nb);
++    pthread_join(th2, NULL);
++
++    // A port nothing listens on comes back with the refusal itself: neither a success nor "in progress".
++    int nb2 = dm_sk_socket(2, 1, 0);
++    if (nb2 < ND_TCP_BASE) fail("a stream socket for the refused connect");
++    if (dm_sk_fcntl(nb2, 4, SK_NONBLOCK)) fail("Fcntl O_NONBLOCK");
++    if (dm_sk_connect(nb2, sa, sizeof sa) != -1) fail("a non-blocking connect to a closed port");
++    if (dm_sk_errno() != ND_ECONNREFUSED) fail("the refused connect errno");
++    dm_sk_close(nb2);
++
+     unsetenv("DM_NEXTENDO");
+     if (dm_sk_socket(2, 1, 0) != -1) fail("a stream socket with the switch off");
+     if (dm_sk_errno() != SK_ENETDOWN) fail("the switch-off errno");
