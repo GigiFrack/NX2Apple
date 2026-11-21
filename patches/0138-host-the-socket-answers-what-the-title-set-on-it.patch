@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sat, 21 Nov 2026 19:04:00 +0000
+Subject: [PATCH] host: the socket answers what the title set on it
+
+Chasing one option at a time was the wrong shape: the assertion that failed on macOS for TCP_NODELAY
+failed there for SO_REUSEADDR too, because this stack does not report either of them before the
+descriptor is connected, and a title that checks its own socket does set-then-get immediately.
+
+The entry keeps the integer options the title has given it and answers a read-back from that record,
+before asking the socket and before falling back to this host's own view. Forwarding stays: IPPROTO_TCP
+and SOL_SOCKET both reach the socket, best effort, because the numbers are the FreeBSD ones this stack
+speaks and a title that expects an option to have an effect still gets it.
+
+Upstream-Status: fork-only
+Reason: One option at a time was the wrong shape: the macOS assertion that failed for TCP_NODELAY failed there for
+ SO_REUSEADDR too, because Apple's stack reports neither before the descriptor is connected, and a title checking
+ its own socket does set-then-get immediately. The entry keeps the integer options the title gave it and answers a
+ read-back from that record; forwarding to the socket stays, best effort, so an option that is supposed to have an
+ effect still does.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 42 ++++++++++++++++++++++++++++--------------
+ 1 file changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 6baa5707..5e95c3b6 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -118,10 +118,15 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ #define ND_ETIMEDOUT 60
+ #define ND_EMSGSIZE 40
+ 
++#define ND_OPT_MAX 8
++typedef struct { int level, option, value, set; } nd_opt_rec;
++
+ typedef struct {
+     int used, host, nonblock, shut_r, shut_w;
+-    int nodelay_set, nodelay;      // TCP_NODELAY as the title set it: the host socket does not report it back
+-                                   // until the connection exists, and a title asks right after setting it
++    // The integer options the title has set on this socket. This stack does not report every one of them back
++    // before the descriptor is connected - TCP_NODELAY and SO_REUSEADDR both read as 0 - and a title that
++    // checks its own socket does set-then-get right away, so the entry answers what it was given.
++    nd_opt_rec opt[ND_OPT_MAX];
+     int64_t rtimeo, stimeo;        // nanoseconds, 0 = no timeout
+     uint32_t local, peer; uint16_t local_port, peer_port;
+ } nd_tcp_ent;
+@@ -342,16 +347,23 @@ int dm_nd_tcp_setopt(int fd, int level, int option, const void *value, unsigned
+         if (option == 0x1006) e->rtimeo = ns; else e->stimeo = ns;
+     } else if (level == 6) {
+         // IPPROTO_TCP: the option numbers are the host's own (TCP_NODELAY is 1 on both), so the socket takes the
+-        // option itself instead of a list of the ones this host happened to think of. TCP_NODELAY is kept here
+-        // too: the host does not report it back before the connection exists.
+-        if (option == 1 && size >= sizeof(int)) { int v; memcpy(&v, value, sizeof v); e->nodelay = !!v; e->nodelay_set = 1; }
++        // option itself instead of a list of the ones this host happened to think of.
+         if (setsockopt(h, IPPROTO_TCP, option, value, size) < 0) r = sk_error(nd_errno(errno));
+     } else if (level == 0xffff) {
+-        // SOL_SOCKET: Horizon's numbers are the FreeBSD ones this stack speaks (SO_REUSEADDR is 4 on both), so
+-        // the socket takes the option and a title that reads it back sees what it set. An option the host does
+-        // not know is accepted and dropped: a stream socket here does not need it.
+-        if (value && size && setsockopt(h, SOL_SOCKET, option, value, size) < 0) r = 0;
++        // SOL_SOCKET: Horizon's numbers are the FreeBSD ones this stack speaks (SO_REUSEADDR is 4 on both). The
++        // socket gets it too, best effort: a stream socket here does not need most of them, and a title's own
++        // read-back is answered from the record below whatever the stack decides to keep.
++        setsockopt(h, SOL_SOCKET, option, value, size);
+     } else r = sk_error(42);
++    if (!r && value && size == sizeof(int)) {
++        int v; memcpy(&v, value, sizeof v);
++        int slot = -1;
++        for (int i = 0; i < ND_OPT_MAX && slot < 0; i++)
++            if (!e->opt[i].set) slot = i;
++        for (int i = 0; i < ND_OPT_MAX; i++)
++            if (e->opt[i].set && e->opt[i].level == level && e->opt[i].option == option) { slot = i; break; }
++        if (slot >= 0) { e->opt[slot].set = 1; e->opt[slot].level = level; e->opt[slot].option = option; e->opt[slot].value = v; }
++    }
+     pthread_mutex_unlock(&g_nd_tcp_m);
+     return r;
+ }
+@@ -362,16 +374,18 @@ int dm_nd_tcp_getopt(int fd, int level, int option, void *value, unsigned *size)
+     pthread_mutex_lock(&g_nd_tcp_m);
+     nd_tcp_ent *e = nd_tcp_locked(fd);
+     if (!e) { pthread_mutex_unlock(&g_nd_tcp_m); return sk_error(SK_EBADF); }
+-    int h = e->host, v = 0, r = 0;
++    int h = e->host, v = 0, r = 0, rec = -1;
++    for (int i = 0; i < ND_OPT_MAX; i++)
++        if (e->opt[i].set && e->opt[i].level == level && e->opt[i].option == option) { rec = i; break; }
+     if (level == 0xffff && (option == 0x1006 || option == 0x1005) && *size >= 16) {
+         int64_t ns = option == 0x1006 ? e->rtimeo : e->stimeo;
+         int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000};
+         memcpy(value, tv, sizeof tv); *size = sizeof tv;
+-    } else if (level == 6 && option == 1 && e->nodelay_set) {
+-        // TCP_NODELAY: what the title set on this socket. The host socket answers 0 here until the connection
+-        // exists, and every title that reads the option back does it right after setting it, before connecting.
++    } else if (rec >= 0) {
++        // An option the title set on this socket reads back as it set it: the stack under this one answers 0 for
++        // several of them until the descriptor is connected, and the title asks immediately, before connecting.
+         unsigned c = *size < sizeof v ? *size : (unsigned)sizeof v;
+-        v = e->nodelay;
++        v = e->opt[rec].value;
+         if (c) { memcpy(value, &v, c); *size = c; }
+     } else if ((level == 0xffff || level == 6) && *size <= 64) {
+         // Horizon's SOL_SOCKET and IPPROTO_TCP numbers are the ones this stack speaks, so the socket answers
