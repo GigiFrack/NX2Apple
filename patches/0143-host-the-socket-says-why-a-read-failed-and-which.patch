@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sun, 22 Nov 2026 13:30:50 +0000
+Subject: [PATCH] host: the socket says why a read failed and which frames went
+ by
+
+The first real NPLN exchange on the phone reads: 213 bytes out, 1375 back, a request of 126, then two reads
+that answer -1 and the title's own error. That is the protocol finally talking, and the log still cannot say
+what the -1 meant: EAGAIN on a non-blocking socket (nothing has arrived yet) and ECONNRESET (the server
+closed) are the same line, and one of them is our bug and the other is not.
+
+So a failure now names the errno and whether the host socket had data waiting at that instant — a "-1, host
+readable 1" says this layer threw data away, a "-1, host readable 0" says nothing arrived. The waits are
+traced too (`socket::poll(%lu fds, %d ms)` with each descriptor's events and revents, capped), because a
+poller that never sees its socket ready and a socket with nothing to read are indistinguishable from
+outside. And each of the first eight vectored calls prints its HTTP/2 frame headers — type, length, flags,
+stream, no payload — so a GOAWAY, a SETTINGS burst and a HEADERS request are read straight off the log.
+
+Upstream-Status: fork-only
+Reason: The first real NPLN exchange reads 213 bytes out, 1375 back, a request of 126, then two reads that answer -1
+  and the title's own error. The log could not say what the -1 meant: EAGAIN on a non-blocking socket (nothing has
+  arrived yet) and ECONNRESET (the server closed) were the same line, and one of them is this layer's bug and the other
+  is not. A failure now names the errno and whether the host socket had data waiting at that instant ("host readable 1"
+  means this layer threw data away, 0 means nothing arrived). The waits are traced with each descriptor's events and
+  revents, capped, because a poller that never sees its socket ready and a socket with nothing to read look identical
+  from outside. Each of the first eight vectored calls also prints its HTTP/2 frame headers (type, length, flags,
+  stream, no payload), so a GOAWAY, a SETTINGS burst and a HEADERS request are read straight off the log instead of
+  costing another build.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 75 ++++++++++++++++++++++++++++++++++-----
+ dm/host/tests/t_net_tcp.c | 15 ++++++++
+ 2 files changed, 81 insertions(+), 9 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 683dddcd..44ebbe80 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -340,13 +340,53 @@ _Static_assert(offsetof(nd_msghdr, control) == 0x20, "MsgHdr.control");
+ _Static_assert(offsetof(nd_msghdr, flags) == 0x2c, "MsgHdr.flags");
+ #endif
+ 
+-// One line per vectored call, capped: a title that connects and then goes quiet stops somewhere in
+-// these, and "the host answered nothing" and "the host answered -1" read the same without it.
+-static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int n) {
++// HTTP/2 frame headers, so the log names the conversation instead of its byte count: type, length, flags,
++// stream. Payloads stay out of the log (a gRPC request carries the account's token in its headers), and the
++// walk stops at ND_H2_MAX or the first frame that does not fit.
++#define ND_H2_MAX 6
++static int nd_tcp_ready(int fd, int16_t events);   // defined below: the failure line asks it what the host saw
++// The frame headers of one chunk as text (no payloads), the count returned: a test pins the parse and the
++// trace is the same function. A client's first chunk opens with the HTTP/2 connection preface, which is not
++// a frame, so the walk starts after it.
++static int nd_h2_format(char *out, size_t cap, const void *buf, size_t n, size_t *used) {
++    const uint8_t *b = buf;
++    size_t off = 0;
++    int at = 0, k = 0;
++    if (cap) out[0] = 0;
++    if (used) *used = 0;
++    if (n >= 24 && !memcmp(b, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24)) off = 24;
++    while (off + 9 <= n && k < ND_H2_MAX && at < (int)cap - 32) {
++        unsigned len = (unsigned)b[off] << 16 | (unsigned)b[off + 1] << 8 | b[off + 2];
++        unsigned type = b[off + 3], flags = b[off + 4];
++        unsigned long stream = ((unsigned long)(b[off + 5] & 0x7f) << 24) | ((unsigned long)b[off + 6] << 16) |
++                               ((unsigned long)b[off + 7] << 8) | b[off + 8];
++        at += snprintf(out + at, cap - (size_t)at, "%s%u len %u flags 0x%x stream %lu",
++                       k ? " | " : "", type, len, flags, stream);
++        off += 9 + (size_t)len;
++        k++;
++    }
++    if (used) *used = off;
++    return k;
++}
++static void nd_h2_frames(const char *dir, const void *buf, size_t n) {
++    char line[256];
++    size_t used = 0;
++    if (!nd_h2_format(line, sizeof line, buf, n, &used)) return;
++    fprintf(stderr, "[dm] nextendo: h2 %s: %s%s\n", dir, line, used < n ? " | more" : "");
++}
++
++// One line per vectored call, capped: a title that connects and then goes quiet stops somewhere in these,
++// and "the host answered nothing" and "the host answered -1" read the same without it. A failure names the
++// errno, because EAGAIN (a non-blocking socket with nothing to read yet) and ECONNRESET (the server closed)
++// are different problems with the same "-1".
++static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int n, const void *buf, size_t len) {
+     if (n > 16 && bytes >= 0 && n % 64) return;
+-    char t[96];
+-    snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec)", what, fd, iov);
++    char t[140];
++    if (bytes < 0) snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec) errno %d, host readable %d",
++                            what, fd, iov, dm_sk_errno(), nd_tcp_ready(fd, SK_POLLIN) != 0);
++    else snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec)", what, fd, iov);
+     dm_nd_trace_result(t, bytes);
++    if (n <= 8 && bytes > 0 && buf) nd_h2_frames(what, buf, (size_t)bytes < len ? (size_t)bytes : len);
+ }
+ 
+ long dm_nd_sendmsg(int fd, const void *msg, int flags) {
+@@ -357,12 +397,13 @@ long dm_nd_sendmsg(int fd, const void *msg, int flags) {
+     for (unsigned i = 0; i < m->iov_len; i++) {
+         const nd_iovec *v = &((const nd_iovec *)m->iov)[i];
+         long w = dm_nd_tcp_send(fd, v->base, v->len, flags);
+-        if (w < 0) { if (total) break; nd_msg_trace("SendMsg", fd, m->iov_len, w, 0); return w; }
++        if (w < 0) { if (total) break; nd_msg_trace("SendMsg", fd, m->iov_len, w, 0, NULL, 0); return w; }
+         total += w;
+         if ((size_t)w < v->len) break;      // a short write: the rest waits for the socket, as send(2) says
+     }
+     static int seen;
+-    nd_msg_trace("SendMsg", fd, m->iov_len, total, ++seen);
++    const nd_iovec *first = m->iov_len ? (const nd_iovec *)m->iov : NULL;
++    nd_msg_trace("SendMsg", fd, m->iov_len, total, ++seen, first ? first->base : NULL, first ? first->len : 0);
+     return total;
+ }
+ 
+@@ -375,7 +416,7 @@ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+     long r = dm_nd_tcp_recv(fd, v->base, v->len, flags, m->name, m->name ? &named : NULL);
+     if (r >= 0) { if (m->name) m->name_len = named; m->flags = 0; }
+     static int seen;
+-    nd_msg_trace("RecvMsg", fd, m->iov_len, r, ++seen);
++    nd_msg_trace("RecvMsg", fd, m->iov_len, r, ++seen, v->base, v->len);
+     return r;
+ }
+ 
+@@ -1029,7 +1070,23 @@ SKF("nnsocketFcntl", h_nsk_Fcntl, int s, int c, int v) {
+     { char t[96]; snprintf(t, sizeof t, "socket::Fcntl(fd %d cmd %d value 0x%x)", s, c, v); dm_nd_trace_result(t, r); }
+     return r;
+ }
+-SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
++SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) {
++    int r = dm_sk_poll(f, n, t);
++    // Which descriptors the wait covered and what the host answered: a poller that never sees its socket ready
++    // and a socket with nothing to read look identical from outside, and only one of them is a bug here.
++    static int seen;
++    int k = ++seen;
++    if (k <= 16 || k % 256 == 0) {
++        char s[176];
++        int at = snprintf(s, sizeof s, "socket::poll(%lu fds, %d ms)", n, t);
++        sk_pollfd *p = f;
++        for (unsigned long i = 0; p && i < n && i < 3 && at > 0 && at < (int)sizeof s; i++)
++            at += snprintf(s + at, sizeof s - (size_t)at, "%s fd %d events 0x%x revents 0x%x", i ? ";" : ":",
++                           p[i].fd, (unsigned)(unsigned short)p[i].events, (unsigned)(unsigned short)p[i].revents);
++        dm_nd_trace_result(s, r);
++    }
++    return r;
++}
+ // The vectored calls are how the NPLN client's gRPC writes and reads: it hands one MsgHdr, not a buffer.
+ // They were the offline cut (a flat -1), so the client's first frame went nowhere and the server, which
+ // answers a plaintext HTTP/2 preface at once, was never heard from.
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index 00aa010b..7ea06905 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -202,6 +202,21 @@ int main(void) {
+     if (dm_sk_socket(2, 1, 0) != -1) fail("a stream socket with the switch off");
+     if (dm_sk_errno() != SK_ENETDOWN) fail("the switch-off errno");
+ 
++    // The HTTP/2 frame walk the trace prints: the connection preface is not a frame, and each header reads as
++    // type, length, flags, stream — a log that names the conversation instead of its byte count.
++    {
++        uint8_t chunk[64] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
++        uint8_t frames[] = {0, 0, 0, 4, 0, 0, 0, 0, 0,      // SETTINGS, no payload, stream 0
++                            0, 0, 3, 1, 5, 0, 0, 0, 1,      // HEADERS, 3 bytes, END_STREAM|END_HEADERS, stream 1
++                            0x82, 0x86, 0x84};
++        char s[256];
++        size_t used = 0;
++        memcpy(chunk + 24, frames, sizeof frames);
++        if (nd_h2_format(s, sizeof s, chunk, 24 + sizeof frames, &used) != 2) fail("two HTTP/2 frames");
++        if (strcmp(s, "4 len 0 flags 0x0 stream 0 | 1 len 3 flags 0x5 stream 1")) fail("the frame headers");
++        if (used != 24 + sizeof frames) fail("the bytes the walk consumed");
++    }
++
+     puts("ok");
+     return 0;
+ }
