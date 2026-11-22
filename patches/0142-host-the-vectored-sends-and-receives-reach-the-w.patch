@@ -30,8 +30,8 @@ Issue: https://github.com/GigiFrack/NX2Apple (fork)
 ---
  dm/host/hle_net.c         | 71 +++++++++++++++++++++++++++++++++++++++
  dm/host/hle_offline.c     |  2 --
- dm/host/tests/t_net_tcp.c | 41 ++++++++++++++++++++++
- 3 files changed, 112 insertions(+), 2 deletions(-)
+ dm/host/tests/t_net_tcp.c | 53 +++++++++++++++++++++++++++++
+ 3 files changed, 124 insertions(+), 2 deletions(-)
 
 diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
 index 45e6bd06..683dddcd 100644
@@ -143,22 +143,28 @@ index c4076cf4..4fac372e 100644
  HLE_FORCE("nnsocketGetAddrInfoWithOptions", "the Nextendo map, then the real resolver; the options are not needed", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)o; (void)n; return dm_nd_gai(h, s, hint, res); }
  HLE_FORCE("nnsocketGetAddrInfo", "the Nextendo map, then the real resolver (DM_NEXTENDO=1)", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { if (dm_nd_enabled()) LOG("gai %s (port %s)", h ? h : "", s ? s : ""); return dm_nd_gai(h, s, hint, res); }
 diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
-index dee795bd..00aa010b 100644
+index dee795bd..1b08f21b 100644
 --- a/dm/host/tests/t_net_tcp.c
 +++ b/dm/host/tests/t_net_tcp.c
-@@ -87,6 +87,21 @@ static void *echo_server(void *arg) {
+@@ -87,6 +87,27 @@ static void *echo_server(void *arg) {
      return NULL;
  }
  
-+// The same, over a descriptor the caller already opened: the vectored test sends its message in two
-+// pieces and expects the echo back.
++// The same, over a descriptor the caller already opened. Both sides count to the whole message: a sendmsg
++// over two iovecs may land in two segments, and a server that echoes the first read alone turns that into a
++// flaky test instead of a true one.
 +static void *echo_vectors(void *arg) {
 +    int ls = *(int *)arg;
 +    int cs = accept(ls, NULL, NULL);
 +    if (cs >= 0) {
 +        char buf[16];
-+        ssize_t n = read(cs, buf, sizeof buf);
-+        if (n > 0) write(cs, buf, (size_t)n);
++        size_t have = 0;
++        while (have < 5) {
++            ssize_t n = read(cs, buf + have, 5 - have);
++            if (n <= 0) break;
++            have += (size_t)n;
++        }
++        if (have) write(cs, buf, have);
 +        close(cs);
 +    }
 +    close(ls);
@@ -168,7 +174,7 @@ index dee795bd..00aa010b 100644
  int main(void) {
      int probe = socket(AF_INET, SOCK_STREAM, 0);            // a free port, then given to the listener
      struct sockaddr_in a = {0};
-@@ -134,6 +149,32 @@ int main(void) {
+@@ -134,6 +155,38 @@ int main(void) {
      dm_sk_close(fd);
      pthread_join(th, NULL);
  
@@ -190,10 +196,16 @@ index dee795bd..00aa010b 100644
 +        vmh.iov = viov; vmh.iov_len = 2;
 +        if (dm_nd_sendmsg(vfd, &vmh, 0) != 5) fail("SendMsg over two iovecs");
 +        char got[6] = {0};
-+        nd_iovec riov[1] = {{got, 5}};
-+        nd_msghdr rmh = {0};
-+        rmh.iov = riov; rmh.iov_len = 1;
-+        if (dm_nd_recvmsg(vfd, &rmh, 0) != 5 || memcmp(got, "hello", 5)) fail("RecvMsg into one iovec");
++        size_t have = 0;
++        while (have < 5) {
++            nd_iovec riov[1] = {{got + have, 5 - have}};
++            nd_msghdr rmh = {0};
++            rmh.iov = riov; rmh.iov_len = 1;
++            long r = dm_nd_recvmsg(vfd, &rmh, 0);
++            if (r <= 0) break;
++            have += (size_t)r;
++        }
++        if (have != 5 || memcmp(got, "hello", 5)) fail("RecvMsg into one iovec");
 +        dm_sk_close(vfd);
 +        pthread_join(th3, NULL);
 +    }

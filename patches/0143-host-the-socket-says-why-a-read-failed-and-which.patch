@@ -147,10 +147,10 @@ index 683dddcd..44ebbe80 100644
  // They were the offline cut (a flat -1), so the client's first frame went nowhere and the server, which
  // answers a plaintext HTTP/2 preface at once, was never heard from.
 diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
-index 00aa010b..7ea06905 100644
+index 1b08f21b..2d85ac4d 100644
 --- a/dm/host/tests/t_net_tcp.c
 +++ b/dm/host/tests/t_net_tcp.c
-@@ -202,6 +202,21 @@ int main(void) {
+@@ -214,6 +214,21 @@ int main(void) {
      if (dm_sk_socket(2, 1, 0) != -1) fail("a stream socket with the switch off");
      if (dm_sk_errno() != SK_ENETDOWN) fail("the switch-off errno");
  
