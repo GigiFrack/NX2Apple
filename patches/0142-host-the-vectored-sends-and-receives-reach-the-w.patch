@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sun, 22 Nov 2026 12:47:17 +0000
+Subject: [PATCH] host: the vectored sends and receives reach the wire
+
+The NPLN client's gRPC speaks in MsgHdr: one call carries the vectors. The host answered that call with a
+flat -1, straight out of the offline cut, so the client's first frame — on Jamboree the 24-byte HTTP/2
+preface — never reached the socket: the title connected, sent nothing, and then waited for a reply that
+could not come, with one grpc thread spinning a core for the rest of the session. The server is not the
+quiet one: a plaintext preface to nex.nextendo.network gets a SETTINGS frame back at once (measured), so
+this was the whole distance between "connected" and "talking".
+
+Both directions: the iovecs are summed for SendMsg (a short write leaves the rest, as send(2) says), the
+first iovec is filled for RecvMsg and the peer name and its length go back when the title asked for them.
+The layout is asserted in the unit, because an offset guessed wrong would read a length out of the game's
+memory and move nothing at all — the same silence, one layer down.
+
+Upstream-Status: fork-only
+Reason: The NPLN client's gRPC speaks in MsgHdr: one call carries the vectors. The host answered that call with a
+  flat -1, straight out of the offline cut, so the client's first frame (on Jamboree the 24-byte HTTP/2 preface) never
+  reached the socket: the title connected, sent nothing, and then waited for a reply that could not come, with one grpc
+  thread spinning a core for the rest of the session. The server is not the quiet one: a plaintext preface to
+  nex.nextendo.network gets a SETTINGS frame back at once (measured), so this was the whole distance between
+  "connected" and "talking". Both directions are served: the iovecs are summed for SendMsg (a short write leaves the
+  rest, as send(2) says), the first iovec is filled for RecvMsg and the peer name and its length go back when the
+  title asked for them. The layout is asserted in the unit, because an offset guessed wrong would read a length out
+  of the game's memory and move nothing at all.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 71 +++++++++++++++++++++++++++++++++++++++
+ dm/host/hle_offline.c     |  2 --
+ dm/host/tests/t_net_tcp.c | 41 ++++++++++++++++++++++
+ 3 files changed, 112 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 45e6bd06..683dddcd 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -4,6 +4,7 @@
+ #include "hle_nextendo.h"   // dm_nd_enabled: the switch the nifm answers below turn on
+ #include <pthread.h>
+ #include <stdatomic.h>
++#include <stddef.h>         // offsetof: the MsgHdr layout the vectored calls read out of the game's memory
+ 
+ HLE_FORCE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_socket_Initialize, const void *cfg) { (void)cfg; return RES_OK; }
+ // SDK 21 (Star Fox) inlines nn::socket::Initialize(const Config &) into the game, and the service connection is this call
+@@ -321,6 +322,63 @@ long dm_nd_tcp_recv(int fd, void *data, unsigned long n, int flags, void *a, uns
+     }
+ }
+ 
++// The MsgHdr a title hands the send/receive-with-vectors calls: name, nameLen, iov, iovLen, control,
++// controlLen, flags — the field order and sizes of a POSIX msghdr, which is what the C shim forwards.
++// The offsets are asserted because a host that guessed them wrong would read the game's memory as a
++// length: the call would answer without moving a byte, exactly the silence this is here to end.
++typedef struct { void *base; size_t len; } nd_iovec;
++typedef struct {
++    void *name; unsigned name_len; void *iov; unsigned iov_len;
++    void *control; unsigned control_len; int flags;
++} nd_msghdr;
++#define ND_IOV_MAX 64
++#if defined(__LP64__)
++_Static_assert(sizeof(nd_msghdr) == 0x30, "the Horizon MsgHdr is 0x30 bytes");
++_Static_assert(offsetof(nd_msghdr, iov) == 0x10, "MsgHdr.iov");
++_Static_assert(offsetof(nd_msghdr, iov_len) == 0x18, "MsgHdr.iovLen");
++_Static_assert(offsetof(nd_msghdr, control) == 0x20, "MsgHdr.control");
++_Static_assert(offsetof(nd_msghdr, flags) == 0x2c, "MsgHdr.flags");
++#endif
++
++// One line per vectored call, capped: a title that connects and then goes quiet stops somewhere in
++// these, and "the host answered nothing" and "the host answered -1" read the same without it.
++static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int n) {
++    if (n > 16 && bytes >= 0 && n % 64) return;
++    char t[96];
++    snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec)", what, fd, iov);
++    dm_nd_trace_result(t, bytes);
++}
++
++long dm_nd_sendmsg(int fd, const void *msg, int flags) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    const nd_msghdr *m = msg;
++    if (!m || m->iov_len > ND_IOV_MAX) return sk_error(SK_EINVAL);
++    long total = 0;
++    for (unsigned i = 0; i < m->iov_len; i++) {
++        const nd_iovec *v = &((const nd_iovec *)m->iov)[i];
++        long w = dm_nd_tcp_send(fd, v->base, v->len, flags);
++        if (w < 0) { if (total) break; nd_msg_trace("SendMsg", fd, m->iov_len, w, 0); return w; }
++        total += w;
++        if ((size_t)w < v->len) break;      // a short write: the rest waits for the socket, as send(2) says
++    }
++    static int seen;
++    nd_msg_trace("SendMsg", fd, m->iov_len, total, ++seen);
++    return total;
++}
++
++long dm_nd_recvmsg(int fd, void *msg, int flags) {
++    if (!nd_tcp_range(fd)) return ND_NOT;
++    nd_msghdr *m = msg;
++    if (!m || !m->iov_len || m->iov_len > ND_IOV_MAX) return sk_error(SK_EINVAL);
++    nd_iovec *v = (nd_iovec *)m->iov;
++    unsigned named = m->name_len;
++    long r = dm_nd_tcp_recv(fd, v->base, v->len, flags, m->name, m->name ? &named : NULL);
++    if (r >= 0) { if (m->name) m->name_len = named; m->flags = 0; }
++    static int seen;
++    nd_msg_trace("RecvMsg", fd, m->iov_len, r, ++seen);
++    return r;
++}
++
+ int dm_nd_tcp_shutdown(int fd, int how) {
+     if (!nd_tcp_range(fd)) return ND_NOT;
+     pthread_mutex_lock(&g_nd_tcp_m);
+@@ -972,6 +1030,19 @@ SKF("nnsocketFcntl", h_nsk_Fcntl, int s, int c, int v) {
+     return r;
+ }
+ SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
++// The vectored calls are how the NPLN client's gRPC writes and reads: it hands one MsgHdr, not a buffer.
++// They were the offline cut (a flat -1), so the client's first frame went nowhere and the server, which
++// answers a plaintext HTTP/2 preface at once, was never heard from.
++SKF("nnsocketSendMsg", h_nsk_SendMsg, int s, const void *m, int f) {
++    long r = dm_nd_sendmsg(s, m, f);
++    if (r == ND_NOT) return sk_fail();
++    return (int)r;
++}
++SKF("nnsocketRecvMsg", h_nsk_RecvMsg, int s, void *m, int f) {
++    long r = dm_nd_recvmsg(s, m, f);
++    if (r == ND_NOT) return sk_fail();
++    return (int)r;
++}
+ SKF("nnsocketResolverGetOption", h_nsk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
+ SKF("nnsocketResolverSetOption", h_nsk_ResSet, const void *o) { (void)o; return sk_fail(); }
+ HLE_FORCE("nnsocketRecv", "local UDP (offline BSD service)", long, h_nsk_Recv, int s, void *b, unsigned long n, int f) { return dm_sk_recvfrom(s, b, n, f, NULL, NULL); }
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index c4076cf4..4fac372e 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -207,8 +207,6 @@ HLE_FORCE("_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPage
+ // ---------- C interface (nnsocket* / nnssl*): offline as well. The arguments are all in registers and the host does not look at them ----------
+ HLE_FORCE("nnsocketAccept", "offline (cut)", int, h_c_sk_Accept, void) { return -1; }
+ HLE_FORCE("nnsocketListen", "offline (cut)", int, h_c_sk_Listen, void) { return -1; }
+-HLE_FORCE("nnsocketRecvMsg", "offline (cut)", int, h_c_sk_RecvMsg, void) { return -1; }
+-HLE_FORCE("nnsocketSendMsg", "offline (cut)", int, h_c_sk_SendMsg, void) { return -1; }
+ HLE_FORCE("nnsocketShutdown", "local UDP (offline BSD service)", int, h_c_sk_Shutdown, int s, int h) { return dm_sk_shutdown(s, h); }
+ HLE_FORCE("nnsocketGetAddrInfoWithOptions", "the Nextendo map, then the real resolver; the options are not needed", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)o; (void)n; return dm_nd_gai(h, s, hint, res); }
+ HLE_FORCE("nnsocketGetAddrInfo", "the Nextendo map, then the real resolver (DM_NEXTENDO=1)", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { if (dm_nd_enabled()) LOG("gai %s (port %s)", h ? h : "", s ? s : ""); return dm_nd_gai(h, s, hint, res); }
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index dee795bd..00aa010b 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -87,6 +87,21 @@ static void *echo_server(void *arg) {
+     return NULL;
+ }
+ 
++// The same, over a descriptor the caller already opened: the vectored test sends its message in two
++// pieces and expects the echo back.
++static void *echo_vectors(void *arg) {
++    int ls = *(int *)arg;
++    int cs = accept(ls, NULL, NULL);
++    if (cs >= 0) {
++        char buf[16];
++        ssize_t n = read(cs, buf, sizeof buf);
++        if (n > 0) write(cs, buf, (size_t)n);
++        close(cs);
++    }
++    close(ls);
++    return NULL;
++}
++
+ int main(void) {
+     int probe = socket(AF_INET, SOCK_STREAM, 0);            // a free port, then given to the listener
+     struct sockaddr_in a = {0};
+@@ -134,6 +149,32 @@ int main(void) {
+     dm_sk_close(fd);
+     pthread_join(th, NULL);
+ 
++    // The vectored calls: one MsgHdr carrying two iovecs out, one carrying a single buffer back. This is
++    // how the NPLN client's gRPC writes and reads, and the host answered it with a flat -1 (the offline
++    // cut) for the whole online flow.
++    {
++        int vport = 0;
++        int vls = idle_listen(&vport);
++        pthread_t th3;
++        pthread_create(&th3, NULL, echo_vectors, &vls);
++        int vfd = dm_sk_socket(2, 1, 0);
++        if (vfd < ND_TCP_BASE) fail("a stream socket for the vectored calls");
++        uint8_t va[16] = {16, 2, (uint8_t)(vport >> 8), (uint8_t)vport, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++        if (dm_sk_connect(vfd, va, sizeof va)) fail("connect for the vectored calls");
++        char part1[4] = "hel", part2[3] = "lo";
++        nd_iovec viov[2] = {{part1, 3}, {part2, 2}};
++        nd_msghdr vmh = {0};
++        vmh.iov = viov; vmh.iov_len = 2;
++        if (dm_nd_sendmsg(vfd, &vmh, 0) != 5) fail("SendMsg over two iovecs");
++        char got[6] = {0};
++        nd_iovec riov[1] = {{got, 5}};
++        nd_msghdr rmh = {0};
++        rmh.iov = riov; rmh.iov_len = 1;
++        if (dm_nd_recvmsg(vfd, &rmh, 0) != 5 || memcmp(got, "hello", 5)) fail("RecvMsg into one iovec");
++        dm_sk_close(vfd);
++        pthread_join(th3, NULL);
++    }
++
+     // A non-blocking connect answers the connection's outcome, not "in progress": the NPLN client sets
+     // O_NONBLOCK and the next thing it does is speak TLS on that socket, and handing it EINPROGRESS is the
+     // answer that left the online flow stalled in the reference ports (they block for the completion).

@@ -136,3 +136,4 @@
 0139-host-a-non-blocking-connect-answers-the-connecti.patch
 0140-host-the-address-the-host-resolves-is-in-host-or.patch
 0141-host-a-patch-already-in-the-image-is-not-a-guard.patch
+0142-host-the-vectored-sends-and-receives-reach-the-w.patch
