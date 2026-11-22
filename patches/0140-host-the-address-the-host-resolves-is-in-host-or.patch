@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sun, 22 Nov 2026 11:31:24 +0000
+Subject: [PATCH] host: the address the host resolves is in host order, like
+ every other
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The redirect table hands the engine an address as a number, and that number
+is host order everywhere: the map's own rules read 10.0.0.9 as 0x0A000009 and
+the guest sockaddr writer puts the octets out from it with shifts. The
+resolver copied sin_addr in instead, which is network order, so on a
+little-endian device the four bytes came back reversed and the title dialled
+the mirror image of the server: 194.29.178.51 for nex.nextendo.network, whose
+real address is 51.178.29.194. Nothing answers there, the non-blocking connect
+runs out its whole budget and the online flow stops with 0x270141 — which is
+what the phone's log showed, address and all.
+
+The TLS layer's read of the peer address from a guest sockaddr gets the same
+conversion, or it would look the SNI name up under the reversed number.
+
+Upstream-Status: fork-only
+Reason: The redirect table hands the engine an address as a host-order number: the map's own rules read 10.0.0.9 as
+ 0x0A000009 and the guest sockaddr writer shifts the octets out of it. The resolver copied sin_addr in instead, which is
+ network order, so on a little-endian device the four bytes came out reversed and the title dialled the mirror image of
+ the server (194.29.178.51 for nex.nextendo.network, whose address is 51.178.29.194). Nothing answers there, so the
+ non-blocking connect spends its whole budget and the online flow stops with 0x270141. The TLS layer's read of the
+ peer address from a guest sockaddr gets the same conversion, or the SNI name is looked up under the reversed number.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_nextendo.c         | 6 +++++-
+ dm/host/hle_ssl.c              | 6 +++++-
+ dm/host/tests/t_nextendo_map.c | 6 ++++++
+ 3 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
+index 8718a4d7..b4423264 100644
+--- a/dm/host/hle_nextendo.c
++++ b/dm/host/hle_nextendo.c
+@@ -91,6 +91,10 @@ void dm_nd_reload(void) {
+ static uint32_t g_nd_nex_ip, g_nd_nat_ip;
+ static int g_nd_builtin_done;
+ 
++// The number every other part of the engine passes around is the address in HOST order (10.0.0.9 is
++// 0x0A000009, as the map's own parser and the guest sockaddr writer both assume). `sin_addr` sits in
++// memory in network order, so copying it as an integer hands out the same four bytes backwards: on a
++// little-endian device 51.178.29.194 became 194.29.178.51 and the TCP connect went to a stranger.
+ static uint32_t nd_resolve_name(const char *name) {
+     struct addrinfo hints, *res = NULL;
+     memset(&hints, 0, sizeof hints);
+@@ -101,7 +105,7 @@ static uint32_t nd_resolve_name(const char *name) {
+     for (struct addrinfo *a = res; a; a = a->ai_next) {
+         if (a->ai_addr && a->ai_addrlen >= sizeof(struct sockaddr_in)) {
+             const struct sockaddr_in *sin = (const struct sockaddr_in *)a->ai_addr;
+-            memcpy(&ip, &sin->sin_addr.s_addr, sizeof ip);   // already network order
++            ip = ntohl(sin->sin_addr.s_addr);
+             break;
+         }
+     }
+diff --git a/dm/host/hle_ssl.c b/dm/host/hle_ssl.c
+index e954b68d..1606a9ff 100644
+--- a/dm/host/hle_ssl.c
++++ b/dm/host/hle_ssl.c
+@@ -226,7 +226,11 @@ static int dm_ssl_open(dm_ssl_conn *c) {
+         uint32_t peer = 0;
+         unsigned n = 0;
+         unsigned char sa[16];
+-        if (c->fd >= 0 && dm_nd_tcp_name(c->fd, sa, &n, 1) == 0 && n >= 8) memcpy(&peer, sa + 4, 4);
++        if (c->fd >= 0 && dm_nd_tcp_name(c->fd, sa, &n, 1) == 0 && n >= 8) {
++            // The guest sockaddr carries the octets in order; the map answers in host order.
++            memcpy(&peer, sa + 4, 4);
++            peer = ntohl(peer);
++        }
+         sni = dm_nd_host_for_addr(peer);
+         if (!sni) sni = dm_nd_last_host();
+     }
+diff --git a/dm/host/tests/t_nextendo_map.c b/dm/host/tests/t_nextendo_map.c
+index 4c52ee1a..6ec9419f 100644
+--- a/dm/host/tests/t_nextendo_map.c
++++ b/dm/host/tests/t_nextendo_map.c
+@@ -61,6 +61,12 @@ int main(void) {
+     expect(strcmp(dm_nd_sni_for("gs.nintendo.net"), "gs.nintendo.net") == 0, "anything else is left alone");
+     expect(dm_nd_lookup("*.example.org", got, 4) == 0, "a bad address never becomes a rule");
+ 
++    // An address that comes from the host's resolver enters the same convention as the map's own rules:
++    // host order, the way 10.0.0.9 above is 0x0A000009. Copied straight out of sin_addr it arrived with
++    // its four bytes backwards, and the title dialled 194.29.178.51 instead of 51.178.29.194 — a connect
++    // that runs out its whole budget against a machine that has nothing to say.
++    expect(nd_resolve_name("51.178.29.194") == 0x33B21DC2u, "the resolver answers in host order, as the map does");
++
+     setenv("DM_NEXTENDO", "0", 1);
+     dm_nd_reload();
+     expect(dm_nd_rule_count() == 0, "no rules with the switch off");
