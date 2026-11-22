@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Sun, 22 Nov 2026 12:02:10 +0000
+Subject: [PATCH] host: a patch already in the image is not a guard mismatch
+
+The guard answers one question: are these the bytes of the build the catalog row was made for? A build
+patched before signing no longer has those bytes at that offset, it has the patched ones, and the loader
+called that a guard mismatch. So an iPhone build, where the catalog patch has to be in the binary because
+the code pages are signed, read like an image the row did not describe — when it was the row, already
+applied. Whether that patch is in the binary is what the online flow depends on next, so the loader now
+says which of the three it found: the original bytes (write it), the patched bytes (already there), or
+neither (not that build).
+
+Upstream-Status: fork-only
+Reason: The guard answers one question: are these the bytes of the build the catalog row was made for? A build
+  patched before signing no longer has those bytes at that offset, it has the patched ones, and the loader called
+  that a guard mismatch. So an iPhone build, where the catalog patch has to be in the binary because the code pages
+  are signed, read like an image the row did not describe, when it was the row already applied. Whether that patch
+  is in the binary is what the online flow depends on next, so the loader says which of the three it found: the
+  original bytes (write it), the patched bytes (already there), or neither (not that build).
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_npln.c           | 57 +++++++++++++++++++++++++++---------
+ dm/host/tests/t_npln_patch.c | 24 +++++++++++++++
+ 2 files changed, 67 insertions(+), 14 deletions(-)
+
+diff --git a/dm/host/hle_npln.c b/dm/host/hle_npln.c
+index c9104f32..91628625 100644
+--- a/dm/host/hle_npln.c
++++ b/dm/host/hle_npln.c
+@@ -166,30 +166,47 @@ int dm_npln_load(const char *path) {
+     return g_nrows;
+ }
+ 
++// Why a row's bytes are or are not in this image. "The guard is not here" and "the patched bytes are
++// already here" are two very different answers: the second is what a binary patched before signing looks
++// like, and reporting it as a guard mismatch sends the reader hunting a bug that is not there.
++typedef enum {
++    DM_NPLN_TARGET_GUARD = 0,   // the catalog's original bytes: the patch belongs here (and can be written)
++    DM_NPLN_TARGET_PATCHED,     // the catalog's patched bytes: already baked in, nothing to write
++    DM_NPLN_TARGET_MISSING,     // neither: this image is not the build the row was made for
++} dm_npln_target_state;
++
+ // Where the row's bytes are in this image. The catalog counts the NSO header in (the reference client keeps
+ // one buffer with the header and the decompressed sections at their file offsets), but whether the host's
+ // mapping starts at that header or after it is the loader's business. So the image origin is read off the
+ // image itself: an NSO begins with "NSO0", and finding it tells us which of the two the base is.
+-static uint8_t *dm_npln_target(dm_npln_row *row, uint8_t *base, uint64_t size) {
++static uint8_t *dm_npln_target(dm_npln_row *row, uint8_t *base, uint64_t size, dm_npln_target_state *state) {
+     const uint64_t header = 0x100;
++    uint64_t cand[2];
++    int ncand = 0;
++    *state = DM_NPLN_TARGET_MISSING;
+     int includes_header = base && size > 4 && !memcmp(base, "NSO0", 4);
+     // Reading before the base is only safe when the loader put the patch area there (a negative patch_off).
+     int room_before = 0;
+     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { room_before = g_mod[i].patch_off <= -(int64_t)header; break; }
+     int starts_after = base && room_before && !memcmp(base - header, "NSO0", 4);
+-    uint64_t off;
+-    if (includes_header) off = row->offset;
+-    else if (starts_after) off = row->offset - header;
++    if (includes_header) cand[ncand++] = row->offset;
++    else if (starts_after) cand[ncand++] = row->offset - header;
+     else {
+         // Neither says "NSO0": keep the old pair as the fallback rather than refusing outright.
+-        uint64_t a = row->offset, b = row->offset - header;
+-        if (a + row->original_len <= size && !memcmp(base + a, row->original, row->original_len)) return base + a;
+-        if (b + row->original_len <= size && !memcmp(base + b, row->original, row->original_len)) return base + b;
+-        return NULL;
++        cand[ncand++] = row->offset;
++        if (row->offset > header) cand[ncand++] = row->offset - header;
++    }
++    // The guard wins over the patch: an image that still carries the original bytes is the one to write.
++    for (int pass = 0; pass < 2; pass++) {
++        const uint8_t *want = pass ? row->patched : row->original;
++        size_t len = pass ? row->patched_len : row->original_len;
++        for (int i = 0; i < ncand; i++) {
++            if (cand[i] + len > size || memcmp(base + cand[i], want, len)) continue;
++            *state = pass ? DM_NPLN_TARGET_PATCHED : DM_NPLN_TARGET_GUARD;
++            return base + cand[i];
++        }
+     }
+-    if (off + row->original_len > size) return NULL;
+-    if (memcmp(base + off, row->original, row->original_len)) return NULL;
+-    return base + off;
++    return NULL;
+ }
+ 
+ // The catalog writes the build id in upper case and 64 characters long; the loader hands back the first
+@@ -236,16 +253,26 @@ int dm_npln_apply(uint64_t title_id) {
+             LOG("[npln] %s version %s (%s) is the one Nextendo prepared", title, running, g_versions[i].protocol);
+         break;
+     }
+-    int written = 0, known_build = 0;
++    int written = 0, known_build = 0, in_place = 0;
+     for (int i = 0; i < g_nrows; i++) {
+         dm_npln_row *row = &g_rows[i];
+         if (strcmp(row->title, title)) continue;
+         if (build && *build && !dm_npln_same_build(row->build, build)) continue;   // another build: what the guard protects
+         known_build = 1;
+-        uint8_t *at = dm_npln_target(row, main_mod->base, image);
++        dm_npln_target_state state = DM_NPLN_TARGET_MISSING;
++        uint8_t *at = dm_npln_target(row, main_mod->base, image, &state);
+         if (!at) {
+-            LOG("[npln] patch for %s at 0x%llx does not match this image (guard bytes differ): left alone",
++            LOG("[npln] patch for %s at 0x%llx: this image carries neither the catalog's original bytes nor the "
++                "patched ones, so it is not that build (guard bytes differ): left alone",
++                row->build, (unsigned long long)row->offset);
++            continue;
++        }
++        if (state == DM_NPLN_TARGET_PATCHED) {
++            // What an iPhone build looks like: the catalog patch went into the binary before signing, so the
++            // guard is already gone. Nothing to write, and nothing wrong.
++            LOG("[npln] patch for %s at 0x%llx is already in this image (baked in before signing)",
+                 row->build, (unsigned long long)row->offset);
++            in_place++;
+             continue;
+         }
+ #if TARGET_OS_IPHONE
+@@ -270,6 +297,8 @@ int dm_npln_apply(uint64_t title_id) {
+     if (!known_build && g_nrows)
+         LOG("[npln] no catalog entry for title %s build %s: this game version is not one Nextendo has prepared",
+             title, build && *build ? build : "(unknown)");
++    if (in_place)
++        LOG("[npln] %d catalog patch(es) were already in the image: nothing to write", in_place);
+     return written;
+ }
+ 
+diff --git a/dm/host/tests/t_npln_patch.c b/dm/host/tests/t_npln_patch.c
+index 2166cd3f..6d7fe708 100644
+--- a/dm/host/tests/t_npln_patch.c
++++ b/dm/host/tests/t_npln_patch.c
+@@ -43,6 +43,30 @@ int main(void) {
+     if (dm_npln_apply_file(path, 0x0100965017338000ULL) != 1) return fail("1 guard written");
+     if (memcmp(g_image + off, "\x2A\x00\x80\x52", 4)) return fail("patched bytes");
+ 
++    // The same image as a build that was patched before signing (what an iPhone build looks like): the guard
++    // is gone and the patched bytes are there. That is not a guard mismatch and nothing may be written.
++    {
++        dm_npln_row row;
++        dm_npln_target_state st = DM_NPLN_TARGET_MISSING;
++        memset(&row, 0, sizeof row);
++        row.offset = off;
++        row.original_len = row.patched_len = 4;
++        memcpy(row.original, "\xAA\xE2\x40\x39", 4);
++        memcpy(row.patched, "\x2A\x00\x80\x52", 4);
++        if (dm_npln_target(&row, g_image, sizeof g_image, &st) != g_image + off || st != DM_NPLN_TARGET_PATCHED)
++            return fail("an already patched image is recognised as patched");
++        if (dm_npln_apply(0x0100965017338000ULL) != 0) return fail("an already patched image is left alone");
++        memcpy(g_image + off, "\xAA\xE2\x40\x39", 4);
++        st = DM_NPLN_TARGET_MISSING;
++        if (dm_npln_target(&row, g_image, sizeof g_image, &st) != g_image + off || st != DM_NPLN_TARGET_GUARD)
++            return fail("the original bytes are still the ones to write");
++        memset(g_image + off, 0, 4);
++        st = DM_NPLN_TARGET_GUARD;
++        if (dm_npln_target(&row, g_image, sizeof g_image, &st) || st != DM_NPLN_TARGET_MISSING)
++            return fail("neither set of bytes says missing");
++        memcpy(g_image + off, "\x2A\x00\x80\x52", 4);
++    }
++
+     // Another build: same offset, different guard, nothing may be written.
+     g_image[off] = 0xAA; g_image[off + 1] = 0xE2; g_image[off + 2] = 0x40; g_image[off + 3] = 0x39;
+     snprintf(g_main.build_id, sizeof g_main.build_id, "37C6625DD50F7C9D0000000000000000");
