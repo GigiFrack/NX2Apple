@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Mon, 23 Nov 2026 12:12:19 +0000
+Subject: [PATCH] host: every stream byte the title moves says so, and a close
+ says what went each way
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Log 666B04F6 (patch 0145 installed) reads: the title sends its ClientHello (213 bytes), reads the
+server's whole flight (1375: ServerHello, Certificate, ServerKeyExchange, ServerHelloDone, read off
+the records), and then writes nothing at all — for the next 25 seconds the only thing on that socket
+is a read that finds nothing and one poll. The trace could not answer the obvious question, because
+it only counted the vectored calls: a write through send(2) or write(2) reaches the same stream
+socket and said nothing at all.
+
+The bytes are counted and traced where every spelling meets (dm_nd_tcp_send / dm_nd_tcp_recv), the
+close line names what went out and in, and the poll trace covers the first 48 waits instead of 16 —
+the shape of a client that waits instead of speaking is exactly what the next log has to show.
+
+Upstream-Status: fork-only
+Reason: Log 666B04F6 (with 0145 installed) shows the title sending its ClientHello (213 bytes), reading the
+  server's whole flight (1375: ServerHello, Certificate, ServerKeyExchange, ServerHelloDone) and then writing
+  nothing at all on that socket: the next 25 seconds hold one read that finds nothing and one poll, and the
+  trace could not say whether the title wrote through send(2), because only the vectored calls were counted.
+  Every read and write on a stream socket is now traced where the spellings meet, a close names the bytes that
+  went each way (a client that never spoke and one the server dropped read the same otherwise), and the poll
+  trace covers the first 48 waits instead of 16.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 62 ++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 50 insertions(+), 12 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index c90c5167..d035e9f8 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -132,6 +132,7 @@ typedef struct {
+     // checks its own socket does set-then-get right away, so the entry answers what it was given.
+     nd_opt_rec opt[ND_OPT_MAX];
+     int64_t rtimeo, stimeo;        // nanoseconds, 0 = no timeout
++    long long in, out;             // bytes the title moved on this socket, for the close line
+     uint32_t local, peer; uint16_t local_port, peer_port;
+ } nd_tcp_ent;
+ 
+@@ -186,11 +187,23 @@ static int nd_hz_errno_in(int e) {
+ // this host does not serve, all of it the same "permission denied" to the caller.
+ static int sk_guest(int r) { return r >= 0 ? r : -nd_hz_errno(t_skerr); }
+ static int sk_guest_fail(int host_errno) { sk_error(host_errno); return -nd_hz_errno(t_skerr); }
+-// A stream socket's close is traced: a client that gives up on a connection closes it, and in a log where the
+-// close is silent that reads exactly like a connection the server dropped.
++// A stream socket's close is traced, with what went each way: a client that gives up on a connection
++// closes it, and in a log where the close is silent that reads exactly like a connection the server
++// dropped — and the two byte counts say whether the title ever spoke at all.
+ static int sk_close(int s) {
++    long long out = -1, in = 0;
++    if (nd_tcp_range(s)) {
++        pthread_mutex_lock(&g_nd_tcp_m);
++        nd_tcp_ent *e = nd_tcp_locked(s);
++        if (e) { out = e->out; in = e->in; }
++        pthread_mutex_unlock(&g_nd_tcp_m);
++    }
+     int r = dm_sk_close(s);
+-    if (nd_tcp_range(s)) { char t[64]; snprintf(t, sizeof t, "socket::Close(fd %d)", s); dm_nd_trace_result(t, r); }
++    if (out >= 0) {
++        char t[112];
++        snprintf(t, sizeof t, "socket::Close(fd %d) after %lld byte(s) out, %lld in", s, out, in);
++        dm_nd_trace_result(t, r);
++    }
+     return r;
+ }
+ static int nd_addr_read(const void *a, unsigned n, uint32_t *addr, uint16_t *port) {
+@@ -348,6 +361,10 @@ int dm_nd_tcp_connect(int fd, const void *a, unsigned n) {
+     return 0;
+ }
+ 
++// Declared here, defined beside the other trace helpers: the two calls below are the only path every
++// stream socket's traffic takes, whatever spelling the title used to reach it.
++static void nd_flow_trace(const char *dir, int fd, long bytes, const void *buf, size_t len);
++
+ long dm_nd_tcp_send(int fd, const void *data, unsigned long n, int flags) {
+     (void)flags;
+     if (!nd_tcp_range(fd)) return ND_NOT;
+@@ -361,10 +378,10 @@ long dm_nd_tcp_send(int fd, const void *data, unsigned long n, int flags) {
+     if (shut) return sk_error(ND_EPIPE);
+     for (;;) {
+         ssize_t w = send(h, data, n, MSG_NOSIGNAL);
+-        if (w >= 0) return (long)w;
+-        if (errno != EAGAIN && errno != EWOULDBLOCK) return sk_error(nd_errno(errno));
+-        if (nonblock) return sk_error(35);
+-        if (deadline && guest_ns() > deadline) return sk_error(ND_ETIMEDOUT);
++        if (w >= 0) { nd_flow_trace("send", fd, (long)w, data, n); return (long)w; }
++        if (errno != EAGAIN && errno != EWOULDBLOCK) { nd_flow_trace("send", fd, -1, NULL, 0); return sk_error(nd_errno(errno)); }
++        if (nonblock) { nd_flow_trace("send", fd, -1, NULL, 0); return sk_error(35); }
++        if (deadline && guest_ns() > deadline) { nd_flow_trace("send", fd, -1, NULL, 0); return sk_error(ND_ETIMEDOUT); }
+         dm_guest_sleep_ns(1000000);
+     }
+ }
+@@ -383,10 +400,10 @@ long dm_nd_tcp_recv(int fd, void *data, unsigned long n, int flags, void *a, uns
+     int sysflags = (flags & 2) ? MSG_PEEK : 0;
+     for (;;) {
+         ssize_t r = recv(h, data, n, sysflags | MSG_DONTWAIT);
+-        if (r >= 0) { nd_addr_write(a, al, peer, peer_port); return (long)r; }   // 0 = the peer closed
+-        if (errno != EAGAIN && errno != EWOULDBLOCK) return sk_error(nd_errno(errno));
+-        if (nonblock) return sk_error(35);
+-        if (deadline && guest_ns() > deadline) return sk_error(35);
++        if (r >= 0) { nd_addr_write(a, al, peer, peer_port); nd_flow_trace("recv", fd, (long)r, data, n); return (long)r; }   // 0 = the peer closed
++        if (errno != EAGAIN && errno != EWOULDBLOCK) { nd_flow_trace("recv", fd, -1, NULL, 0); return sk_error(nd_errno(errno)); }
++        if (nonblock) { nd_flow_trace("recv", fd, -1, NULL, 0); return sk_error(35); }
++        if (deadline && guest_ns() > deadline) { nd_flow_trace("recv", fd, -1, NULL, 0); return sk_error(35); }
+         dm_guest_sleep_ns(1000000);
+     }
+ }
+@@ -560,6 +577,27 @@ static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int
+         nd_h2_frames(what, buf, got);
+     }
+ }
++// The same for every read and write that reaches a stream socket, whichever spelling the title used: the
++// gRPC transport writes its preface through the vectored call, and the TLS library under it may write
++// through send(2). A trace that reads only the first of those shows a connection that never spoke.
++static void nd_flow_trace(const char *dir, int fd, long bytes, const void *buf, size_t len) {
++    static int n_send, n_recv;
++    int n = dir[0] == 's' ? ++n_send : ++n_recv;
++    if (bytes > 0 && nd_tcp_range(fd)) {
++        pthread_mutex_lock(&g_nd_tcp_m);
++        nd_tcp_ent *e = nd_tcp_locked(fd);
++        if (e) { if (dir[0] == 's') e->out += bytes; else e->in += bytes; }
++        pthread_mutex_unlock(&g_nd_tcp_m);
++    }
++    if (n > 24 && n % 16) return;
++    char t[80]; snprintf(t, sizeof t, "socket::%s(fd %d)", dir, fd);
++    dm_nd_trace_result(t, bytes);
++    if (bytes > 0 && buf && len) {
++        size_t got = (size_t)bytes < len ? (size_t)bytes : len;
++        nd_head_trace(dir, buf, got);
++        nd_tls_summary(dir, buf, got);
++    }
++}
+ 
+ long dm_nd_sendmsg(int fd, const void *msg, int flags) {
+     if (!nd_tcp_range(fd)) return ND_NOT;
+@@ -1273,7 +1311,7 @@ SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) {
+     // and a socket with nothing to read look identical from outside, and only one of them is a bug here.
+     static int seen;
+     int k = ++seen;
+-    if (k <= 16 || k % 256 == 0) {
++    if (k <= 48 || k % 32 == 0) {
+         char s[176];
+         int at = snprintf(s, sizeof s, "socket::poll(%lu fds, %d ms)", n, t);
+         sk_pollfd *p = f;
