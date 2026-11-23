@@ -34,9 +34,11 @@ Reason: The title's socket calls go through its own C library (the SDK's nnmusl)
 Issue: https://github.com/GigiFrack/NX2Apple (fork)
 
 ---
- dm/host/hle_net.c         | 118 ++++++++++++++++++++++++++------------
- dm/host/tests/t_net_tcp.c |  40 +++++++++++++
- 2 files changed, 121 insertions(+), 37 deletions(-)
+ dm/host/hle_net.c              | 118 ++++++++++++++++++++++-----------
+ dm/host/tests/t_net_eventfd.c  |  14 ++--
+ dm/host/tests/t_net_loopback.c |  28 ++++----
+ dm/host/tests/t_net_tcp.c      |  40 +++++++++++
+ 4 files changed, 142 insertions(+), 58 deletions(-)
 
 diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
 index e336aac5..c90c5167 100644
@@ -249,6 +251,124 @@ index e336aac5..c90c5167 100644
  }
  
  void dm_net_teardown(void) {
+diff --git a/dm/host/tests/t_net_eventfd.c b/dm/host/tests/t_net_eventfd.c
+index eaef6a14..ac9f0001 100644
+--- a/dm/host/tests/t_net_eventfd.c
++++ b/dm/host/tests/t_net_eventfd.c
+@@ -19,7 +19,7 @@ int main(void) {
+     int fd = h_sk_EventFd(0, 6);   // the flags gRPC creates its descriptor with: never blocks
+     assert(fd == 0);   // the bsd service's numbers: the lowest free one, from 0
+     unsigned long v = 99;
+-    assert(h_sk_EventFdRead(fd, &v) == -1 && h_sk_GetLastError() == SK_EAGAIN && v == 99);
++    assert(h_sk_EventFdRead(fd, &v) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN) && v == 99);
+ 
+     sk_pollfd p = {fd, SK_POLLIN, 0x7f};
+     uint64_t t0 = guest_ns();
+@@ -68,20 +68,20 @@ int main(void) {
+     uint64_t cs[16] = {0}; int64_t tv1[2] = {5, 0};
+     cs[0] = 1ull << sem;
+     pthread_create(&th, NULL, closer, (void *)(intptr_t)sem);
+-    assert(h_sk_Select(sem + 1, cs, NULL, NULL, tv1) == -1 && h_sk_GetLastError() == SK_EBADF);
++    assert(h_sk_Select(sem + 1, cs, NULL, NULL, tv1) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EBADF));
+     pthread_join(th, NULL);
+-    assert(h_nsk_Close(fd) == -1);   // closed already
+-    assert(h_sk_EventFdWrite(fd, 1) == -1 && h_sk_GetLastError() == SK_EBADF);
+-    assert(h_sk_EventFdRead(fd, &v) == -1 && h_sk_GetLastError() == SK_EBADF);
++    assert(h_nsk_Close(fd) < 0);   // closed already
++    assert(h_sk_EventFdWrite(fd, 1) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EBADF));
++    assert(h_sk_EventFdRead(fd, &v) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EBADF));
+ 
+     // The table is reused and bounded
+     int all[EFD_MAX];
+     for (int i = 0; i < EFD_MAX; i++) { all[i] = h_sk_EventFd(0, 6); assert(all[i] == i); }
+-    assert(h_sk_EventFd(0, 6) == -1 && h_sk_GetLastError() == 24);
++    assert(h_sk_EventFd(0, 6) == -1 && h_sk_GetLastError() == nd_hz_errno(24));
+     for (int i = 0; i < EFD_MAX; i++) assert(h_sk_Close(all[i]) == 0);
+ 
+     // What needs the network stays offline
+-    assert(h_nsk_Socket(2, 1, 0) == -1 && h_sk_GetLastError() == SK_ENETDOWN);
++    assert(h_nsk_Socket(2, 1, 0) == -nd_hz_errno(SK_ENETDOWN) && h_sk_GetLastError() == nd_hz_errno(SK_ENETDOWN));
+     sk_pollfd bad = {EFD_MAX, SK_POLLIN, 0};
+     assert(h_nsk_Poll(&bad, 1, 0) == 0 && bad.revents == 0);   // one the host never made: nothing ready, as a socket with nothing to say
+     sk_pollfd none = {-1, SK_POLLIN, 0x7f};
+diff --git a/dm/host/tests/t_net_loopback.c b/dm/host/tests/t_net_loopback.c
+index 16c512cb..f4a27620 100644
+--- a/dm/host/tests/t_net_loopback.c
++++ b/dm/host/tests/t_net_loopback.c
+@@ -37,13 +37,13 @@ int main(void) {
+     assert(dm_sk_sendto(self, "test", 4, 0, a, 16) == 4);
+     n = sizeof from; assert(h_sk_RecvFrom(self, data, sizeof data, SK_MSG_DONTWAIT, from, &n) == 4 && !memcmp(data, "test", 4));
+     assert(n == 16 && from[4] == 127 && port_of(from) == port);
+-    assert(h_sk_Recv(self, data, sizeof data, SK_MSG_DONTWAIT) == -1 && h_sk_GetLastError() == SK_EAGAIN);
++    assert(h_sk_Recv(self, data, sizeof data, SK_MSG_DONTWAIT) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN));
+ 
+     // Both local endpoints can exchange datagrams. Peek leaves the entire packet queued; a short receive consumes the remainder.
+     assert(dm_sk_sendto(self, "abcdef", 6, 0, b, 16) == 6);
+     assert(h_sk_Recv(other, data, 2, SK_MSG_PEEK) == 2 && !memcmp(data, "ab", 2));
+     assert(h_sk_Recv(other, data, 3, 0) == 3 && !memcmp(data, "abc", 3));
+-    assert(h_sk_Recv(other, data, sizeof data, SK_MSG_DONTWAIT) == -1 && h_sk_GetLastError() == SK_EAGAIN);
++    assert(h_sk_Recv(other, data, sizeof data, SK_MSG_DONTWAIT) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN));
+     assert(dm_sk_sendto(self, NULL, 0, 0, b, 16) == 0);
+     sk_pollfd poll = {other, SK_POLLIN, 0}; assert(h_sk_Poll(&poll, 1, 0) == 1); assert(h_sk_Recv(other, data, sizeof data, 0) == 0);
+ 
+@@ -51,17 +51,17 @@ int main(void) {
+     assert(h_nsk_Connect(self, b, 16) == 0 && h_nsk_Connect(other, a, 16) == 0);
+     assert(h_nsk_Send(self, "peer", 4, 0) == 4 && h_nsk_Recv(other, data, sizeof data, 0) == 4);
+     assert(h_nsk_Fcntl(other, 4, SK_NONBLOCK) == 0 && h_nsk_Fcntl(other, 3, 0) == SK_NONBLOCK);
+-    assert(h_nsk_Recv(other, data, sizeof data, 0) == -1 && h_sk_GetLastError() == SK_EAGAIN);
++    assert(h_nsk_Recv(other, data, sizeof data, 0) == -nd_hz_errno(SK_EAGAIN) && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN));
+     n = 16; assert(h_nsk_GetPeerName(other, from, &n) == 0 && !memcmp(from, a, 16));
+     int stranger = h_nsk_Socket(2, 2, 0); assert(stranger >= 0 && dm_sk_sendto(stranger, "drop", 4, 0, b, 16) == 4);
+-    assert(h_nsk_Recv(other, data, sizeof data, 0) == -1 && h_sk_GetLastError() == SK_EAGAIN); assert(h_sk_Close(stranger) == 0);
++    assert(h_nsk_Recv(other, data, sizeof data, 0) == -nd_hz_errno(SK_EAGAIN) && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN)); assert(h_sk_Close(stranger) == 0);
+ 
+     // Remote traffic and TCP never become host network activity.
+     uint8_t remote[16]; address(remote, 0x08080808, 53);
+-    assert(dm_sk_sendto(self, "dns", 3, 0, remote, 16) == -1 && h_sk_GetLastError() == SK_ENETDOWN);
+-    assert(h_nsk_Connect(other, remote, 16) == -1 && h_sk_GetLastError() == SK_ENETDOWN);
+-    assert(h_nsk_Socket(2, 1, 0) == -1 && h_nsk_Socket(10, 2, 0) == -1);
+-    assert(dm_sk_sendto(self, data, SK_UDP_MAX + 1, 0, a, 16) == -1 && h_sk_GetLastError() == SK_EMSGSIZE);
++    assert(dm_sk_sendto(self, "dns", 3, 0, remote, 16) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_ENETDOWN));
++    assert(h_nsk_Connect(other, remote, 16) == -nd_hz_errno(SK_ENETDOWN) && h_sk_GetLastError() == nd_hz_errno(SK_ENETDOWN));
++    assert(h_nsk_Socket(2, 1, 0) == -nd_hz_errno(SK_ENETDOWN) && h_nsk_Socket(10, 2, 0) == -nd_hz_errno(SK_EAFNOSUPPORT));
++    assert(dm_sk_sendto(self, data, SK_UDP_MAX + 1, 0, a, 16) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EMSGSIZE));
+ 
+     // Poll and Select observe UDP and EventFd together, including an arrival after the wait starts.
+     assert(h_nsk_Fcntl(other, 4, 0) == 0); pthread_t thread;
+@@ -81,18 +81,18 @@ int main(void) {
+     for (unsigned i = 0; i < SK_PACKET_MAX + 10; i++) assert(h_nsk_Send(self, "q", 1, 0) == 1);
+     unsigned received = 0;
+     while (h_sk_Recv(other, data, sizeof data, SK_MSG_DONTWAIT) >= 0) received++;
+-    assert(received == SK_PACKET_MAX && h_sk_GetLastError() == SK_EAGAIN);
++    assert(received == SK_PACKET_MAX && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN));
+ 
+     // A closed receiver wakes with EBADF even when its descriptor number is immediately reused.
+     wait_arg arg = {.fd = other}; assert(pthread_create(&thread, NULL, receiver, &arg) == 0);
+     while (!atomic_load(&arg.entered)) dm_guest_sleep_ns(1000000);
+     dm_guest_sleep_ns(20000000); assert(h_sk_Close(other) == 0); int reused = h_nsk_Socket(2, 2, 0); assert(reused == other);
+-    pthread_join(thread, NULL); assert(arg.result == -1 && arg.error == SK_EBADF);
++    pthread_join(thread, NULL); assert(arg.result == -1 && arg.error == nd_hz_errno(SK_EBADF));
+ 
+     // Receive timeouts terminate a blocked wait; unsupported options are errors, not fictitious successful changes.
+     int64_t timeout[2] = {0, 20000}; assert(h_nsk_SetSockOpt(reused, 0xffff, 0x1006, timeout, sizeof timeout) == 0);
+-    uint64_t start = guest_ns(); assert(h_sk_Recv(reused, data, sizeof data, 0) == -1 && h_sk_GetLastError() == SK_EAGAIN && guest_ns() - start >= 15000000);
+-    int v = 1; assert(h_nsk_SetSockOpt(reused, 0xffff, 0x12345, &v, sizeof v) == -1);
++    uint64_t start = guest_ns(); assert(h_sk_Recv(reused, data, sizeof data, 0) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN) && guest_ns() - start >= 15000000);
++    int v = 1; assert(h_nsk_SetSockOpt(reused, 0xffff, 0x12345, &v, sizeof v) < 0);
+     assert(h_sk_Close(reused) == 0 && h_sk_Close(self) == 0 && h_sk_Close(event) == 0);
+ 
+     // SO_REUSEADDR permits a wildcard/specific-address overlap. Delivery chooses the more specific local binding, not whichever fd was allocated first.
+@@ -101,8 +101,8 @@ int main(void) {
+     address(b, 0x7f000001, port_of(a)); assert(h_nsk_Bind(specific, b, 16) == 0);
+     assert(dm_sk_sendto(wildcard, "specific", 8, 0, b, 16) == 8);
+     assert(h_sk_Recv(specific, data, sizeof data, SK_MSG_DONTWAIT) == 8 && !memcmp(data, "specific", 8));
+-    assert(h_sk_Recv(wildcard, data, sizeof data, SK_MSG_DONTWAIT) == -1 && h_sk_GetLastError() == SK_EAGAIN);
+-    int clash = h_nsk_Socket(2, 2, 0); assert(clash >= 0 && h_nsk_Bind(clash, b, 16) == -1 && h_sk_GetLastError() == SK_EADDRINUSE);
++    assert(h_sk_Recv(wildcard, data, sizeof data, SK_MSG_DONTWAIT) == -1 && h_sk_GetLastError() == nd_hz_errno(SK_EAGAIN));
++    int clash = h_nsk_Socket(2, 2, 0); assert(clash >= 0 && h_nsk_Bind(clash, b, 16) == -nd_hz_errno(SK_EADDRINUSE) && h_sk_GetLastError() == nd_hz_errno(SK_EADDRINUSE));
+     assert(h_sk_Close(clash) == 0 && h_sk_Close(specific) == 0 && h_sk_Close(wildcard) == 0);
+     puts("ok t_net_loopback"); return 0;
+ }
 diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
 index 2fa0f51b..84ab8e65 100644
 --- a/dm/host/tests/t_net_tcp.c
