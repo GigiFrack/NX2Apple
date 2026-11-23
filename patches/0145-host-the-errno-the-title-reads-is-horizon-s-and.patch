@@ -35,8 +35,8 @@ Issue: https://github.com/GigiFrack/NX2Apple (fork)
 
 ---
  dm/host/hle_net.c         | 118 ++++++++++++++++++++++++++------------
- dm/host/tests/t_net_tcp.c |  37 ++++++++++++
- 2 files changed, 118 insertions(+), 37 deletions(-)
+ dm/host/tests/t_net_tcp.c |  40 +++++++++++++
+ 2 files changed, 121 insertions(+), 37 deletions(-)
 
 diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
 index e336aac5..c90c5167 100644
@@ -250,10 +250,10 @@ index e336aac5..c90c5167 100644
  
  void dm_net_teardown(void) {
 diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
-index 2fa0f51b..b7018fb2 100644
+index 2fa0f51b..84ab8e65 100644
 --- a/dm/host/tests/t_net_tcp.c
 +++ b/dm/host/tests/t_net_tcp.c
-@@ -315,6 +315,43 @@ int main(void) {
+@@ -315,6 +315,46 @@ int main(void) {
          if (used != 24 + sizeof frames) fail("the bytes the walk consumed");
      }
  
@@ -278,6 +278,9 @@ index 2fa0f51b..b7018fb2 100644
 +    // transport polls with events 0 after its write, and an answer of "nothing" there is an answer that
 +    // leaves it waiting for a reply no one will send.
 +    {
++        // The switch checks above turned Nextendo off; a stream socket, and the hang-up it polls, need it on.
++        setenv("DM_NEXTENDO", "1", 1);
++        dm_nd_reload();
 +        int hport = 0;
 +        int hls = idle_listen(&hport);
 +        pthread_t th5;
