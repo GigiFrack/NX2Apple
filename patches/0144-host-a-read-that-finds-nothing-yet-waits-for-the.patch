@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Mon, 23 Nov 2026 09:23:53 +0000
+Subject: [PATCH] host: a read that finds nothing yet waits for the bytes
+
+The log of the first TLS exchange on the phone reads: 213 bytes out (a TLS ClientHello, `16 03 01 00 d0`), 1375
+back (the server's flight), the client's next flight of 126, and then two reads that answer -1 with errno 35 and
+no data on the host socket. On the second one the title gives up at once — no poll, no retry — and reports
+0x270141. So the wall is not the handshake: it is that a read finding nothing is answered "nothing yet", and the
+NPLN client's grpc reads as if the bytes were already there.
+
+A read that finds nothing now waits inside a budget (2000 ms, the same order as the connect's, `DM_NEXTENDO_READ_WAIT_MS`,
+0 answers at once as before) and returns the bytes when they arrive; the wait is traced with how long it took.
+
+The trace grew to read the conversation instead of its byte count, because each of these cost a build to guess:
+the first bytes each way as a hex head (a TLS record and an HTTP/2 preface read nothing alike, and the frame walk
+alone made a ClientHello look like a corrupt frame header), the TLS records with their handshake type (an alert
+named `2/40` must not read like a Finished), and — from the ClientHello itself — the `sni` the server routes by,
+the `alpn` offered and the TLS versions, which is what separates a wrong redirect from a wrong handshake. The
+error a title reads back after a failed call is traced too (`GetLastError`, `GetLastErrno`, `SetLastErrno`), zero
+included: a stale 0 makes a non-blocking read look like a hard failure, and the log could not tell whether the
+title asked at all.
+
+Upstream-Status: fork-only
+Reason: The NPLN client's grpc/BoringSSL reads the socket in the same loop that sends its TLS flight, and a read
+  answered EAGAIN while the server's next flight is still in flight ends the online flow with 0x270141 (npln
+  2321-4992) instead of waiting the few milliseconds it takes. The reference port blocks for the connect
+  completion for the same reason (ManagedSocket.cs: "do NOT return EINPROGRESS and rely on grpc to poll"); the
+  read side has no such note, so this is measured here: two reads answer -1 with nothing on the socket, and the
+  title shuts the connection down immediately after the second. The budget covers a server flight without ever
+  turning a legitimate EAGAIN into a two-second stall, and the switch turns the wait off.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 166 +++++++++++++++++++++++++++++++++++++-
+ dm/host/tests/t_net_tcp.c |  86 ++++++++++++++++++++
+ 2 files changed, 248 insertions(+), 4 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 44ebbe80..e336aac5 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -4,6 +4,7 @@
+ #include "hle_nextendo.h"   // dm_nd_enabled: the switch the nifm answers below turn on
+ #include <pthread.h>
+ #include <stdatomic.h>
++#include <stdarg.h>         // the trace builds its lines with vsnprintf
+ #include <stddef.h>         // offsetof: the MsgHdr layout the vectored calls read out of the game's memory
+ 
+ HLE_FORCE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_socket_Initialize, const void *cfg) { (void)cfg; return RES_OK; }
+@@ -119,6 +120,7 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ #define ND_ETIMEDOUT 60
+ #define ND_EMSGSIZE 40
+ #define ND_CONNECT_WAIT_MS 2000   // how long a non-blocking connect may take before it is answered "in progress"
++#define ND_READ_WAIT_MS 2000      // how long a non-blocking read waits for bytes before it answers "nothing yet"
+ 
+ #define ND_OPT_MAX 8
+ typedef struct { int level, option, value, set; } nd_opt_rec;
+@@ -248,6 +250,38 @@ static void nd_connect_trace(int fd, uint32_t addr, uint16_t port, int nonblock,
+     dm_nd_trace_result(t, err ? -1 : 0);
+ }
+ 
++// A title's grpc/BoringSSL reads the socket as if the bytes were already there: the NPLN client sends its
++// TLS flight, reads the server's, sends the next one and reads again within the same loop, and a "nothing
++// yet" (EAGAIN) at that point ends the online flow with 0x270141 (npln 2321-4992) instead of waiting the
++// few milliseconds the server's flight takes. So a non-blocking read that finds nothing waits inside this
++// budget and returns the bytes when they arrive. DM_NEXTENDO_READ_WAIT_MS=0 answers at once, as before.
++#define ND_READ_ENV "DM_NEXTENDO_READ_WAIT_MS"
++static int nd_read_wait_ms(void) {   // read every time: the test flips it, and a boot value is all the game needs
++    const char *s = getenv(ND_READ_ENV);
++    char *end = NULL;
++    long v = (s && *s) ? strtol(s, &end, 10) : -1;
++    return (s && *s && end && !*end && v >= 0 && v <= 60000) ? (int)v : ND_READ_WAIT_MS;
++}
++static long nd_now_ms(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
++}
++static int nd_wait_readable(int h, int ms) {
++    struct pollfd p = {0};
++    p.fd = h; p.events = POLLIN;
++    return poll(&p, 1, ms) > 0;
++}
++// The host descriptor of one of these sockets, or -1: the wait polls the host, the game holds a number.
++static int nd_host_fd(int fd) {
++    if (!nd_tcp_range(fd)) return -1;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    int h = e ? e->host : -1;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    return h;
++}
++
+ int dm_nd_tcp_connect(int fd, const void *a, unsigned n) {
+     if (!nd_tcp_range(fd)) return ND_NOT;
+     uint32_t addr = 0; uint16_t port = 0;
+@@ -368,6 +402,104 @@ static int nd_h2_format(char *out, size_t cap, const void *buf, size_t n, size_t
+     if (used) *used = off;
+     return k;
+ }
++
++// What the connection is speaking, read off the records themselves: a TLS ClientHello carries the name the
++// server routes by (SNI) and the protocol it offers (ALPN), and a server that answers an alert after a
++// "completed" handshake reads the same as a server that answered a Finished if only the byte count is
++// printed. Records, the handshake type, SNI, ALPN and the versions offered, in one line.
++static void nd_append(char *out, size_t cap, int *at, const char *fmt, ...) {
++    va_list ap;
++    int w;
++    if (*at < 0 || (size_t)*at + 1 >= cap) return;
++    va_start(ap, fmt);
++    w = vsnprintf(out + *at, cap - (size_t)*at, fmt, ap);
++    va_end(ap);
++    if (w > 0) *at += w;
++    if ((size_t)*at >= cap) *at = (int)cap - 1;        // truncated: no further writes past the buffer
++}
++static void nd_tls_client_hello(char *out, size_t cap, const unsigned char *h, size_t n) {
++    size_t off = 4;                                     // handshake type (1) + length (3)
++    int at = 0;
++    if (cap) out[0] = 0;
++    if (off + 2 + 32 > n) return;
++    off += 2 + 32;                                      // legacy version + random
++    if (off + 1 > n) return;
++    off += 1 + h[off];                                  // session id
++    if (off + 2 > n) return;
++    off += 2 + ((size_t)h[off] << 8 | h[off + 1]);      // cipher suites
++    if (off + 1 > n) return;
++    off += 1 + h[off];                                  // compression methods
++    if (off + 2 > n) return;
++    size_t end = off + 2 + ((size_t)h[off] << 8 | h[off + 1]);
++    off += 2;
++    if (end > n) end = n;
++    while (off + 4 <= end) {
++        unsigned t = (unsigned)h[off] << 8 | h[off + 1];
++        size_t len = (size_t)h[off + 2] << 8 | h[off + 3];
++        const unsigned char *e = h + off + 4;
++        if (off + 4 + len > end) break;
++        if (t == 0 && len >= 5) {                       // server_name: list length, type, length, name
++            size_t nl = (size_t)e[3] << 8 | e[4];
++            if (5 + nl <= len) nd_append(out, cap, &at, "sni %.*s", (int)nl, (const char *)e + 5);
++        } else if (t == 16 && len >= 3) {               // ALPN: list length, then length-prefixed names
++            size_t q = 2;
++            const char *sep = " alpn ";
++            while (q + 1 <= len && q + 1 + e[q] <= len) {
++                nd_append(out, cap, &at, "%s%.*s", sep, (int)e[q], (const char *)e + q + 1);
++                sep = ",";
++                q += 1 + e[q];
++            }
++        } else if (t == 43 && len >= 3) {               // supported_versions: list length, then 2-byte versions
++            size_t q = 1;
++            int v13 = 0, v12 = 0;
++            while (q + 2 <= len) {
++                unsigned v = (unsigned)e[q] << 8 | e[q + 1];
++                if (v == 0x0304) v13 = 1;
++                if (v == 0x0303) v12 = 1;
++                q += 2;
++            }
++            if (v13 || v12) nd_append(out, cap, &at, " versions %s%s", v13 ? "1.3" : "", v12 ? (v13 ? "/1.2" : "1.2") : "");
++        }
++        off += 4 + len;
++    }
++}
++static void nd_tls_summary(const char *dir, const void *buf, size_t n) {
++    const unsigned char *b = buf;
++    char line[320];
++    size_t off = 0;
++    int k = 0, at = 0;
++    line[0] = 0;
++    while (off + 5 <= n && k < 6) {
++        unsigned type = b[off];
++        size_t len = (size_t)b[off + 3] << 8 | b[off + 4];
++        const char *name = type == 20 ? "ccs" : type == 21 ? "alert" : type == 22 ? "handshake" :
++                           type == 23 ? "appdata" : "other";
++        nd_append(line, sizeof line, &at, "%s%s %zu", k ? ", " : "", name, len);
++        if (type == 22 && len >= 4 && off + 9 <= n) {
++            nd_append(line, sizeof line, &at, "/%u", b[off + 5]);
++            if (b[off + 5] == 1) {                      // ClientHello: what it asks the server to route and speak
++                char ext[180];
++                nd_tls_client_hello(ext, sizeof ext, b + off + 5, len);
++                if (ext[0]) nd_append(line, sizeof line, &at, " (%s)", ext);
++            }
++        } else if (type == 21 && len >= 2 && off + 7 <= n) {
++            nd_append(line, sizeof line, &at, " %u/%u", b[off + 5], b[off + 6]);
++        }
++        off += 5 + len;
++        k++;
++    }
++    if (k) fprintf(stderr, "[dm] nextendo: tls %s: %s\n", dir, line);
++}
++// The first bytes as they are: a TLS record (16 03 0x ...) and an HTTP/2 preface look nothing alike, and a
++// frame header read off a TLS record reads as garbage that costs a build to doubt.
++static void nd_head_trace(const char *what, const void *buf, size_t n) {
++    if (!buf || !n) return;
++    char hx[3 * 16 + 1];
++    int at = 0;
++    size_t k = n < 16 ? n : 16;
++    for (size_t i = 0; i < k; i++) at += snprintf(hx + at, sizeof hx - (size_t)at, "%02x ", ((const unsigned char *)buf)[i]);
++    fprintf(stderr, "[dm] nextendo: %s first %zu byte(s): %s\n", what, k, hx);
++}
+ static void nd_h2_frames(const char *dir, const void *buf, size_t n) {
+     char line[256];
+     size_t used = 0;
+@@ -386,7 +518,12 @@ static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int
+                             what, fd, iov, dm_sk_errno(), nd_tcp_ready(fd, SK_POLLIN) != 0);
+     else snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec)", what, fd, iov);
+     dm_nd_trace_result(t, bytes);
+-    if (n <= 8 && bytes > 0 && buf) nd_h2_frames(what, buf, (size_t)bytes < len ? (size_t)bytes : len);
++    if (n <= 8 && bytes > 0 && buf) {
++        size_t got = (size_t)bytes < len ? (size_t)bytes : len;
++        nd_head_trace(what, buf, got);
++        nd_tls_summary(what, buf, got);
++        nd_h2_frames(what, buf, got);
++    }
+ }
+ 
+ long dm_nd_sendmsg(int fd, const void *msg, int flags) {
+@@ -414,6 +551,18 @@ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+     nd_iovec *v = (nd_iovec *)m->iov;
+     unsigned named = m->name_len;
+     long r = dm_nd_tcp_recv(fd, v->base, v->len, flags, m->name, m->name ? &named : NULL);
++    if (r < 0 && dm_sk_errno() == SK_EAGAIN && nd_read_wait_ms() > 0) {
++        // Nothing on the socket yet: wait for the peer's flight instead of telling the title "nothing".
++        int h = nd_host_fd(fd), budget = nd_read_wait_ms();
++        long t0 = nd_now_ms();
++        if (h >= 0 && nd_wait_readable(h, budget)) {
++            unsigned again = m->name_len;
++            long r2 = dm_nd_tcp_recv(fd, v->base, v->len, flags, m->name, m->name ? &again : NULL);
++            if (r2 >= 0) { r = r2; named = again; }
++        }
++        fprintf(stderr, "[dm] nextendo: socket::RecvMsg(fd %d) read %ld byte(s) after %ld ms (%s=%d ms)\n",
++                fd, r, nd_now_ms() - t0, ND_READ_ENV, budget);
++    }
+     if (r >= 0) { if (m->name) m->name_len = named; m->flags = 0; }
+     static int seen;
+     nd_msg_trace("RecvMsg", fd, m->iov_len, r, ++seen, v->base, v->len);
+@@ -1031,7 +1180,13 @@ HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolu
+ }
+ HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo (cut)", void, h_sk_FreeAddrInfo, void *ai) { (void)ai; }
+ HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution (cut): NULL", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
+-HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) { return t_skerr; }
++// The error the title reads back after a failed call. Both spellings are traced now, zero included: a title
++// whose own errno ends up stale (0) reads "not EAGAIN" and treats a non-blocking read as a hard failure, and
++// the log could not tell whether it asked at all.
++HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) {
++    dm_nd_trace_result("socket::GetLastError", t_skerr);
++    return t_skerr;
++}
+ // C interface
+ // The C spelling of the four a connection is prepared with: a title on this ABI calls these, not the C++ ones,
+ // and the answer an entry gives is the only way to see which of them it stopped on.
+@@ -1111,10 +1266,13 @@ HLE_FORCE("nnsocketWrite", "local UDP/EventFd (offline BSD service)", long, h_ns
+ HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
+ HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) {
+     // Only when there is one: a title that reads the errno after a call that failed says which failure it saw.
+-    if (t_skerr) dm_nd_trace_result("socket::GetLastErrno", t_skerr);
++    dm_nd_trace_result("socket::GetLastErrno", t_skerr);
+     return t_skerr;
+ }
+-HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_nsk_SetErrno, int e) { t_skerr = e; }
++HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_nsk_SetErrno, int e) {
++    dm_nd_trace_result("socket::SetLastErrno", e);
++    t_skerr = e;
++}
+ 
+ void dm_net_teardown(void) {
+     pthread_mutex_lock(&g_efd_m);
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index 2d85ac4d..2fa0f51b 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -10,6 +10,7 @@
+ #include <netinet/in.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <stdatomic.h>
+ #include <string.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -90,6 +91,52 @@ static void *echo_server(void *arg) {
+ // The same, over a descriptor the caller already opened. Both sides count to the whole message: a sendmsg
+ // over two iovecs may land in two segments, and a server that echoes the first read alone turns that into a
+ // flaky test instead of a true one.
++// A reply that is late by design: the read comes before the bytes do, by construction — the server waits
++// for the read to be attempted before it writes, so the first read cannot find the bytes already there.
++static atomic_int g_read_go;
++static void *late_reply(void *arg) {
++    int ls = *(int *)arg;
++    int cs = accept(ls, NULL, NULL);
++    if (cs >= 0) {
++        struct timespec spin = {0, 2000000};
++        while (!atomic_load(&g_read_go)) nanosleep(&spin, NULL);
++        struct timespec d = {0, 100000000};
++        nanosleep(&d, NULL);
++        write(cs, "late", 4);
++        close(cs);
++    }
++    close(ls);
++    return NULL;
++}
++
++
++// A ClientHello built by hand: the record walk has to read the name the server routes by and the protocol it
++// offers straight out of the bytes, because those are what tell a wrong redirect from a wrong handshake.
++static size_t build_client_hello(uint8_t *b, const char *sni, const char *alpn) {
++    size_t at = 4;
++    b[0] = 1;                                   // handshake type: ClientHello
++    b[at++] = 3; b[at++] = 3;                   // legacy version
++    for (int i = 0; i < 32; i++) b[at++] = (uint8_t)i;
++    b[at++] = 0;                                // session id
++    b[at++] = 0; b[at++] = 2; b[at++] = 0x13; b[at++] = 0x01;
++    b[at++] = 1; b[at++] = 0;                   // compression
++    size_t ext_at = at; at += 2;
++    size_t sn = strlen(sni), al = strlen(alpn);
++    b[at++] = 0; b[at++] = 0; b[at++] = 0; b[at++] = (uint8_t)(5 + sn);      // server_name
++    b[at++] = 0; b[at++] = (uint8_t)(3 + sn); b[at++] = 0;                  // list, type host_name
++    b[at++] = (uint8_t)(sn >> 8); b[at++] = (uint8_t)sn;
++    memcpy(b + at, sni, sn); at += sn;
++    b[at++] = 0; b[at++] = 16; b[at++] = 0; b[at++] = (uint8_t)(3 + al);     // ALPN
++    b[at++] = 0; b[at++] = (uint8_t)(1 + al); b[at++] = (uint8_t)al;
++    memcpy(b + at, alpn, al); at += al;
++    b[at++] = 0; b[at++] = 43; b[at++] = 0; b[at++] = 3; b[at++] = 2; b[at++] = 0x03; b[at++] = 0x04;   // versions
++    size_t el = at - ext_at - 2;
++    b[ext_at] = (uint8_t)(el >> 8); b[ext_at + 1] = (uint8_t)el;
++    size_t hl = at - 4;
++    b[1] = (uint8_t)(hl >> 16); b[2] = (uint8_t)(hl >> 8); b[3] = (uint8_t)hl;
++    return at;
++}
++
+ static void *echo_vectors(void *arg) {
+     int ls = *(int *)arg;
+     int cs = accept(ls, NULL, NULL);
+@@ -187,6 +234,33 @@ int main(void) {
+         pthread_join(th3, NULL);
+     }
+ 
++    // A read that finds nothing yet: the NPLN client's grpc reads its TLS flight expecting the bytes to be
++    // there, and EAGAIN at that point ended the online flow (0x270141). The host waits inside a budget and
++    // answers the bytes; DM_NEXTENDO_READ_WAIT_MS=0 keeps the old answer.
++    {
++        int lport = 0;
++        int lls = idle_listen(&lport);
++        pthread_t th4;
++        pthread_create(&th4, NULL, late_reply, &lls);
++        uint8_t la[16] = {16, 2, (uint8_t)(lport >> 8), (uint8_t)lport, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++        int lfd = dm_sk_socket(2, 1, 0);
++        if (lfd < ND_TCP_BASE) fail("a stream socket for the late reply");
++        if (dm_sk_fcntl(lfd, 4, SK_NONBLOCK)) fail("Fcntl O_NONBLOCK for the late reply");   // as the title's socket is
++        if (dm_sk_connect(lfd, la, sizeof la)) fail("connect for the late reply");
++        char got[8] = {0};
++        nd_iovec riov[1] = {{got, sizeof got}};
++        nd_msghdr rmh = {0};
++        rmh.iov = riov; rmh.iov_len = 1;
++        setenv("DM_NEXTENDO_READ_WAIT_MS", "0", 1);
++        atomic_store(&g_read_go, 1);   // the server writes only after this read has been answered
++        if (dm_nd_recvmsg(lfd, &rmh, 0) != -1 || dm_sk_errno() != SK_EAGAIN) fail("a read with no wait still answers EAGAIN");
++        setenv("DM_NEXTENDO_READ_WAIT_MS", "500", 1);
++        if (dm_nd_recvmsg(lfd, &rmh, 0) != 4 || memcmp(got, "late", 4)) fail("a read inside the budget answers the bytes");
++        unsetenv("DM_NEXTENDO_READ_WAIT_MS");
++        dm_sk_close(lfd);
++        pthread_join(th4, NULL);
++    }
++
+     // A non-blocking connect answers the connection's outcome, not "in progress": the NPLN client sets
+     // O_NONBLOCK and the next thing it does is speak TLS on that socket, and handing it EINPROGRESS is the
+     // answer that left the online flow stalled in the reference ports (they block for the completion).
+@@ -214,6 +288,18 @@ int main(void) {
+     if (dm_sk_socket(2, 1, 0) != -1) fail("a stream socket with the switch off");
+     if (dm_sk_errno() != SK_ENETDOWN) fail("the switch-off errno");
+ 
++    // The TLS record walk: SNI, ALPN and the versions come out of the ClientHello, and an alert record is
++    // named as such — a server that answers an alert must not read like a server that answered a Finished.
++    {
++        uint8_t hello[256];
++        size_t hn = build_client_hello(hello, "npln.test.example", "h2");
++        char s[180];
++        nd_tls_client_hello(s, sizeof s, hello, hn);
++        if (!strstr(s, "sni npln.test.example")) fail("the SNI read off a ClientHello");
++        if (!strstr(s, "alpn h2")) fail("the ALPN read off a ClientHello");
++        if (!strstr(s, "versions 1.3")) fail("the versions read off a ClientHello");
++    }
++
+     // The HTTP/2 frame walk the trace prints: the connection preface is not a frame, and each header reads as
+     // type, length, flags, stream — a log that names the conversation instead of its byte count.
+     {
