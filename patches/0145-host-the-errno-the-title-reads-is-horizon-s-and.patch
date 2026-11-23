@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Mon, 23 Nov 2026 11:31:48 +0000
+Subject: [PATCH] host: the errno the title reads is Horizon's, and a C call
+ answers -errno
+
+The socket C entries answer the title's own C library (the SDK's nnmusl), whose layer takes a
+syscall's answer as -errno and turns it into errno = -r. Answering -1 there makes the title read
+errno 1 (EPERM) whatever went wrong, so a non-blocking read that merely found nothing yet looks
+like a hard failure to its TLS stack: log A233283B shows the NPLN client dropping the connection
+right after writing its HTTP/2 preface, with no GetLastErrno call at all.
+
+The numbers the title compares are Horizon's, which are the Linux ones (Ryujinx Nextendo,
+LinuxError.cs: EAGAIN 11, EINPROGRESS 115, ECONNRESET 104, ENOTCONN 107, ENETDOWN 100), not this
+host's Darwin ones (35, 36, 54, 57, 50). GetLastErrno and GetLastError hand back the same
+numbering, and SetLastErrno takes it back.
+
+poll reports a closed peer as a hang-up whatever the caller asked for, as poll(2) says: the
+client's transport polls with events 0 after its write, and an answer of nothing there leaves it
+waiting for a reply no one will send.
+
+A stream socket's close is traced, and a failed receive names both numbers, because a client that
+gives up on a connection and a server that dropped it read the same in a log.
+
+Upstream-Status: pending
+Reason: The title's socket calls go through its own C library (the SDK's nnmusl), whose layer takes a syscall's
+  answer as -errno, and every failure was answered -1: the title then read errno 1 (EPERM) whatever went wrong,
+  so a non-blocking read that had merely found nothing yet looked like a hard failure to its TLS stack. Log
+  A233283B (patch 0144 installed) shows the handshake completing, the server's HTTP/2 SETTINGS arriving, the
+  client writing its 128-byte preface and closing at once, with not one GetLastErrno in the whole log: the error
+  it decided on never came from us. The numbers were wrong too — Horizon's socket errors are the Linux ones
+  (Ryujinx Nextendo, LinuxError.cs), so EAGAIN is 11, not this host's 35. And the client's transport polls with
+  events 0 after its write, where poll(2) still reports a hang-up and ours answered nothing.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 118 ++++++++++++++++++++++++++------------
+ dm/host/tests/t_net_tcp.c |  37 ++++++++++++
+ 2 files changed, 118 insertions(+), 37 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index e336aac5..c90c5167 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -85,7 +85,7 @@ void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns);
+ static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000); return 0; }
+ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
+ 
+-enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLNVAL = 0x20,
++enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLHUP = 0x10, SK_POLLNVAL = 0x20,
+        SK_EBADF = 9, SK_EAGAIN = 35, SK_EINVAL = 22, SK_EMSGSIZE = 40, SK_EPROTONOSUPPORT = 43, SK_EOPNOTSUPP = 45,
+        SK_EAFNOSUPPORT = 47, SK_EADDRINUSE = 48, SK_ENOTCONN = 57,
+        SK_NONBLOCK = 0x800, SK_MSG_PEEK = 2, SK_MSG_DONTWAIT = 0x80, SK_UDP = 2, SK_EFD = 1,
+@@ -158,6 +158,41 @@ static int nd_errno(int e) {
+     default: return SK_ENETDOWN;
+     }
+ }
++// The number the title reads back. Horizon's socket errors are the Linux ones (Ryujinx Nextendo,
++// LinuxError.cs: EAGAIN 11, EINPROGRESS 115, ECONNRESET 104, ENOTCONN 107, ENETDOWN 100), while this host
++// numbers them as Darwin does (EAGAIN 35, EINPROGRESS 36). A title that compares the number with its own
++// EAGAIN reads the host's 35 as an error it does not know, so a non-blocking read that found nothing yet
++// becomes a hard failure in its TLS stack. The value leaves only through nd_hz_errno.
++static int nd_hz_errno(int e) {
++    switch (e) {
++    case 35: return 11;     // EAGAIN / EWOULDBLOCK
++    case 36: return 115;    // EINPROGRESS
++    case 37: return 114;    // EALREADY
++    default: return e >= 38 && e <= 63 ? e + 50 : e;   // one family: Darwin 38..63 is Horizon 88..113
++    }
++}
++// The reverse, for the errors a title sets itself (SetLastErrno).
++static int nd_hz_errno_in(int e) {
++    switch (e) {
++    case 11: return 35;
++    case 115: return 36;
++    case 114: return 37;
++    default: return e >= 88 && e <= 113 ? e - 50 : e;
++    }
++}
++// A C entry is not the C++ one. The titles reach these through their own C library (the SDK's nnmusl),
++// whose layer takes a syscall's answer as -errno and turns it into errno = -r. Answering -1 there makes the
++// title read errno 1 (EPERM) whatever went wrong: a read that merely found nothing yet, an address family
++// this host does not serve, all of it the same "permission denied" to the caller.
++static int sk_guest(int r) { return r >= 0 ? r : -nd_hz_errno(t_skerr); }
++static int sk_guest_fail(int host_errno) { sk_error(host_errno); return -nd_hz_errno(t_skerr); }
++// A stream socket's close is traced: a client that gives up on a connection closes it, and in a log where the
++// close is silent that reads exactly like a connection the server dropped.
++static int sk_close(int s) {
++    int r = dm_sk_close(s);
++    if (nd_tcp_range(s)) { char t[64]; snprintf(t, sizeof t, "socket::Close(fd %d)", s); dm_nd_trace_result(t, r); }
++    return r;
++}
+ static int nd_addr_read(const void *a, unsigned n, uint32_t *addr, uint16_t *port) {
+     if (!a || n < 16) return sk_error(22);
+     const uint8_t *b = a;
+@@ -513,9 +548,9 @@ static void nd_h2_frames(const char *dir, const void *buf, size_t n) {
+ // are different problems with the same "-1".
+ static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int n, const void *buf, size_t len) {
+     if (n > 16 && bytes >= 0 && n % 64) return;
+-    char t[140];
+-    if (bytes < 0) snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec) errno %d, host readable %d",
+-                            what, fd, iov, dm_sk_errno(), nd_tcp_ready(fd, SK_POLLIN) != 0);
++    char t[176];
++    if (bytes < 0) snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec) errno %d (title %d), host readable %d",
++                            what, fd, iov, dm_sk_errno(), nd_hz_errno(dm_sk_errno()), nd_tcp_ready(fd, SK_POLLIN) != 0);
+     else snprintf(t, sizeof t, "socket::%s(fd %d, %u iovec)", what, fd, iov);
+     dm_nd_trace_result(t, bytes);
+     if (n <= 8 && bytes > 0 && buf) {
+@@ -704,6 +739,10 @@ static int nd_tcp_ready(int fd, int16_t events) {
+     int rev = 0;
+     if (hp.revents & (POLLIN | POLLHUP | POLLERR)) rev |= events & (SK_POLLIN | SK_POLLRDNORM);
+     if (hp.revents & POLLOUT) rev |= events & (SK_POLLOUT | SK_POLLWRNORM);
++    // A closed peer is reported whatever the caller asked for, as poll(2) says: the HTTP/2 transport of the
++    // NPLN client polls with events 0 after its write, and an answer with no hang-up is an answer that
++    // leaves it waiting for a reply that will never come.
++    if (hp.revents & (POLLHUP | POLLERR)) rev |= SK_POLLHUP;
+     return rev;
+ }
+ typedef struct sk_packet { struct sk_packet *next; uint32_t addr; uint16_t port; size_t size; uint8_t data[]; } sk_packet;
+@@ -1134,7 +1173,7 @@ SKF("_ZN2nn6socket7ConnectEiPKNS0_8SockAddrEj", h_sk_Connect, int s, const void
+ }
+ SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) { (void)s; (void)n; return sk_fail(); }
+ SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsigned *n) { (void)s; (void)a; (void)n; return sk_fail(); }
+-SKF("_ZN2nn6socket5CloseEi", h_sk_Close, int s) { return dm_sk_close(s); }
++SKF("_ZN2nn6socket5CloseEi", h_sk_Close, int s) { return sk_close(s); }
+ SKF("_ZN2nn6socket11GetPeerNameEiPNS0_8SockAddrEPj", h_sk_GetPeerName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
+ SKF("_ZN2nn6socket11GetSockNameEiPNS0_8SockAddrEPj", h_sk_GetSockName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
+ SKF("_ZN2nn6socket10GetSockOptEiNS0_5LevelENS0_6OptionEPvPj", h_sk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) {
+@@ -1183,27 +1222,30 @@ HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name r
+ // The error the title reads back after a failed call. Both spellings are traced now, zero included: a title
+ // whose own errno ends up stale (0) reads "not EAGAIN" and treats a non-blocking read as a hard failure, and
+ // the log could not tell whether it asked at all.
+-HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) {
+-    dm_nd_trace_result("socket::GetLastError", t_skerr);
+-    return t_skerr;
++HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host, in the title's numbering", int, h_sk_GetLastError, void) {
++    int e = nd_hz_errno(t_skerr);
++    char t[64]; snprintf(t, sizeof t, "socket::GetLastError (host %d)", t_skerr);
++    dm_nd_trace_result(t, e);
++    return e;
+ }
+ // C interface
+ // The C spelling of the four a connection is prepared with: a title on this ABI calls these, not the C++ ones,
+-// and the answer an entry gives is the only way to see which of them it stopped on.
++// and the answer an entry gives is the only way to see which of them it stopped on. Their failures are -errno,
++// not -1: see sk_guest above.
+ SKF("nnsocketSocket", h_nsk_Socket, int a, int b, int c) {
+     int r = dm_sk_socket(a, b, c);
+     { char t[96]; snprintf(t, sizeof t, "socket::Socket(family %d type %d protocol %d)", a, b, c); dm_nd_trace_result(t, r); }
+-    return r;
++    return sk_guest(r);
+ }
+-SKF("nnsocketBind", h_nsk_Bind, int s, const void *a, unsigned n) { return dm_sk_bind(s, a, n); }
++SKF("nnsocketBind", h_nsk_Bind, int s, const void *a, unsigned n) { return sk_guest(dm_sk_bind(s, a, n)); }
+ SKF("nnsocketConnect", h_nsk_Connect, int s, const void *a, unsigned n) {
+     int r = dm_sk_connect(s, a, n);
+     { char t[96]; snprintf(t, sizeof t, "socket::Connect(fd %d) %s", s, r ? "failed" : "connected"); dm_nd_trace_result(t, r); }
+-    return r;
++    return sk_guest(r);
+ }
+-SKF("nnsocketClose", h_nsk_Close, int s) { return dm_sk_close(s); }
+-SKF("nnsocketGetPeerName", h_nsk_GetPeerName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
+-SKF("nnsocketGetSockName", h_nsk_GetSockName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
++SKF("nnsocketClose", h_nsk_Close, int s) { return sk_guest(sk_close(s)); }
++SKF("nnsocketGetPeerName", h_nsk_GetPeerName, int s, void *a, unsigned *n) { return sk_guest(dm_sk_name(s, a, n, 1)); }
++SKF("nnsocketGetSockName", h_nsk_GetSockName, int s, void *a, unsigned *n) { return sk_guest(dm_sk_name(s, a, n, 0)); }
+ SKF("nnsocketGetSockOpt", h_nsk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) {
+     unsigned ask = n ? *n : 0;
+     int r = dm_sk_getopt(s, l, o, v, n);
+@@ -1212,18 +1254,18 @@ SKF("nnsocketGetSockOpt", h_nsk_GetSockOpt, int s, int l, int o, void *v, unsign
+                                                     s, l, o, ask, *n, *(const int *)v);
+     else snprintf(t, sizeof t, "socket::GetSockOpt(fd %d level 0x%x option 0x%x) size %u -> %u", s, l, o, ask, n ? *n : 0);
+     dm_nd_trace_result(t, r);
+-    return r;
++    return sk_guest(r);
+ }
+ SKF("nnsocketSetSockOpt", h_nsk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) {
+     int r = dm_sk_setopt(s, l, o, v, n);
+     { char t[112]; snprintf(t, sizeof t, "socket::SetSockOpt(fd %d level 0x%x option 0x%x) size %u", s, l, o, n);
+       dm_nd_trace_result(t, r); }
+-    return r;
++    return sk_guest(r);
+ }
+ SKF("nnsocketFcntl", h_nsk_Fcntl, int s, int c, int v) {
+     int r = dm_sk_fcntl(s, c, v);
+     { char t[96]; snprintf(t, sizeof t, "socket::Fcntl(fd %d cmd %d value 0x%x)", s, c, v); dm_nd_trace_result(t, r); }
+-    return r;
++    return sk_guest(r);
+ }
+ SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) {
+     int r = dm_sk_poll(f, n, t);
+@@ -1240,38 +1282,40 @@ SKF("nnsocketPoll", h_nsk_Poll, void *f, unsigned long n, int t) {
+                            p[i].fd, (unsigned)(unsigned short)p[i].events, (unsigned)(unsigned short)p[i].revents);
+         dm_nd_trace_result(s, r);
+     }
+-    return r;
++    return sk_guest(r);
+ }
+ // The vectored calls are how the NPLN client's gRPC writes and reads: it hands one MsgHdr, not a buffer.
+ // They were the offline cut (a flat -1), so the client's first frame went nowhere and the server, which
+ // answers a plaintext HTTP/2 preface at once, was never heard from.
+ SKF("nnsocketSendMsg", h_nsk_SendMsg, int s, const void *m, int f) {
+     long r = dm_nd_sendmsg(s, m, f);
+-    if (r == ND_NOT) return sk_fail();
+-    return (int)r;
++    if (r == ND_NOT) return sk_guest_fail(SK_ENETDOWN);
++    return sk_guest((int)r);
+ }
+ SKF("nnsocketRecvMsg", h_nsk_RecvMsg, int s, void *m, int f) {
+     long r = dm_nd_recvmsg(s, m, f);
+-    if (r == ND_NOT) return sk_fail();
+-    return (int)r;
+-}
+-SKF("nnsocketResolverGetOption", h_nsk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
+-SKF("nnsocketResolverSetOption", h_nsk_ResSet, const void *o) { (void)o; return sk_fail(); }
+-HLE_FORCE("nnsocketRecv", "local UDP (offline BSD service)", long, h_nsk_Recv, int s, void *b, unsigned long n, int f) { return dm_sk_recvfrom(s, b, n, f, NULL, NULL); }
+-HLE_FORCE("nnsocketSend", "local UDP (offline BSD service)", long, h_nsk_Send, int s, const void *b, unsigned long n, int f) { return dm_sk_sendto(s, b, n, f, NULL, 0); }
+-HLE_FORCE("nnsocketSendTo", "local UDP (offline BSD service)", long, h_nsk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
+-HLE_FORCE("nnsocketRecvFrom", "local UDP (offline BSD service)", long, h_nsk_RecvFrom, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return dm_sk_recvfrom(s, b, n, f, a, al); }
+-HLE_FORCE("nnsocketRead", "local UDP/EventFd (offline BSD service)", long, h_nsk_Read, int s, void *b, unsigned long n) { return dm_sk_read(s, b, n); }
+-HLE_FORCE("nnsocketWrite", "local UDP/EventFd (offline BSD service)", long, h_nsk_Write, int s, const void *b, unsigned long n) { return dm_sk_write(s, b, n); }
++    if (r == ND_NOT) return sk_guest_fail(SK_ENETDOWN);
++    return sk_guest((int)r);
++}
++SKF("nnsocketResolverGetOption", h_nsk_ResGet, void *o, int k) { (void)o; (void)k; return sk_guest_fail(SK_ENETDOWN); }
++SKF("nnsocketResolverSetOption", h_nsk_ResSet, const void *o) { (void)o; return sk_guest_fail(SK_ENETDOWN); }
++HLE_FORCE("nnsocketRecv", "local UDP (offline BSD service)", long, h_nsk_Recv, int s, void *b, unsigned long n, int f) { return sk_guest((int)dm_sk_recvfrom(s, b, n, f, NULL, NULL)); }
++HLE_FORCE("nnsocketSend", "local UDP (offline BSD service)", long, h_nsk_Send, int s, const void *b, unsigned long n, int f) { return sk_guest((int)dm_sk_sendto(s, b, n, f, NULL, 0)); }
++HLE_FORCE("nnsocketSendTo", "local UDP (offline BSD service)", long, h_nsk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return sk_guest((int)dm_sk_sendto(s, b, n, f, a, al)); }
++HLE_FORCE("nnsocketRecvFrom", "local UDP (offline BSD service)", long, h_nsk_RecvFrom, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return sk_guest((int)dm_sk_recvfrom(s, b, n, f, a, al)); }
++HLE_FORCE("nnsocketRead", "local UDP/EventFd (offline BSD service)", long, h_nsk_Read, int s, void *b, unsigned long n) { return sk_guest((int)dm_sk_read(s, b, n)); }
++HLE_FORCE("nnsocketWrite", "local UDP/EventFd (offline BSD service)", long, h_nsk_Write, int s, const void *b, unsigned long n) { return sk_guest((int)dm_sk_write(s, b, n)); }
+ HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
+-HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) {
++HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host, in the title's numbering", int, h_nsk_GetErrno, void) {
+     // Only when there is one: a title that reads the errno after a call that failed says which failure it saw.
+-    dm_nd_trace_result("socket::GetLastErrno", t_skerr);
+-    return t_skerr;
++    int e = nd_hz_errno(t_skerr);
++    char t[64]; snprintf(t, sizeof t, "socket::GetLastErrno (host %d)", t_skerr);
++    dm_nd_trace_result(t, e);
++    return e;
+ }
+-HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_nsk_SetErrno, int e) {
++HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host, in the title's numbering", void, h_nsk_SetErrno, int e) {
+     dm_nd_trace_result("socket::SetLastErrno", e);
+-    t_skerr = e;
++    t_skerr = nd_hz_errno_in(e);
+ }
+ 
+ void dm_net_teardown(void) {
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index 2fa0f51b..b7018fb2 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -315,6 +315,43 @@ int main(void) {
+         if (used != 24 + sizeof frames) fail("the bytes the walk consumed");
+     }
+ 
++    // The numbers the title reads: Horizon's socket errors are the Linux ones (Ryujinx Nextendo,
++    // LinuxError.cs), so the host's Darwin numbering must not reach the title — a non-blocking read that
++    // found nothing yet has to read as EAGAIN there, or the TLS stack calls it a hard failure. And a C entry
++    // answers -errno, which is what the title's own C library turns into errno = -r.
++    {
++        if (nd_hz_errno(SK_EAGAIN) != 11) fail("EAGAIN in the title's numbering");
++        if (nd_hz_errno(ND_EINPROGRESS) != 115) fail("EINPROGRESS in the title's numbering");
++        if (nd_hz_errno(54) != 104) fail("ECONNRESET in the title's numbering");
++        if (nd_hz_errno(ND_ETIMEDOUT) != 110) fail("ETIMEDOUT in the title's numbering");
++        if (nd_hz_errno(SK_ENOTCONN) != 107) fail("ENOTCONN in the title's numbering");
++        if (nd_hz_errno(SK_ENETDOWN) != 100) fail("ENETDOWN in the title's numbering");
++        if (nd_hz_errno(SK_EBADF) != 9 || nd_hz_errno(SK_EINVAL) != 22) fail("a number both ABIs share");
++        if (nd_hz_errno_in(11) != SK_EAGAIN || nd_hz_errno_in(115) != ND_EINPROGRESS) fail("a title's errno read back");
++        nd_msghdr empty = {0};                                  // no iovec: EINVAL, the shortest failure to reach
++        if (h_nsk_RecvMsg(ND_TCP_BASE, &empty, 0) != -22) fail("a failing C call answers -errno, not -1");
++    }
++
++    // A peer that closed is polled as a hang-up, whatever the caller asked for: the NPLN client's HTTP/2
++    // transport polls with events 0 after its write, and an answer of "nothing" there is an answer that
++    // leaves it waiting for a reply no one will send.
++    {
++        int hport = 0;
++        int hls = idle_listen(&hport);
++        pthread_t th5;
++        pthread_create(&th5, NULL, idle_accept, &hls);          // accepts, then closes its end at once
++        int hfd = dm_sk_socket(2, 1, 0);
++        if (hfd < ND_TCP_BASE) fail("a stream socket for the hang-up");
++        uint8_t ha[16] = {16, 2, (uint8_t)(hport >> 8), (uint8_t)hport, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++        if (dm_sk_connect(hfd, ha, sizeof ha)) fail("connect for the hang-up");
++        sk_pollfd one = {hfd, SK_POLLIN, 0};
++        int n = dm_sk_poll(&one, 1, 2000);
++        if (n != 1 || !(one.revents & SK_POLLHUP)) fail("a closed peer is polled as a hang-up");
++        if (one.revents & SK_POLLNVAL) fail("a live descriptor answers POLLNVAL");
++        dm_sk_close(hfd);
++        pthread_join(th5, NULL);
++    }
++
+     puts("ok");
+     return 0;
+ }
