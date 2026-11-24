@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 24 Nov 2026 12:14:25 +0000
+Subject: [PATCH] host: a title that stopped mid-handshake is fed one record,
+ to see if it is alive
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Log 81C6FC07 ran build 0150 with DM_NEXTENDO_PEER=104.154.89.105, so the title spoke TLS to
+tls-v1-2.badssl.com instead of Nextendo: TLS 1.2, ECDHE-RSA-AES128-GCM-SHA256, an expired
+certificate, and a 1696-byte flight that is exactly ServerHello 66 + Certificate 1283 +
+ServerKeyExchange 338 + ServerHelloDone 9. The title read all 1696 bytes in one call and then asked
+for 6496 more — the room left in an 8 KB buffer — got EAGAIN and never wrote anything again, while
+the npln dispatcher thread burned a whole core. The same stall as every Nextendo run, from a server
+that shares no certificate, chain or extension set with it: the peer is not the variable, and neither
+is the certificate, the offer or a truncated read.
+
+What no log can say is whether the title's TLS stack is still able to react at all — and that decides
+where the work goes. `DM_NEXTENDO_FEED=<hex>` answers the first empty read on each socket with those
+bytes, once. Fed a record, a title whose TLS is alive reacts to it and writes (an alert or a fresh
+flight, both visible in the flow trace); one deadlocked in its own transport stays silent whatever it
+is fed, and no TLS work in this host would reach it. A typo feeds nothing, a peek is left alone, and
+the read budget is untouched: this is an instrument, never a play configuration.
+
+The host test connects to a listener that says nothing, sets a nine-byte record and asserts the read
+answers it and the next read does not.
+
+Upstream-Status: fork-only
+Reason: the Nextendo online seams are this fork's own work: upstream's multi-worktree tree takes them to seedds/nxnative instead
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 48 +++++++++++++++++++++++++++++++++++++++
+ dm/host/tests/t_net_tcp.c | 25 ++++++++++++++++++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 3dbe665f..832a3b7c 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -140,6 +140,7 @@ typedef struct {
+     nd_opt_rec opt[ND_OPT_MAX];
+     int64_t rtimeo, stimeo;        // nanoseconds, 0 = no timeout
+     long long in, out;             // bytes the title moved on this socket, for the close line
++    int fed;                       // the DM_NEXTENDO_FEED bytes have already answered one read here
+     uint32_t local, peer; uint16_t local_port, peer_port;
+ } nd_tcp_ent;
+ 
+@@ -323,6 +324,33 @@ static long nd_now_ms(void) {
+     clock_gettime(CLOCK_MONOTONIC, &t);
+     return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+ }
++
++// `DM_NEXTENDO_FEED=<hex>` answers one empty read per socket with those bytes, and it exists to settle the one
++// question no log has answered: this title reads the server's whole TLS flight and then waits for bytes that
++// will never come. Fed a hand-made record, a title whose TLS stack is alive reacts to it — and it writes, which
++// the flow trace shows as an alert or a fresh handshake. A title deadlocked in its own transport stays silent
++// whatever it is fed, and no amount of TLS work in this host would reach it.
++#define ND_FEED_MAX 8192
++static int nd_hex_nibble(int c) {
++    if (c >= '0' && c <= '9') return c - '0';
++    if ((c | 32) >= 'a' && (c | 32) <= 'f') return (c | 32) - 'a' + 10;
++    return -1;
++}
++static int nd_feed_bytes(unsigned char *out, int cap) {
++    const char *s = getenv("DM_NEXTENDO_FEED");
++    int n = 0;
++    if (!s) return 0;
++    while (*s && n < cap) {
++        while (*s == ' ' || *s == '\t' || *s == '\\') s++;
++        if (!*s) break;
++        int hi = nd_hex_nibble((unsigned char)s[0]);
++        int lo = s[1] ? nd_hex_nibble((unsigned char)s[1]) : -1;
++        if (hi < 0 || lo < 0) return 0;         // a typo is not a shorter probe: feed nothing at all
++        out[n++] = (unsigned char)(hi << 4 | lo);
++        s += 2;
++    }
++    return n;
++}
+ static int nd_wait_readable(int h, int ms) {
+     struct pollfd p = {0};
+     p.fd = h; p.events = POLLIN;
+@@ -410,6 +438,26 @@ long dm_nd_tcp_recv(int fd, void *data, unsigned long n, int flags, void *a, uns
+         ssize_t r = recv(h, data, n, sysflags | MSG_DONTWAIT);
+         if (r >= 0) { nd_addr_write(a, al, peer, peer_port); nd_flow_trace("recv", fd, (long)r, data, n); return (long)r; }   // 0 = the peer closed
+         if (errno != EAGAIN && errno != EWOULDBLOCK) { nd_flow_trace("recv", fd, -1, NULL, 0); return sk_error(nd_errno(errno)); }
++        // Before any wait and on either kind of socket: the feed is a diagnostic, and it must answer the first
++        // empty read whether or not the title made the socket non-blocking (see nd_feed_bytes).
++        if (!sysflags && n) {
++            static unsigned char feed[ND_FEED_MAX];
++            int fn = nd_feed_bytes(feed, (int)sizeof feed);
++            if (fn > 0) {
++                int once = 0;
++                pthread_mutex_lock(&g_nd_tcp_m);
++                nd_tcp_ent *e2 = nd_tcp_locked(fd);
++                if (e2 && !e2->fed) { e2->fed = 1; once = 1; }
++                pthread_mutex_unlock(&g_nd_tcp_m);
++                if (once) {
++                    size_t c = n < (unsigned long)fn ? (size_t)n : (size_t)fn;
++                    memcpy(data, feed, c);
++                    fprintf(stderr, "[dm] nextendo: fed %zu byte(s) to fd %d that nothing was going to send\n", c, fd);
++                    nd_flow_trace("recv", fd, (long)c, data, n);
++                    return (long)c;
++                }
++            }
++        }
+         if (nonblock) { nd_flow_trace("recv", fd, -1, NULL, 0); return sk_error(35); }
+         if (deadline && guest_ns() > deadline) { nd_flow_trace("recv", fd, -1, NULL, 0); return sk_error(35); }
+         dm_guest_sleep_ns(1000000);
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index 25c458ba..765355ca 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -301,6 +301,31 @@ int main(void) {
+         pthread_join(th5, NULL);
+     }
+ 
++    // The feed: with DM_NEXTENDO_FEED set, the first empty read on a socket answers those bytes once. It is the
++    // only instrument that can tell a title whose TLS reacts to input from one deadlocked in its transport, and
++    // it must never answer a second read: a title left waiting has to stay waiting.
++    {
++        int fport = 0;
++        int fls = idle_listen(&fport);
++        pthread_t th6;
++        pthread_create(&th6, NULL, quiet_accept, &fls);
++        uint8_t fa[16] = {16, 2, (uint8_t)(fport >> 8), (uint8_t)fport, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++        int ffd = dm_sk_socket(2, 1, 0);
++        if (ffd < ND_TCP_BASE) fail("a stream socket for the feed");
++        if (dm_sk_fcntl(ffd, 4, SK_NONBLOCK)) fail("Fcntl O_NONBLOCK for the feed");
++        if (dm_sk_connect(ffd, fa, sizeof fa)) fail("connect for the feed");
++        setenv("DM_NEXTENDO_FEED", "16 03 03 00 04 0e 00 00 00", 1);
++        unsigned char fgot[16] = {0};
++        long fr = dm_nd_tcp_recv(ffd, fgot, sizeof fgot, 0, NULL, NULL);
++        if (fr != 9) fail("the feed answers the bytes it names");
++        if (fgot[0] != 0x16 || fgot[5] != 0x0e) fail("the feed's own bytes");
++        if (dm_nd_tcp_recv(ffd, fgot, sizeof fgot, 0, NULL, NULL) != -1) fail("the feed answers once, not every read");
++        if (dm_sk_errno() != SK_EAGAIN) fail("and then nothing yet, as before the feed");
++        dm_sk_close(ffd);
++        pthread_join(th6, NULL);
++        unsetenv("DM_NEXTENDO_FEED");
++    }
++
+     // A non-blocking connect answers the connection's outcome, not "in progress": the NPLN client sets
+     // O_NONBLOCK and the next thing it does is speak TLS on that socket, and handing it EINPROGRESS is the
+     // answer that left the online flow stalled in the reference ports (they block for the completion).
