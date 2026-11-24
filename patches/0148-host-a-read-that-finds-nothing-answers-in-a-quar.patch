@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 24 Nov 2026 09:41:50 +0000
+Subject: [PATCH] host: a read that finds nothing answers in a quarter second,
+ and the C++ errno says when it is asked
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Log 21C165AE (patch 0147 installed) has the same shape as 0146, and it refutes what 0147 assumed: the
+title sends its 213-byte ClientHello, reads the server's whole flight (1375 bytes: ServerHello,
+Certificate, ServerKeyExchange, ServerHelloDone), and then a read that waits two seconds and finds
+nothing is followed by nothing at all — no second send for the rest of the session, one poll with a
+zero timeout every five seconds, and the online flow stays on its connection screen.
+
+The two builds differ in nothing the title reads back: it calls neither GetLastErrno nor GetLastError
+in any of the logs (those entries are traced, zero included), and the value the C entries return is -1
+in both. What did differ is how long we held that read: 2000 ms in 0144, where the title wrote its
+126-byte flight the moment the read answered, and 2001 ms in 0146 and 0147, where it went to sleep
+instead. A budget that sits on the boundary of a title's own clock is not a budget, so it drops to
+250 ms — five times the worst server round trip in these logs, eight times below the old one — and the
+read line now says whether the title had made the socket non-blocking.
+
+The C++ spelling of GetLastErrno is the one a title's own C library asks, and it was the only socket
+error answer the host did not log: a title that never asks why a read failed and one that asks and
+gets a number it cannot use read exactly alike. It is traced now, with Nextendo on, so the next log
+settles it.
+
+Upstream-Status: fork-only
+Reason: Log 21C165AE (patch 0147) repeats 0146 exactly: after the server's whole handshake flight the title writes nothing for the rest of the session, with a two-second read that finds nothing and a zero-timeout poll every five seconds. The builds differ in nothing the title reads back - it never calls GetLastErrno or GetLastError, and the C entries answer -1 in both - while the one thing that changed is how long we held that read (2000 ms in 0144, where the title wrote its 126-byte flight next; 2001 ms in 0146/0147, where it stopped). The budget drops to 250 ms so it cannot sit on a timeout of the title's own, and the C++ GetLastErrno is traced so the next log says whether the title asks.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c         | 23 +++++++++++++++++++---
+ dm/host/hle_offline.c     | 10 +++++++++-
+ dm/host/tests/t_net_tcp.c | 40 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 5536a229..d2590b35 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -120,7 +120,14 @@ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POL
+ #define ND_ETIMEDOUT 60
+ #define ND_EMSGSIZE 40
+ #define ND_CONNECT_WAIT_MS 2000   // how long a non-blocking connect may take before it is answered "in progress"
+-#define ND_READ_WAIT_MS 2000      // how long a non-blocking read waits for bytes before it answers "nothing yet"
++// How long a non-blocking read waits for bytes before it answers "nothing yet". The budget is short on
++// purpose: at 2000 ms a log showed the title driving its handshake the moment the read answered (patch 0144,
++// the ClientKeyExchange written next), and at 2001 ms the same read left it polling a socket that owed
++// bytes and never writing them (patches 0146 and 0147). The two builds differ in nothing the title reads
++// back — it calls neither GetLastErrno nor GetLastError in any of those logs — so the budget must not sit
++// anywhere near a timeout the title may have of its own. The server that owes the flight answers in tens of
++// milliseconds, so this still covers it.
++#define ND_READ_WAIT_MS 250
+ 
+ #define ND_OPT_MAX 8
+ typedef struct { int level, option, value, set; } nd_opt_rec;
+@@ -618,6 +625,16 @@ long dm_nd_sendmsg(int fd, const void *msg, int flags) {
+     return total;
+ }
+ 
++// Whether the title made this socket non-blocking: a non-blocking read must answer "nothing yet" at once,
++// and the log has to say which kind of socket was held inside the budget.
++static int nd_tcp_nonblock(int fd) {
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    int nb = e ? e->nonblock : 0;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    return nb;
++}
++
+ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+     if (!nd_tcp_range(fd)) return ND_NOT;
+     nd_msghdr *m = msg;
+@@ -634,8 +651,8 @@ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+             long r2 = dm_nd_tcp_recv(fd, v->base, v->len, flags, m->name, m->name ? &again : NULL);
+             if (r2 >= 0) { r = r2; named = again; }
+         }
+-        fprintf(stderr, "[dm] nextendo: socket::RecvMsg(fd %d) read %ld byte(s) after %ld ms (%s=%d ms)\n",
+-                fd, r, nd_now_ms() - t0, ND_READ_ENV, budget);
++        fprintf(stderr, "[dm] nextendo: socket::RecvMsg(fd %d) read %ld byte(s) after %ld ms (%s=%d ms, title socket %s)\n",
++                fd, r, nd_now_ms() - t0, ND_READ_ENV, budget, nd_tcp_nonblock(fd) ? "non-blocking" : "blocking");
+     }
+     if (r >= 0) { if (m->name) m->name_len = named; m->flags = 0; }
+     static int seen;
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 4fac372e..5daf5598 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -73,7 +73,15 @@ HLE_FORCE("_ZN2nn9bluetooth19ConnectToGattServerERKNS0_7AddressE", "BLE connect
+ enum { SK_ENETDOWN = 50, SK_EAI_FAIL = 4 };
+ HLE_FORCE("_ZN2nn6socket10InitializeEPvmmi", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_sk_Init4, void *mem, uint64_t sz, uint64_t alloc, int conc) { (void)mem; (void)sz; (void)alloc; (void)conc; return RES_OK; }
+ HLE_FORCE("_ZN2nn6socket8FinalizeEv", "pairs with Initialize (cut)", Result, h_sk_Fini, void) { return RES_OK; }
+-HLE_FORCE("_ZN2nn6socket12GetLastErrnoEv", "local UDP (offline BSD service)", int, h_sk_Errno, void) { return dm_sk_errno(); }
++// The C++ spelling is the one a title's own C library asks after a failed socket call, and it is the only
++// socket error answer this host did not log: a title whose every read finds nothing and which never asks why
++// reads exactly like one that asked and got a number it could not use. Traced only with Nextendo on, so an
++// offline title keeps its quiet log.
++HLE_FORCE("_ZN2nn6socket12GetLastErrnoEv", "local UDP (offline BSD service)", int, h_sk_Errno, void) {
++    int e = dm_sk_errno();
++    if (dm_nd_enabled()) { char t[64]; snprintf(t, sizeof t, "socket::GetLastErrno (host %d)", e); dm_nd_trace_result(t, e); }
++    return e;
++}
+ HLE_FORCE("_ZN2nn6socket6SocketEiii", "local UDP (offline BSD service)", int, h_sk_Socket3i, int a, int b, int c) { return dm_sk_socket(a, b, c); }
+ HLE_FORCE("_ZN2nn6socket8ShutdownEii", "local UDP (offline BSD service)", int, h_sk_Shutdown, int s, int h) { return dm_sk_shutdown(s, h); }
+ HLE_FORCE("_ZN2nn6socket4BindEiPK8sockaddrj", "local UDP (offline BSD service)", int, h_sk_Bind, int s, const void *a, unsigned n) { return dm_sk_bind(s, a, n); }
+diff --git a/dm/host/tests/t_net_tcp.c b/dm/host/tests/t_net_tcp.c
+index 7c303203..25c458ba 100644
+--- a/dm/host/tests/t_net_tcp.c
++++ b/dm/host/tests/t_net_tcp.c
+@@ -109,6 +109,19 @@ static void *late_reply(void *arg) {
+     return NULL;
+ }
+ 
++// An accepted connection that says nothing at all, and outlives the read: the read has to answer on its own
++// budget instead of finding bytes, which is what makes the default budget measurable.
++static void *quiet_accept(void *arg) {
++    int ls = *(int *)arg;
++    int cs = accept(ls, NULL, NULL);
++    if (cs >= 0) {
++        struct timespec d = {2, 500000000};
++        nanosleep(&d, NULL);
++        close(cs);
++    }
++    close(ls);
++    return NULL;
++}
+ 
+ // A ClientHello built by hand: the record walk has to read the name the server routes by and the protocol it
+ // offers straight out of the bytes, because those are what tell a wrong redirect from a wrong handshake.
+@@ -261,6 +274,33 @@ int main(void) {
+         pthread_join(th4, NULL);
+     }
+ 
++    // The default budget is the short one, and this is its regression test: the two builds that answered this
++    // same read after 2000 and 2001 ms diverged (the first had the title write its TLS flight next, the second
++    // had it wait on a socket that owed bytes and never write them), so the read must not hold a title that
++    // made its socket non-blocking anywhere near a second of its own clock.
++    {
++        int qport = 0;
++        int qls = idle_listen(&qport);
++        pthread_t th5;
++        pthread_create(&th5, NULL, quiet_accept, &qls);
++        uint8_t qa[16] = {16, 2, (uint8_t)(qport >> 8), (uint8_t)qport, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
++        int qfd = dm_sk_socket(2, 1, 0);
++        if (qfd < ND_TCP_BASE) fail("a stream socket for the quiet budget");
++        if (dm_sk_fcntl(qfd, 4, SK_NONBLOCK)) fail("Fcntl O_NONBLOCK for the quiet budget");
++        if (dm_sk_connect(qfd, qa, sizeof qa)) fail("connect for the quiet budget");
++        char qgot[8] = {0};
++        nd_iovec qiov[1] = {{qgot, sizeof qgot}};
++        nd_msghdr qmh = {0};
++        qmh.iov = qiov; qmh.iov_len = 1;
++        uint64_t q0 = guest_ns();
++        long qr = dm_nd_recvmsg(qfd, &qmh, 0);
++        uint64_t qms = (guest_ns() - q0) / 1000000ull;
++        if (qr != -1 || dm_sk_errno() != SK_EAGAIN) fail("a read into a quiet socket answers nothing yet");
++        if (qms > 1000) fail("the default read budget is the short one");
++        dm_sk_close(qfd);
++        pthread_join(th5, NULL);
++    }
++
+     // A non-blocking connect answers the connection's outcome, not "in progress": the NPLN client sets
+     // O_NONBLOCK and the next thing it does is speak TLS on that socket, and handing it EINPROGRESS is the
+     // answer that left the online flow stalled in the reference ports (they block for the completion).
