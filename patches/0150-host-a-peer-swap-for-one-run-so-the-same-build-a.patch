@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 24 Nov 2026 11:18:02 +0000
+Subject: [PATCH] host: a peer swap for one run, so the same build asks a
+ second question
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Six logs have read the stall from the title's end and none of them can answer whether its TLS would
+finish against a server that is not Nextendo's: every log carries the same 213-byte ClientHello and
+the same 1375-byte flight, and the socket answers that sit between them are now the same in three
+implementations (this host, Ryujinx-Nextendo's ManagedSocket and mush8's bsd.rs, which calls
+libc::recvfrom straight and answers EAGAIN on a non-blocking descriptor).
+
+`DM_NEXTENDO_PEER=<ip|host>` answers every built-in redirect with that address instead of
+`nex.nextendo.network`, so the next build is run twice and only `env.txt` changes: once against
+Nextendo, once against a stranger. A literal address skips the resolver, the NAT hosts keep pointing
+at `nat.nextendo.network`, and a value that resolves to nothing leaves the redirect where it was with
+a line saying so.
+
+The control peer is `tls-v1-2.badssl.com`: it answers any SNI with TLS 1.2 and
+ECDHE-RSA-AES128-GCM-SHA256 — the protocol and cipher Nextendo picks for this title — and presents an
+expired certificate, which is the same shape. A handshake that completes there and not against
+Nextendo names the peer's flight as the difference; one that stalls in both places names the title,
+and the hex dump from 0149 is then the tool that reads it.
+
+The host test passes a literal address and asserts the NPLN name maps to it, so the check needs no
+network. The env switch row for DM_NEXTENDO_READ_WAIT_MS also still promised 2000 ms: the default has
+been 250 since 0148.
+
+Upstream-Status: fork-only
+Reason: the Nextendo online seams are this fork's own work: upstream's multi-worktree tree takes them to seedds/nxnative instead
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_nextendo.c         | 15 +++++++++++++++
+ dm/host/tests/t_nextendo_map.c | 11 +++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/dm/host/hle_nextendo.c b/dm/host/hle_nextendo.c
+index b4423264..c8088cab 100644
+--- a/dm/host/hle_nextendo.c
++++ b/dm/host/hle_nextendo.c
+@@ -124,6 +124,21 @@ static void nd_builtin_resolve(void) {
+     g_nd_builtin_done = 1;
+     g_nd_nex_ip = nd_resolve_name("nex.nextendo.network");
+     g_nd_nat_ip = nd_resolve_name("nat.nextendo.network");
++    // A peer swap for one run: `DM_NEXTENDO_PEER=<ip|host>` answers every redirect with that address, so
++    // the same build can be run twice and only env.txt changes. The question it settles is one a log cannot:
++    // whether the title finishes a TLS handshake with a server that is not Nextendo's. A literal address
++    // skips the resolver, which is how the host test uses it.
++    const char *peer = getenv("DM_NEXTENDO_PEER");
++    if (peer && *peer) {
++        uint32_t ip = 0;
++        if (!nd_ipv4(peer, &ip)) ip = nd_resolve_name(peer);
++        if (ip) {
++            g_nd_nex_ip = ip;
++            fprintf(stderr, "[dm] nextendo: peer override %s -> %08x\n", peer, ip);
++        } else {
++            fprintf(stderr, "[dm] nextendo: peer %s did not resolve, keeping nex %08x\n", peer, g_nd_nex_ip);
++        }
++    }
+     fprintf(stderr, "[dm] nextendo: built-in redirects, nex %08x nat %08x\n", g_nd_nex_ip, g_nd_nat_ip);
+ }
+ 
+diff --git a/dm/host/tests/t_nextendo_map.c b/dm/host/tests/t_nextendo_map.c
+index 6ec9419f..15b11cca 100644
+--- a/dm/host/tests/t_nextendo_map.c
++++ b/dm/host/tests/t_nextendo_map.c
+@@ -67,6 +67,17 @@ int main(void) {
+     // that runs out its whole budget against a machine that has nothing to say.
+     expect(nd_resolve_name("51.178.29.194") == 0x33B21DC2u, "the resolver answers in host order, as the map does");
+ 
++    // A peer swap for one run: `DM_NEXTENDO_PEER` answers every built-in redirect, so the same build runs
++    // against Nextendo and then against a stranger with only env.txt changed. A literal address never
++    // touches the resolver, so this needs no network.
++    setenv("DM_NEXTENDO_BUILTIN_HOSTS", "1", 1);
++    setenv("DM_NEXTENDO_PEER", "10.9.9.9", 1);
++    g_nd_builtin_done = 0;
++    expect(dm_nd_lookup("t-adf89f68-lp1.lp1.t.npln.srv.nintendo.net", got, 4) == 1,
++           "with a peer override the NPLN name still maps");
++    expect(got[0] == 0x0A090909u, "and maps to the peer, not to nex.nextendo.network");
++    unsetenv("DM_NEXTENDO_PEER");
++
+     setenv("DM_NEXTENDO", "0", 1);
+     dm_nd_reload();
+     expect(dm_nd_rule_count() == 0, "no rules with the switch off");
