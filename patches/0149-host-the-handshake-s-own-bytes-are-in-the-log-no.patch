@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Tue, 24 Nov 2026 10:46:25 +0000
+Subject: [PATCH] host: the handshake's own bytes are in the log, not just
+ their first sixteen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Log 8931D405 (patch 0148, the budget at 250 ms) is the same stall as 0147, and it closes both
+explanations this thread has been living on. The budget is not the variable: 2000 ms, 2001 ms and
+251 ms all end with one send for the session (the 213-byte ClientHello), the server's 1375-byte
+flight read once, and then nothing but a poll asking for POLLIN every five seconds until the title
+shuts the socket down. And the errno is not read at all: the C++ GetLastErrno spelling, the one
+answer that used to leave no line, now prints when it is asked and appears zero times in the whole
+log. So the title, having read the flight, is waiting to read a record that is not coming, while the
+server waits for the flight the title never writes.
+
+What no log so far can say is why, because every one of them carries sixteen bytes of the ClientHello
+and sixteen of the server's flight: enough to name a TLS record, not enough to read the offer
+(versions, cipher list, extensions beyond SNI/ALPN) or to compare the flight with the one the same
+offer gets from this host. Both fit in the log — 208 bytes and 1375 — so they are dumped in hex, once
+per direction and capped, and the flow lines now carry the calling thread (a handshake that stops
+between a read and a write is a different bug when one thread owns both) and the empty read names the
+length it asked for and the flags it used.
+
+Upstream-Status: fork-only
+Reason: Log 8931D405 (patch 0148) repeats 0146/0147 exactly with the read budget at 251 ms, so neither the budget
+  nor the errno can be the cause: the title sends one ClientHello, reads the server's whole flight, and then only
+  polls for readability until it shuts the socket down, and the freshly traced C++ GetLastErrno is never called
+  (zero lines in the log). With the socket API answered the same way in the build that wrote its flight (0144) and
+  in the four that do not, the next step needs the bytes themselves: the whole ClientHello and the whole flight in
+  hex, once per direction, plus the calling thread on every flow line and the asked length on an empty read, so the
+  handshake can be replayed and compared here instead of guessed at.
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+---
+ dm/host/hle_net.c | 39 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index d2590b35..3dbe665f 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -585,6 +585,28 @@ static void nd_msg_trace(const char *what, int fd, unsigned iov, long bytes, int
+         nd_h2_frames(what, buf, got);
+     }
+ }
++// The handshake's own bytes, whole and once per direction. Every log so far carries sixteen bytes of the
++// ClientHello and sixteen of the server's flight, which is enough to say "a TLS record" and not enough to
++// answer the two questions the stall leaves: what the title offered (versions, ciphers, extensions, ALPN),
++// and whether the flight it received is the one the same offer gets from this host. Both fit in a few dozen
++// lines of hex, and a log already carries thousands, so the next run can be replayed here instead of guessed
++// at. Capped, once: a session that works must not pay for this.
++static void nd_hex_dump(const char *dir, const void *buf, size_t n) {
++    static int once_send, once_recv;
++    int *once = dir[0] == 's' ? &once_send : &once_recv;
++    if (*once || !buf || !n) return;
++    *once = 1;
++    size_t cap = n < 1400 ? n : 1400;
++    char line[2 * 32 + 1];
++    fprintf(stderr, "[dm] nextendo: %s hex: %zu byte(s)%s\n", dir, n, n > cap ? ", first 1400" : "");
++    for (size_t at = 0; at < cap; at += 32) {
++        size_t k = cap - at < 32 ? cap - at : 32;
++        int o = 0;
++        for (size_t i = 0; i < k; i++)
++            o += snprintf(line + o, sizeof line - (size_t)o, "%02x", ((const unsigned char *)buf)[at + i]);
++        fprintf(stderr, "[dm] nextendo: %s hex %04zu: %s\n", dir, at, line);
++    }
++}
+ // The same for every read and write that reaches a stream socket, whichever spelling the title used: the
+ // gRPC transport writes its preface through the vectored call, and the TLS library under it may write
+ // through send(2). A trace that reads only the first of those shows a connection that never spoke.
+@@ -598,12 +620,17 @@ static void nd_flow_trace(const char *dir, int fd, long bytes, const void *buf,
+         pthread_mutex_unlock(&g_nd_tcp_m);
+     }
+     if (n > 24 && n % 16) return;
+-    char t[80]; snprintf(t, sizeof t, "socket::%s(fd %d)", dir, fd);
++    // The thread is part of the line: a handshake that stops between a read and a write is a different bug
++    // when the two come from one thread than when a second thread owes the write.
++    char t[96];
++    snprintf(t, sizeof t, "socket::%s(fd %d) t%03x", dir, fd,
++             (unsigned)((uintptr_t)pthread_self() >> 8) & 0xfff);
+     dm_nd_trace_result(t, bytes);
+     if (bytes > 0 && buf && len) {
+         size_t got = (size_t)bytes < len ? (size_t)bytes : len;
+         nd_head_trace(dir, buf, got);
+         nd_tls_summary(dir, buf, got);
++        nd_hex_dump(dir, buf, got);
+     }
+ }
+ 
+@@ -651,8 +678,14 @@ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+             long r2 = dm_nd_tcp_recv(fd, v->base, v->len, flags, m->name, m->name ? &again : NULL);
+             if (r2 >= 0) { r = r2; named = again; }
+         }
+-        fprintf(stderr, "[dm] nextendo: socket::RecvMsg(fd %d) read %ld byte(s) after %ld ms (%s=%d ms, title socket %s)\n",
+-                fd, r, nd_now_ms() - t0, ND_READ_ENV, budget, nd_tcp_nonblock(fd) ? "non-blocking" : "blocking");
++        // The asked length and the flags belong on the line too: a title whose read offered room for the whole
++        // flight and a title that asked for a prefix of it are different problems, and so is a read that asked
++        // not to wait.
++        fprintf(stderr, "[dm] nextendo: socket::RecvMsg(fd %d) read %ld of %zu asked, flags 0x%x, after %ld ms, "
++                        "t%03x (%s=%d ms, title socket %s)\n",
++                fd, r, v->len, flags, nd_now_ms() - t0,
++                (unsigned)((uintptr_t)pthread_self() >> 8) & 0xfff,
++                ND_READ_ENV, budget, nd_tcp_nonblock(fd) ? "non-blocking" : "blocking");
+     }
+     if (r >= 0) { if (m->name) m->name_len = named; m->flags = 0; }
+     static int seen;
