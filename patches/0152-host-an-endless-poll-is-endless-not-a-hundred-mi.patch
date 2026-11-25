@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 25 Nov 2026 09:13:22 +0000
+Subject: [PATCH] host: an endless poll is endless, not a hundred-millisecond
+ timeout of our own
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Nextendo's own list has this title verified and playing online on Ryujinx-Nextendo, so the client's
+TLS does run there and the difference is in this host, not in the game or the server. Two of our
+socket answers differ from the reference service, and both live around the handshake:
+
+The reference blocks in select/poll until an fd is ready. This host answered every `poll(-1)` with 0
+after 100 ms — log 5640DC4F has seven of them in a row before the server's flight arrived — so an
+endless wait reads to the title as a timeout it never asked for. The slice stays, but it is now only
+how often the teardown hook is re-read: with `ms < 0` both paths keep waiting instead of returning.
+
+The other is `DM_NEXTENDO_READ_WAIT_MS`, which holds a non-blocking read for 250 ms before answering
+EAGAIN; the reference answers at once, and `0` is that answer — an env change, no build.
+
+Upstream-Status: fork-only
+Reason: the Nextendo online seams are this fork's own work: upstream's multi-worktree tree takes them to seedds/nxnative instead
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 832a3b7c..45f6053a 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -1233,10 +1233,14 @@ static int sk_poll_local(void *fds, uint64_t n, int ms) {
+     for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0 && sk_used(p[i].fd)) { open |= 1ull << p[i].fd; generation[p[i].fd] = g_efd[p[i].fd].generation; }
+     for (uint64_t i = 0; i < n; i++) p[i].revents = 0;
+     if (!open) { pthread_mutex_unlock(&g_efd_m); return sk_idle(ms); }
+-    // Periodically return from an endless wait, as before, so guest garbage collection/shutdown can observe a thread outside the host hook.
+-    int64_t limit = (ms < 0 ? 100 : (int64_t)ms) * 1000000; uint64_t start = guest_ns(); int ready;
++    // An endless wait is endless: the slice is how often the teardown hook is re-read, not a timeout the caller
++    // asked for. Returning 0 from `poll(-1)` made every endless wait look like a timeout of the caller's own
++    // (log 5640DC4F: seven `poll(-1) -> 0` in a row before the server's flight arrived), which the reference
++    // service never does — it blocks in select/poll until an fd is ready.
++    int64_t limit = (ms < 0 ? -1 : (int64_t)ms * 1000000); uint64_t start = guest_ns(); int ready;
+     while (!(ready = efd_ready(p, n, open, generation))) {
+         if (dm_teardown_is_parking()) { pthread_mutex_unlock(&g_efd_m); dm_teardown_check_current_thread(); return 0; }
++        if (limit < 0) { dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, 1000000); continue; }
+         int64_t left = limit - (int64_t)(guest_ns() - start); if (left <= 0) break;
+         dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, dm_detclock_enabled() && left > 1000000 ? 1000000 : left);
+     }
+@@ -1246,7 +1250,7 @@ static int sk_poll_local(void *fds, uint64_t n, int ms) {
+ // sockets by the host's poll, and the loop sleeps a millisecond between samples. PRUDP is a network
+ // wait, not a hot path, so a millisecond of granularity costs nothing and keeps the two locks apart.
+ static int nd_poll_mixed(sk_pollfd *p, uint64_t n, int ms) {
+-    int64_t start = guest_ns(), limit = (ms < 0 ? 100 : (int64_t)ms) * 1000000;
++    int64_t start = guest_ns(), limit = (ms < 0 ? -1 : (int64_t)ms * 1000000);
+     for (;;) {
+         int ready = 0;
+         sk_pollfd local[EFD_MAX]; int idx[EFD_MAX]; int nl = 0;
+@@ -1262,6 +1266,11 @@ static int nd_poll_mixed(sk_pollfd *p, uint64_t n, int ms) {
+             for (int k = 0; k < nl; k++) if (local[k].revents) { p[idx[k]].revents = local[k].revents; ready++; }
+         }
+         if (ready) return ready;
++        if (limit < 0) {   // endless: wait, do not answer a timeout of our own (see the datagram path above)
++            if (dm_teardown_is_parking()) { dm_teardown_check_current_thread(); return 0; }
++            dm_guest_sleep_ns(1000000);
++            continue;
++        }
+         int64_t left = limit - (int64_t)(guest_ns() - start);
+         if (left <= 0) return 0;
+         dm_guest_sleep_ns(left > 1000000 ? 1000000 : left);
