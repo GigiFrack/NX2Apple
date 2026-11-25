@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 25 Nov 2026 09:18:29 +0000
+Subject: [PATCH] host: the third endless wait that answered a timeout nobody
+ asked for
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`sk_idle` is the poll nobody can be woken for — an empty set, or descriptors this service does not
+manage — and it slept a 100 ms slice and returned 0 whatever timeout it was given. With `ms < 0` that
+is the same lie the other two paths told: a caller that arms itself and expects to be woken reads 0 as
+its own deadline expiring, and a transport that does it in the pollset thread spins there instead of
+running the work it queued (log DEA255C6 has `poll(1 fds, -1 ms): fd 0 … -> 0` and a dispatcher thread
+at ~970 ms/s for the whole session). An endless wait now sleeps in 1 ms slices and re-reads the
+teardown hook, and only a real timeout returns.
+
+Upstream-Status: fork-only
+Reason: the Nextendo online seams are this fork's own work: upstream's multi-worktree tree takes them to seedds/nxnative instead
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 45f6053a..a88fbff2 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -82,7 +82,20 @@ int dm_sk_errno(void) { return t_skerr; }
+ #define SKF(m, cname, ...) HLE_FORCE(m, "local BSD descriptor service; remote networking unavailable", int, cname, __VA_ARGS__)
+ void dm_guest_sleep_ns(int64_t ns);
+ void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns);
+-static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000); return 0; }
++// A poll nobody can be woken for: an empty set, or descriptors this service does not manage. POSIX waits the
++// timeout and an endless wait is endless — answering 0 after a 100 ms slice reads as a timeout the caller never
++// asked for, and a transport that arms itself on it spins instead of sleeping (the same shape as the two paths
++// below, and the third place it was hiding).
++static int sk_idle(int64_t ms) {
++    if (ms < 0) {
++        for (;;) {
++            if (dm_teardown_is_parking()) { dm_teardown_check_current_thread(); return 0; }
++            dm_guest_sleep_ns(1000000);
++        }
++    }
++    dm_guest_sleep_ns(ms * 1000000);
++    return 0;
++}
+ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
+ 
+ enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLHUP = 0x10, SK_POLLNVAL = 0x20,
