@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 25 Nov 2026 10:52:24 +0000
+Subject: [PATCH] net: the dump hook from hle_net is weak, so a test that links
+ it alone still links
+
+The host tests build hle_net.c on its own, without crash.c, and the call to
+crash_dump_after_ms left them with an undefined symbol (CI 45592302363). The engine's
+own idiom for this is a weak definition with a default body: here the default is
+'armed nothing', and noinline keeps the call going through the symbol, so the real
+one in crash.c still wins when it is linked.
+
+Upstream-Status: fork-only
+Reason: the Nextendo online seams are this fork's own work: upstream's multi-worktree tree takes them to seedds/nxnative instead
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/hle_net.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 23b42793..7c9b1347 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -7,7 +7,9 @@
+ #include <stdarg.h>         // the trace builds its lines with vsnprintf
+ #include <stddef.h>         // offsetof: the MsgHdr layout the vectored calls read out of the game's memory
+ 
+-int crash_dump_after_ms(unsigned ms);   // crash.c: one state dump, ms from now, from a thread of its own
++// crash.c has the one that dumps: this default, weak and never inlined, is what a test that links this file
++// alone calls (no dump, armed = 0). Inlined, the call would never reach the strong definition.
++__attribute__((weak, noinline)) int crash_dump_after_ms(unsigned ms) { (void)ms; return 0; }
+ 
+ HLE_FORCE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_socket_Initialize, const void *cfg) { (void)cfg; return RES_OK; }
+ // SDK 21 (Star Fox) inlines nn::socket::Initialize(const Config &) into the game, and the service connection is this call
