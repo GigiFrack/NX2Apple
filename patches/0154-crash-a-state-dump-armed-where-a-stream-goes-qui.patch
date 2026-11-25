@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@local>
+Date: Wed, 25 Nov 2026 10:07:41 +0000
+Subject: [PATCH] crash: a state dump armed where a stream goes quiet
+
+A title that has read the server's whole TLS flight and then writes nothing leaves one
+question a log cannot answer: which thread is holding the handshake, and what is it
+waiting on. The watchdog answers that only when the frames stop, and here they never
+do: Jamboree keeps rendering at 60 fps while nn.npln's dispatcher burns a core.
+
+So the dump is armed from the code that sees the stall: the first empty read on a
+Nextendo stream that has already delivered bytes schedules the same state dump the
+watchdog prints (every guest thread's wait, its wait object, registers, last SVC and
+backtrace), DM_NEXTENDO_DUMP ms later, once per process. crash_dump_after_ms is
+generic and takes its own thread, so the reader returns at once.
+
+Upstream-Status: fork-only
+Reason: the Nextendo online seams are this fork's own work: upstream's multi-worktree tree takes them to seedds/nxnative instead
+Issue: https://github.com/GigiFrack/NX2Apple (fork)
+
+---
+ dm/host/crash.c   | 20 ++++++++++++++++++++
+ dm/host/hle_net.c | 27 ++++++++++++++++++++++++++-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/crash.c b/dm/host/crash.c
+index 7c4d5bcc..f3a39944 100644
+--- a/dm/host/crash.c
++++ b/dm/host/crash.c
+@@ -148,6 +148,26 @@ void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
+ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
+ // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
+ void crash_dump_now(const char *why) { fprintf(stderr, "[dm] state dump (%s): tick %u / stage %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
++// A state dump armed by the code that sees the stall, a moment later. What a title's threads are doing while it
++// sits silent is the whole question a network log leaves open, and a wall-clock guess (DM_WATCH) either lands in
++// the loading screen or misses the run: the caller here knows the instant, the thread of its own lets it return.
++// One shot per process — the dump suspends every guest thread, so it is a measurement, not a trace.
++static _Atomic int g_dump_after_armed;
++static void *dump_after_main(void *arg) {
++    unsigned ms = (unsigned)(uintptr_t)arg;
++    struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L};
++    while (nanosleep(&ts, &ts) && errno == EINTR) {}
++    crash_dump_now("armed where a stream went quiet");
++    return NULL;
++}
++int crash_dump_after_ms(unsigned ms) {   // 1 = armed, 0 = already fired or no thread
++    int none = 0;
++    if (!atomic_compare_exchange_strong(&g_dump_after_armed, &none, 1)) return 0;
++    pthread_t th;
++    if (pthread_create(&th, NULL, dump_after_main, (void *)(uintptr_t)ms)) { atomic_store(&g_dump_after_armed, 0); return 0; }
++    pthread_detach(th);
++    return 1;
++}
+ // Only the first crashing thread prints its state: when several threads crash at once (Unity's job threads often do), the dumps used to interleave and the process hung in the dump without exiting.
+ // Later threads stop in pause() until the process exits; the first thread re-entering (crashing again while printing, or the SIGALRM of the 15 s safety below) exits at once.
+ static _Atomic uintptr_t g_crash_owner;
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index a88fbff2..23b42793 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -7,6 +7,8 @@
+ #include <stdarg.h>         // the trace builds its lines with vsnprintf
+ #include <stddef.h>         // offsetof: the MsgHdr layout the vectored calls read out of the game's memory
+ 
++int crash_dump_after_ms(unsigned ms);   // crash.c: one state dump, ms from now, from a thread of its own
++
+ HLE_FORCE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_socket_Initialize, const void *cfg) { (void)cfg; return RES_OK; }
+ // SDK 21 (Star Fox) inlines nn::socket::Initialize(const Config &) into the game, and the service connection is this call
+ HLE_FORCE("_ZN2nn6socket8internal10InitializeEi", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_socket_InitializeInternal, int n) { (void)n; return RES_OK; }
+@@ -723,6 +725,28 @@ static int nd_tcp_nonblock(int fd) {
+     return nb;
+ }
+ 
++// A read that comes back empty on a stream that has already spoken is the moment worth measuring: the title has
++// the server's bytes and does not answer, and whether its reads and its TLS sit in one thread or in two is the
++// difference between a TLS that refuses and a transport that lost a wakeup. One dump, one process, from here.
++// A read that finds nothing on a socket that has said nothing yet (a keep-alive, a fresh accept) is ordinary and
++// stays quiet.
++static void nd_dump_armed(int fd) {
++    static int armed;
++    static long long on = -1;
++    if (on < 0) {
++        const char *e = getenv("DM_NEXTENDO_DUMP");
++        on = e && *e ? atoi(e) : 0;
++        if (on > 0) fprintf(stderr, "[dm] nextendo: a state dump %lld ms after a stream that has spoken goes quiet (DM_NEXTENDO_DUMP)\n", on);
++    }
++    if (on <= 0 || armed) return;
++    pthread_mutex_lock(&g_nd_tcp_m);
++    nd_tcp_ent *e = nd_tcp_locked(fd);
++    long long got = e ? e->in : 0;
++    pthread_mutex_unlock(&g_nd_tcp_m);
++    if (got <= 0) return;
++    if (crash_dump_after_ms((unsigned)on)) armed = 1;
++}
++
+ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+     if (!nd_tcp_range(fd)) return ND_NOT;
+     nd_msghdr *m = msg;
+@@ -748,6 +772,7 @@ long dm_nd_recvmsg(int fd, void *msg, int flags) {
+                 (unsigned)((uintptr_t)pthread_self() >> 8) & 0xfff,
+                 ND_READ_ENV, budget, nd_tcp_nonblock(fd) ? "non-blocking" : "blocking");
+     }
++    if (r < 0 && dm_sk_errno() == SK_EAGAIN) nd_dump_armed(fd);
+     if (r >= 0) { if (m->name) m->name_len = named; m->flags = 0; }
+     static int seen;
+     nd_msg_trace("RecvMsg", fd, m->iov_len, r, ++seen, v->base, v->len);
+@@ -1198,7 +1223,7 @@ long dm_sk_write(int fd, const void *data, unsigned long size) {
+ }
+ long dm_sk_recvfrom(int fd, void *data, unsigned long n, int flags, void *a, unsigned *al) {
+     long tcp = dm_nd_tcp_recv(fd, data, n, flags, a, al);
+-    if (tcp != ND_NOT) return tcp;
++    if (tcp != ND_NOT) { if (tcp < 0 && dm_sk_errno() == SK_EAGAIN) nd_dump_armed(fd); return tcp; }
+     if ((!data && n) || (a && !al)) return sk_error(SK_EINVAL);
+     if (flags & ~(SK_MSG_DONTWAIT | SK_MSG_PEEK)) return sk_error(SK_EOPNOTSUPP);
+     dm_host_mutex_lock(&g_efd_m); long r = -1;
